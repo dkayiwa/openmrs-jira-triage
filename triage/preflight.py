@@ -31,7 +31,11 @@ def main(argv=None) -> int:
     jira = jira_from_env(cfg)
     ok = True
 
-    info = jira.server_info()
+    try:
+        info = jira.server_info()
+    except Exception as e:
+        check("jira reachable", False, str(e)[:200])
+        return 1
     ok &= check("jira reachable", True, f"{info.get('baseUrl')} ({info.get('deploymentType')})")
     me = jira.myself()
     print(f"       auth: {'as ' + (me.get('displayName') or '?') if me else 'anonymous (read-only)'}")
@@ -72,10 +76,14 @@ def main(argv=None) -> int:
         hyphen_label = "ai-triage-charset-test"
         try:
             jira.update_labels(args.scratch, [hyphen_label], [])
-            jira.update_labels(args.scratch, [], [hyphen_label])
             ok &= check("hyphenated label accepted", True, hyphen_label)
         except JiraError as e:
             ok &= check("hyphenated label accepted", False, str(e)[:200])
+        finally:
+            try:
+                jira.update_labels(args.scratch, [], [hyphen_label])
+            except JiraError:
+                print(f"       WARN: could not remove {hyphen_label} from {args.scratch}; remove manually")
     else:
         print("       (label-charset write test skipped: pass --scratch O3-XXXX with bot credentials)")
 

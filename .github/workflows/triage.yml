@@ -13,11 +13,18 @@ on:
         description: max tickets this run (0 = all in scope)
   # Enable after the dry-run gate is passed (>= 90% grader agreement on evals).
   # Every 4 hours comfortably meets the pilot's 24h SLA despite cron drift.
+  # NOTE: scheduled runs are LIVE (see the run step) - that is the pilot.
   # schedule:
   #   - cron: "17 */4 * * *"
 
 permissions:
   contents: read
+
+# Never let two sweeps overlap: both could fetch a ticket before either
+# labels it, and the loser would post a duplicate comment.
+concurrency:
+  group: triage-pilot
+  cancel-in-progress: false
 
 jobs:
   triage:
@@ -28,7 +35,9 @@ jobs:
         with:
           python-version: "3.12"
       - run: pip install -r requirements.txt
-      - run: python -m triage.run --limit "${{ inputs.limit || '0' }}" ${{ inputs.mode == 'live' && '--live' || '' }}
+      - run: python -m unittest discover -s tests -q
+      # Scheduled runs are live by definition; manual dispatches choose.
+      - run: python -m triage.run --limit "${{ inputs.limit || '0' }}" ${{ (github.event_name == 'schedule' || inputs.mode == 'live') && '--live' || '' }}
         env:
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}

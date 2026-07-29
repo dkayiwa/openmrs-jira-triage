@@ -29,8 +29,9 @@ construction:
 
 ```sh
 python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
-export ANTHROPIC_API_KEY=...          # or have an `ant auth login` profile
+echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env   # .env is gitignored and auto-loaded
 
+.venv/bin/python -m unittest discover -s tests -q  # offline logic tests
 .venv/bin/python -m triage.preflight  # connectivity, statuses, AC field, scope JQL
 .venv/bin/python -m triage.run --limit 5   # dry-run: proposals + contexts + journal
 ```
@@ -73,8 +74,13 @@ phase, every human label-removal gets added here as a new case.
 6. **Enable writes:** add the four repo secrets, uncomment the `schedule` block
    in `.github/workflows/triage.yml`, or run `python -m triage.run --live`.
 7. **Weekly:** `python -m triage.metrics` prints the three pilot metrics and a
-   draft ADOPT / EXTEND / STOP against the pre-registered thresholds. Pair with
+   draft ADOPT / EXTEND / STOP against the pre-registered thresholds, computed
+   purely from Jira changelogs (set `pilot_launch` in config first). Pair with
    a native Jira filter subscription for the dashboard digest.
+8. **Process note for maintainers:** removing an `ai-triage-*` label opts the
+   ticket out permanently - including after promoting a ticket to `intro`.
+   Leave the ai-triage label in place; the intro metric counts tickets holding
+   both labels.
 
 ## Layout
 
@@ -88,5 +94,7 @@ triage/classifier.py  one Claude call, JSON-schema output, refusal fallbacks
 triage/preflight.py   pre-launch checks incl. label charset test
 triage/metrics.py     live-phase metrics + decision rule
 evals/run_evals.py    graded regression set for prompt changes
+tests/                offline unit tests (no network, no API key)
 out/                  journal.jsonl, contexts/, proposals (gitignored)
 ```
+

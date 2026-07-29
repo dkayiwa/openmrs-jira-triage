@@ -74,14 +74,19 @@ def run(min_agreement: float) -> int:
     hits = 0
     misses: list[tuple[str, str, str]] = []
     for case in cases:
-        got = clf.classify((CONTEXTS / (case["key"] + ".txt")).read_text())
-        if got.label == case["expected_label"]:
+        # Per-case isolation: one API hiccup must not discard the paid
+        # classifications already made; an errored case counts as a miss.
+        try:
+            got_label = clf.classify((CONTEXTS / (case["key"] + ".txt")).read_text()).label
+        except Exception as e:
+            got_label = f"ERROR ({type(e).__name__}: {str(e)[:120]})"
+        if got_label == case["expected_label"]:
             hits += 1
             print("  " + case["key"] + ": ok")
         else:
-            misses.append((case["key"], case["expected_label"], got.label))
+            misses.append((case["key"], case["expected_label"], got_label))
             print("  " + case["key"] + ": MISS expected " + case["expected_label"]
-                  + " got " + got.label)
+                  + " got " + got_label)
     agreement = hits / len(cases)
     print(f"\nagreement: {hits}/{len(cases)} = {agreement:.0%} "
           f"(prompt {cfg['prompt']['version']}, gate {min_agreement:.0%})")

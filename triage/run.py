@@ -23,7 +23,21 @@ from .state import PROPERTY_KEY, inspect
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 
+def _load_dotenv(env: pathlib.Path | None = None) -> None:
+    """Load .env into os.environ (existing env vars win)."""
+    env = env or ROOT / ".env"
+    if not env.exists():
+        return
+    for line in env.read_text().splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip("'\""))
+
+
 def load_config() -> dict:
+    _load_dotenv()
     with open(ROOT / "config.toml", "rb") as fh:
         return tomllib.load(fh)
 
@@ -34,6 +48,17 @@ def jira_from_env(cfg: dict) -> JiraClient:
         os.environ.get("JIRA_EMAIL"),
         os.environ.get("JIRA_API_TOKEN"),
     )
+
+
+def plan_label_writes(present: list[str], label: str) -> tuple[list[str], list[str], bool]:
+    """(labels_to_add, labels_to_remove, post_comment).
+
+    Comment only when the label is new for the ticket: re-runs after content
+    edits or a lost property must never post duplicate comments to watchers.
+    """
+    is_new = label not in present
+    stale = [l for l in present if l != label]
+    return ([label] if is_new else [], stale, is_new)
 
 
 def comment_body(cfg: dict, c) -> str:
@@ -89,7 +114,8 @@ def main(argv=None) -> int:
     ap.add_argument("--limit", type=int, default=0, help="max tickets this run (0 = all)")
     ap.add_argument("--keys", help="comma-separated issue keys (skips the JQL sweep)")
     ap.add_argument("--no-classify", action="store_true", help="fetch and assemble contexts only")
-    ap.add_argument("--force", action="store_true", help="dry-run: reclassify already-labeled tickets")
+    ap.add_argument("--force", action="store_true",
+                    help="reclassify already-triaged tickets (opt-outs are still respected)")
     args = ap.parse_args(argv)
 
     cfg = load_config()
@@ -138,49 +164,64 @@ def main(argv=None) -> int:
     proposals: list = []
     journal = out / "journal.jsonl"
     for key in keys:
-        issue = jira.issue(key, fields, expand_changelog=True)
-        st = inspect(issue, ai_labels, bot_id)
-        text = ctx.assemble(jira, issue, ac_field, blocked)
-        chash = ctx.content_hash(text)
-        (out / "contexts" / f"{key}.txt").write_text(text)
-
         row: dict = {
-            "at": stamp.isoformat(), "key": key, "hash": chash,
-            "prompt": cfg["prompt"]["version"], "mode": "live" if args.live else "dry-run",
+            "key": key, "prompt": cfg["prompt"]["version"],
+            "mode": "live" if args.live else "dry-run",
         }
-        unchanged = (
-            not args.live
-            or (jira.get_property(key, PROPERTY_KEY) or {}).get("contentHash") == chash
-        )
-        if st.opted_out:
-            row["action"] = "skip-opted-out"
-            row["by"] = st.opted_out_by
-        elif st.ai_labels_present and unchanged and not args.force:
-            row["action"] = "skip-already-triaged"
-            row["labels"] = st.ai_labels_present
-        elif classifier is None:
-            row["action"] = "context-only"
-        else:
-            c = classifier.classify(text)
-            if c.refused:
-                row["action"] = "error-refusal"
+        st = None
+        # Per-ticket isolation: one bad ticket (API hiccup, truncated JSON,
+        # Jira write failure) must not abort the rest of the sweep.
+        try:
+            issue = jira.issue(key, fields, expand_changelog=True)
+            st = inspect(issue, ai_labels, bot_id)
+            text = ctx.assemble(jira, issue, ac_field, blocked)
+            chash = ctx.content_hash(text)
+            (out / "contexts" / f"{key}.txt").write_text(text)
+            row["hash"] = chash
+
+            unchanged = (
+                not args.live
+                or (jira.get_property(key, PROPERTY_KEY) or {}).get("contentHash") == chash
+            )
+            if st.opted_out:
+                row["action"] = "skip-opted-out"
+                row["by"] = st.opted_out_by
+            elif st.ai_labels_present and unchanged and not args.force:
+                row["action"] = "skip-already-triaged"
+                row["labels"] = st.ai_labels_present
+            elif classifier is None:
+                row["action"] = "context-only"
             else:
-                row.update(action="proposed", label=c.label, confidence=c.confidence, model=c.model)
-                proposals.append((issue, c))
-                if args.live:
-                    label = cfg["labels"][c.label]
-                    jira.update_labels(key, [label], [l for l in st.ai_labels_present if l != label])
-                    jira.add_comment(key, comment_body(cfg, c))
-                    jira.set_property(key, PROPERTY_KEY, {
-                        "contentHash": chash, "label": label,
-                        "prompt": cfg["prompt"]["version"], "at": row["at"],
-                    })
-                    row["action"] = "labeled"
-        if st.human_adds:
+                c = classifier.classify(text)
+                if c.refused:
+                    row["action"] = "error-refusal"
+                else:
+                    row.update(action="proposed", label=c.label, confidence=c.confidence, model=c.model)
+                    proposals.append((issue, c))
+                    if args.live:
+                        label = cfg["labels"][c.label]
+                        add, remove, post_comment = plan_label_writes(st.ai_labels_present, label)
+                        if add or remove:
+                            jira.update_labels(key, add, remove)
+                        if post_comment:
+                            jira.add_comment(key, comment_body(cfg, c))
+                        jira.set_property(key, PROPERTY_KEY, {
+                            "contentHash": chash, "label": label,
+                            "prompt": cfg["prompt"]["version"],
+                            "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+                        })
+                        row["action"] = "labeled" if post_comment else "refreshed"
+        except Exception as e:
+            row["action"] = "error"
+            row["error"] = f"{type(e).__name__}: {e}"[:300]
+        if st and st.human_adds:
             row["convention_violation_adds"] = st.human_adds
+        row["at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
         with open(journal, "a") as fh:
             fh.write(json.dumps(row) + "\n")
         suffix = f" -> {row['label']}" if row.get("label") else ""
+        if row["action"] == "error":
+            suffix = f" ({row['error']})"
         print(f"  {key}: {row['action']}{suffix}")
 
     if proposals:

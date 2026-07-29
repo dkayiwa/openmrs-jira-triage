@@ -65,8 +65,10 @@ class Classifier:
         )
         if response.stop_reason == "refusal":
             return Classification("", "", [], [], 0.0, response.model, refused=True)
-        text = next(b.text for b in response.content if b.type == "text")
-        data = json.loads(text)
+        block = next((b for b in response.content if b.type == "text"), None)
+        if block is None:
+            raise RuntimeError(f"no text block in response (stop_reason={response.stop_reason})")
+        data = json.loads(block.text)
         return Classification(
             label=data["label"],
             rationale=data["rationale"],

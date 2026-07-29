@@ -38,6 +38,9 @@ version = "v1"
 
 [metrics]
 # Pre-registered success thresholds from the design doc. Do not tune after launch.
+# pilot_launch anchors the 24h SLA: the initial backlog is older than 24h by
+# definition, so the SLA runs from max(ticket created, pilot_launch).
+pilot_launch = ""
 sorted_within_24h_pct = 95
 max_label_removal_rate = 0.10
 min_intro_outcomes = 5

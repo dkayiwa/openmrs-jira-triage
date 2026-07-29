@@ -46,7 +46,9 @@ def assemble(client: JiraClient, issue: dict, ac_field: str | None, blocked_ids:
                 "",
             ]
         except Exception:
-            lines += [f"PARENT {parent['key']}: {parent.get('fields', {}).get('summary', '')}", ""]
+            # Keep the audit trail honest: the model did not see the parent body.
+            lines += [f"PARENT {parent['key']}: {parent.get('fields', {}).get('summary', '')}",
+                      "(parent description unavailable)", ""]
     links = []
     for link in f.get("issuelinks") or []:
         if "outwardIssue" in link:
@@ -58,7 +60,8 @@ def assemble(client: JiraClient, issue: dict, ac_field: str | None, blocked_ids:
         links.append(f"- {rel} {other['key']}: {other.get('fields', {}).get('summary', '')}")
     if links:
         lines += ["LINKED TICKETS:"] + links + [""]
-    humans = [c for c in (f.get("comment") or {}).get("comments", []) if is_human_comment(c, blocked_ids)]
+    all_comments = client.comments(issue["key"], f.get("comment"))
+    humans = [c for c in all_comments if is_human_comment(c, blocked_ids)]
     if humans:
         lines.append("HUMAN COMMENTS:")
         for c in humans:

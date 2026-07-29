@@ -19,10 +19,17 @@ class TicketState:
     opted_out: bool = False
     opted_out_by: str | None = None
     human_adds: list[str] = field(default_factory=list)  # convention violations
+    bot_first_labeled_at: str | None = None  # changelog timestamp of the bot's first ai-label add
+
+
+def _labels(value: str | None) -> set[str]:
+    # Changelog label lists are separated by spaces (observed live) but labels
+    # can never contain spaces or commas, so tolerate both separators.
+    return set((value or "").replace(",", " ").split())
 
 
 def inspect(issue: dict, ai_labels: list[str], bot_account_id: str | None) -> TicketState:
-    """Walk the changelog's labels-field items (space-separated label lists).
+    """Walk the changelog's labels-field items.
 
     With no bot_account_id configured, every ai-triage removal counts as an
     opt-out (the safe direction), and manual-add violations are not attributed.
@@ -37,11 +44,19 @@ def inspect(issue: dict, ai_labels: list[str], bot_account_id: str | None) -> Ti
         for item in history.get("items", []):
             if item.get("field") != "labels":
                 continue
-            before = set((item.get("fromString") or "").split())
-            after = set((item.get("toString") or "").split())
+            before = _labels(item.get("fromString"))
+            after = _labels(item.get("toString"))
             if (before - after) & set(ai_labels) and not is_bot:
                 st.opted_out = True
                 st.opted_out_by = author.get("displayName") or author_id
-            if (after - before) & set(ai_labels) and not is_bot and bot_account_id is not None:
-                st.human_adds.append(author.get("displayName") or author_id)
+            if (after - before) & set(ai_labels):
+                if is_bot:
+                    # Keep the earliest add regardless of history ordering.
+                    # Timestamps within one response share a timezone, so
+                    # string comparison orders them correctly.
+                    added_at = history.get("created")
+                    if added_at and (st.bot_first_labeled_at is None or added_at < st.bot_first_labeled_at):
+                        st.bot_first_labeled_at = added_at
+                elif bot_account_id is not None:
+                    st.human_adds.append(author.get("displayName") or author_id)
     return st
