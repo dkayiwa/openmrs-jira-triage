@@ -56,12 +56,19 @@ Code session using your own account:
 # 1. gather - no Anthropic credential, writes contexts + a manifest
 .venv/bin/python -m triage.run --no-classify --limit 5
 
-# 2. classify - read out/manifest.json (it embeds the JSON schema and the
-#    content hash of each context) and write out/classifications.json
+# 2. classify - read out/manifest.json (it lists every ticket eligible for
+#    classification with its content hash, and embeds entry_schema, the schema
+#    of one classifications-file entry) and write out/classifications.json
 
 # 3. apply - replays those classifications; makes no Claude call
 .venv/bin/python -m triage.run --classifications out/classifications.json --live
 ```
+
+The apply sweep may be wider than the file: a ticket with no entry is journalled
+`skip-unclassified` and left alone, so a file covering part of the cohort is a
+normal way to work through it in batches. Only the gather step writes the
+manifest, so an apply run cannot clobber the description the next batch is built
+from.
 
 `out/classifications.json` looks like this; `content_hash` comes from the
 manifest and is required:
@@ -83,13 +90,20 @@ manifest and is required:
 }
 ```
 
-Lookup is by content hash, not ticket key, so staleness is caught for free: if
-the ticket is edited between being classified and being applied, the freshly
-assembled context hashes differently, no classification matches, and the stale
-label is never written. A `prompt_version` that disagrees with `config.toml`,
-a missing `content_hash`, or anything failing the schema aborts before any
-write. The `classifier` string is recorded in each ticket's entity property so
-an audit can tell replayed labels from pinned-model ones.
+Lookup is by content hash, so staleness is caught for free: if the ticket is
+edited between being classified and being applied, the freshly assembled context
+hashes differently and the stale label is never written. Each entry is also
+checked against the `TICKET:` line of the context it matched, so two entries
+whose `content_hash` values are mispaired are refused rather than applied to each
+other's tickets. A `prompt_version` disagreeing with `config.toml`, a duplicate
+or non-string `content_hash`, an empty rationale, a confidence outside 0–1, or
+over-length text all abort before any Jira call.
+
+Each ticket's entity property records **`source`** (`api` or `file`), set by the
+pipeline, alongside a self-declared `classifier` string. Only `source` is
+evidence — a file can claim any model name it likes. `source` also participates
+in the idempotency key, so a replayed label does not permanently pin a ticket
+against the pinned-model pipeline.
 
 > **This is not the pilot's measured path.** The eval gate and the three
 > pre-registered metrics assume one pinned model and prompt version per label.

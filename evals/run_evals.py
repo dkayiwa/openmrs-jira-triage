@@ -43,6 +43,19 @@ def import_proposals(path: str, contexts_dir: str) -> None:
             grade = (r.get("grade(ok/wrong)") or "").strip().lower()
             if grade not in ("ok", "wrong"):
                 continue
+            # An `ok` grade copies the proposal's own label into expected_label.
+            # If that proposal came from a replayed file rather than the pinned
+            # model, the eval set would then measure the pinned model against a
+            # different classifier's decision boundary - and the >= 90% gate it
+            # feeds is what authorises go-live. A `wrong` grade is safe either
+            # way, because correct_label is the human's judgement.
+            source = (r.get("source") or "api").strip() or "api"
+            if grade == "ok" and source != "api":
+                print(f"skip {r['key']}: proposed by source={source}, so an 'ok' grade "
+                      "would seed the eval set with that classifier's own label; "
+                      "re-run this ticket through the API path, or mark it wrong "
+                      "with an explicit correct_label")
+                continue
             expected = r["proposed_label"] if grade == "ok" else (r.get("correct_label") or "").strip()
             if expected not in LABEL_KEYS:
                 print(f"skip {r['key']}: correct_label must be one of {LABEL_KEYS}")

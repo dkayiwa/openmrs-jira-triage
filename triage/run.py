@@ -19,6 +19,9 @@ import tomllib
 from . import context as ctx
 from .classifier import (
     LABEL_KEYS,
+    MAX_ITEM,
+    MAX_ITEMS,
+    MAX_RATIONALE,
     SCHEMA,
     Classification,
     Classifier,
@@ -40,7 +43,7 @@ CONSECUTIVE_ERROR_LIMIT = 5
 # import can detect a context overwritten by a later dry-run.
 PROPOSAL_COLUMNS = [
     "key", "url", "summary", "proposed_label", "confidence", "rationale",
-    "missing_info", "verification_steps", "content_hash",
+    "missing_info", "verification_steps", "content_hash", "source",
     "grade(ok/wrong)", "correct_label", "grader_notes",
 ]
 
@@ -81,6 +84,42 @@ def jira_from_env(cfg: dict) -> JiraClient:
     )
 
 
+def classification_entry_schema() -> dict:
+    """The schema of one entry in a classifications file.
+
+    Derived from the response SCHEMA rather than restated, so the two cannot
+    drift, plus the two things the response schema cannot carry: content_hash
+    (which binds the entry to a context) and the magnitude caps.
+    """
+    props = {k: dict(v) for k, v in SCHEMA["properties"].items()}
+    props["rationale"]["maxLength"] = MAX_RATIONALE
+    for key in ("missing_info", "verification_steps"):
+        props[key]["maxItems"] = MAX_ITEMS
+        props[key]["items"] = dict(props[key]["items"], maxLength=MAX_ITEM)
+    props["confidence"].update(minimum=0, maximum=1)
+    props["content_hash"] = {
+        "type": "string",
+        "description": "the content_hash of the context this classifies, from tickets[]",
+    }
+    return {
+        "type": "object",
+        "properties": props,
+        "required": [*SCHEMA["required"], "content_hash"],
+        "additionalProperties": False,
+    }
+
+
+class NotClassified(Exception):
+    """This ticket is not in the classifications file.
+
+    A routine, free, expected condition - a file legitimately covers a subset of
+    the sweep. Distinct from an error so it never reaches the consecutive-error
+    circuit breaker, which exists to cap *paid* API faults: counting misses
+    there aborted the sweep partway and dropped classifications that were
+    perfectly good.
+    """
+
+
 class FileClassifier:
     """Serves classifications produced outside the pipeline.
 
@@ -95,21 +134,47 @@ class FileClassifier:
     """
 
     def __init__(self, path: pathlib.Path, prompt_version: str):
-        doc = json.loads(path.read_text())
+        # Every failure here is fatal and named, before any ticket is fetched:
+        # this file decides what gets written to public tickets.
+        try:
+            doc = json.loads(path.read_text())
+        except FileNotFoundError:
+            sys.exit(f"{path}: no such file")
+        except json.JSONDecodeError as e:
+            sys.exit(f"{path}: not valid JSON ({e})")
+        if not isinstance(doc, dict):
+            sys.exit(f"{path}: expected a JSON object, got {type(doc).__name__}")
         if doc.get("prompt_version") != prompt_version:
             sys.exit(f"{path}: classified against prompt {doc.get('prompt_version')!r} "
                      f"but config.toml pins {prompt_version!r}")
         self.model = doc.get("classifier") or "unattributed"
+        entries = doc.get("classifications") or {}
+        if not entries:
+            sys.exit(f"{path}: no classifications in the file")
         self.by_hash: dict[str, Classification] = {}
-        for key, entry in (doc.get("classifications") or {}).items():
+        self.keys: dict[str, str] = {}
+        owner: dict[str, str] = {}
+        for key, entry in entries.items():
+            if not isinstance(entry, dict):
+                sys.exit(f"{path}: {key} must be an object, got {type(entry).__name__}")
             entry = dict(entry)
             chash = entry.pop("content_hash", None)
             if not chash:
                 sys.exit(f"{path}: {key} has no content_hash, so it cannot be matched "
                          "to a context safely")
+            if not isinstance(chash, str):
+                sys.exit(f"{path}: {key} content_hash must be a string, "
+                         f"got {type(chash).__name__}")
+            if chash in owner:
+                # Lookup is by hash, so a repeat would silently overwrite - and
+                # if the two disagree, which label lands would depend on dict
+                # order rather than on anything the author intended.
+                sys.exit(f"{path}: {key} and {owner[chash]} share content_hash {chash}")
+            owner[chash] = key
             errors = validate_classification(entry)
             if errors:
                 sys.exit(f"{path}: {key} is not a valid classification: {'; '.join(errors)}")
+            self.keys[chash] = key
             self.by_hash[chash] = Classification(
                 label=entry["label"], rationale=entry["rationale"],
                 missing_info=list(entry["missing_info"]),
@@ -121,9 +186,20 @@ class FileClassifier:
         chash = ctx.content_hash(context)
         found = self.by_hash.get(chash)
         if found is None:
+            raise NotClassified(
+                f"no classification for content hash {chash}; not in this batch, "
+                "or the ticket changed since it was classified"
+            )
+        # The hash guards against edited content but not against *mispaired*
+        # content: swapping two entries' content_hash values would apply each
+        # ticket's label and rationale to the other, silently. Every context
+        # starts with "TICKET: <key>", so the entry's own key is checkable.
+        declared = self.keys[chash]
+        actual = context.splitlines()[0].removeprefix("TICKET:").strip()
+        if actual != declared:
             raise RuntimeError(
-                f"no classification for content hash {chash}; the ticket changed "
-                "since it was classified, or it was never classified"
+                f"classification is filed under {declared} but this content is "
+                f"{actual}; the content_hash values are mispaired"
             )
         return found
 
@@ -186,6 +262,17 @@ def plan_label_writes(present: list[str], label: str) -> tuple[list[str], list[s
     return ([label] if is_new else [], stale, is_new)
 
 
+def csv_safe(text: str) -> str:
+    """Defuse spreadsheet formula injection in a grading-sheet cell.
+
+    The sheet is both the human deliverable and the eval harness's input, and
+    Sheets/Excel evaluate a leading =, +, - or @ when the file is opened - so an
+    =IMPORTXML(...) rationale would exfiltrate the row to a third party with no
+    click at all. A leading apostrophe forces the cell to text.
+    """
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+
+
 def wiki_safe(text: str) -> str:
     """Neutralise Jira wiki constructs in model output that act on third parties.
 
@@ -199,8 +286,13 @@ def wiki_safe(text: str) -> str:
     Escaping `[` and `!` disables mentions, links and images. The safety does
     not depend on how Jira renders the escape: either way the construct no
     longer fires.
+
+    Whitespace is collapsed for a second reason: the comment's own structure is
+    line-based (a label line, then the rationale, then a footer), so multi-line
+    model text could forge a second `AI triage: {{...}}` line and a fake footer,
+    making the rendered comment state a label that was never applied.
     """
-    return text.replace("[", "\\[").replace("!", "\\!")
+    return " ".join(text.split()).replace("[", "\\[").replace("!", "\\!")
 
 
 def comment_body(cfg: dict, c) -> str:
@@ -219,7 +311,7 @@ def comment_body(cfg: dict, c) -> str:
 
 
 def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, proposals: list,
-                    live: bool) -> pathlib.Path:
+                    live: bool, source: str = "api") -> pathlib.Path:
     # Seconds included: two quick --keys runs in the same minute would
     # otherwise overwrite a grading sheet someone had already started on.
     base = out / f"proposals-{stamp:%Y%m%d-%H%M%S}"
@@ -229,9 +321,11 @@ def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, prop
         w.writerow(PROPOSAL_COLUMNS)
         for issue, c, chash in proposals:
             w.writerow(
-                [issue["key"], url + issue["key"], issue["fields"].get("summary", ""), c.label,
-                 f"{c.confidence:.2f}", c.rationale, "; ".join(c.missing_info),
-                 "; ".join(c.verification_steps), chash, "", "", ""]
+                [issue["key"], url + issue["key"],
+                 csv_safe(issue["fields"].get("summary", "")), c.label,
+                 f"{c.confidence:.2f}", csv_safe(c.rationale),
+                 csv_safe("; ".join(c.missing_info)),
+                 csv_safe("; ".join(c.verification_steps)), chash, source, "", "", ""]
             )
     with open(base.with_suffix(".md"), "w") as fh:
         # The mode is stated because this file is also written on live runs,
@@ -246,13 +340,17 @@ def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, prop
                 "Grade in the matching CSV: `ok` or `wrong` in grade(ok/wrong); when wrong, set "
                 "correct_label to automation_candidate / needs_judgment / needs_more_info.\n\n"
             )
+        # Escaped for the same reason as the comment body: `![](url)` in a
+        # rationale is a tracking beacon fetched by everyone who opens this file.
         for issue, c, _ in proposals:
-            fh.write(f"## [{issue['key']}]({url}{issue['key']}) {issue['fields'].get('summary', '')}\n\n")
-            fh.write(f"**{c.label}** (confidence {c.confidence:.2f})\n\n{c.rationale}\n\n")
+            fh.write(f"## [{issue['key']}]({url}{issue['key']}) "
+                     f"{wiki_safe(issue['fields'].get('summary', ''))}\n\n")
+            fh.write(f"**{c.label}** (confidence {c.confidence:.2f})\n\n"
+                     f"{wiki_safe(c.rationale)}\n\n")
             if c.missing_info:
-                fh.write("Missing info: " + "; ".join(c.missing_info) + "\n\n")
+                fh.write("Missing info: " + "; ".join(map(wiki_safe, c.missing_info)) + "\n\n")
             if c.verification_steps:
-                fh.write("Verification: " + "; ".join(c.verification_steps) + "\n\n")
+                fh.write("Verification: " + "; ".join(map(wiki_safe, c.verification_steps)) + "\n\n")
     return base
 
 
@@ -270,6 +368,24 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     args = ap.parse_args(argv)
 
     cfg = load_config()
+
+    # Resolved before any network call: a contradictory flag combination or an
+    # unusable classifications file is a purely local fault, and failing on it
+    # after a full JQL sweep wastes the sweep and buries the error under later
+    # stdout. (Anthropic() resolves credentials lazily, so this does not surface
+    # a missing key any earlier - only the local faults move.)
+    if args.no_classify and args.classifications:
+        sys.exit("--no-classify and --classifications are contradictory")
+    classifier = None
+    if args.classifications:
+        classifier = FileClassifier(pathlib.Path(args.classifications),
+                                    cfg["prompt"]["version"])
+    elif not args.no_classify:
+        classifier = Classifier(
+            cfg["claude"]["model"], cfg["claude"]["max_tokens"],
+            (ROOT / "prompt" / "system.md").read_text(),
+        )
+
     jira = jira_from_env(cfg)
     bot_id = os.environ.get("TRIAGE_BOT_ACCOUNT_ID")
     if args.live and not (jira.authenticated and bot_id):
@@ -316,19 +432,10 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
         keys = keys[: args.limit]
     print(f"{len(keys)} ticket(s) in scope")
 
-    classifier = None
-    if args.no_classify and args.classifications:
-        sys.exit("--no-classify and --classifications are contradictory")
-    if args.classifications:
-        classifier = FileClassifier(pathlib.Path(args.classifications),
-                                    cfg["prompt"]["version"])
+    source = "file" if isinstance(classifier, FileClassifier) else "api"
+    if isinstance(classifier, FileClassifier):
         print(f"replaying {len(classifier.by_hash)} classification(s) by "
               f"{classifier.model}; no Claude call will be made")
-    elif not args.no_classify:
-        classifier = Classifier(
-            cfg["claude"]["model"], cfg["claude"]["max_tokens"],
-            (ROOT / "prompt" / "system.md").read_text(),
-        )
 
     fields = ctx.ISSUE_FIELDS + ([ac_field] if ac_field else [])
     proposals: list = []
@@ -351,11 +458,6 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             chash = ctx.content_hash(text)
             (out / "contexts" / f"{key}.txt").write_text(text)
             row["hash"] = chash
-            manifest[key] = {
-                "content_hash": chash,
-                "summary": issue["fields"].get("summary", ""),
-                "context": f"contexts/{key}.txt",
-            }
 
             # Dry-run skips the property read: nothing was written, so the
             # stored hash reflects the last *live* run, and re-grading the same
@@ -366,10 +468,15 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             # it graded under two prompt versions. Re-classification is quiet
             # unless the label actually flips.
             prop = {} if not args.live else (jira.get_property(key, PROPERTY_KEY) or {})
+            # The label is a function of content, prompt AND which classifier
+            # produced it, so all three are compared. Without the last, one
+            # replay run would permanently pin those tickets: the pinned-model
+            # pipeline would report skip-already-triaged forever.
             unchanged = (
                 not args.live
                 or (prop.get("contentHash") == chash
-                    and prop.get("prompt") == cfg["prompt"]["version"])
+                    and prop.get("prompt") == cfg["prompt"]["version"]
+                    and prop.get("source", "api") == source)
             )
             # Scope is re-checked only for live writes: a ticket can transition
             # out of "To Do" between the JQL sweep and this fetch, and labelling
@@ -380,6 +487,18 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             out_of_scope = args.live and status != cfg["jira"]["scope_status"]
             action = plan_ticket(st, unchanged, args.force, classifier is not None,
                                  out_of_scope)
+            # Listed when the ticket is eligible for classification - either it
+            # would be classified now, or the only thing stopping it is that this
+            # run has no classifier (--no-classify, the gather step). Tickets
+            # skipped for a state reason are excluded, so the manifest never
+            # invites an outside classifier to spend effort on a ticket the pilot
+            # has promised never to touch again.
+            if action in (None, "context-only"):
+                manifest[key] = {
+                    "content_hash": chash,
+                    "summary": issue["fields"].get("summary", ""),
+                    "context": f"contexts/{key}.txt",
+                }
             if action:
                 row["action"] = action
                 if action == "skip-opted-out":
@@ -404,9 +523,11 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                         jira.set_property(key, PROPERTY_KEY, {
                             "contentHash": chash, "label": label,
                             "prompt": cfg["prompt"]["version"],
-                            # Recorded so a later audit can tell which labels
-                            # came from the pinned model and which from a
-                            # replayed file - they are not the same experiment.
+                            # `source` is set by the pipeline, so it is evidence.
+                            # `classifier` is self-declared by whatever produced
+                            # the classification and is a label, not proof - a
+                            # file can claim any model name it likes.
+                            "source": source,
                             "classifier": c.model,
                             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         })
@@ -415,6 +536,11 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                     # is headed "labels and comments applied", so a ticket whose
                     # write raised must not appear in it.
                     proposals.append((issue, c, chash))
+        except NotClassified as e:
+            # Not a fault: a classifications file may cover a subset of the
+            # sweep. Recorded as a skip so it never trips the error breaker.
+            row["action"] = "skip-unclassified"
+            row["detail"] = str(e)[:200]
         except Exception as e:
             row["action"] = "error"
             row["error"] = f"{type(e).__name__}: {e}"[:300]
@@ -442,21 +568,26 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                   "rather than re-spending on every remaining ticket", file=sys.stderr)
             break
 
-    if manifest:
-        # Self-describing so whatever classifies these contexts (an agent in a
-        # session, a script) has the schema, the prompt version and the content
-        # hashes in one place, and can write a classifications file back.
+    # Written only by the gather step. An apply run reaches a different (often
+    # narrower) set of tickets, and overwriting the manifest with that set
+    # destroyed the very description the next batch is built from.
+    if args.no_classify and manifest:
         (out / "manifest.json").write_text(json.dumps({
             "at": stamp.isoformat(),
             "prompt_version": cfg["prompt"]["version"],
-            "mode": "live" if args.live else "dry-run",
-            "classification_schema": SCHEMA,
+            "complete": not consecutive >= CONSECUTIVE_ERROR_LIMIT,
+            # The schema of a classifications-file ENTRY, not of the model's
+            # response: an entry additionally requires content_hash, and the
+            # magnitude caps cannot be expressed in a response schema. A
+            # consumer that validated against the response schema would produce
+            # a file this pipeline rejects.
+            "entry_schema": classification_entry_schema(),
             "tickets": manifest,
         }, indent=2) + "\n")
-        print(f"\nManifest: {out / 'manifest.json'} ({len(manifest)} ticket(s))")
+        print(f"\nManifest: {out / 'manifest.json'} ({len(manifest)} ticket(s) to classify)")
 
     if proposals:
-        base = write_proposals(cfg, out, stamp, proposals, args.live)
+        base = write_proposals(cfg, out, stamp, proposals, args.live, source)
         print(f"\nGrading sheet: {base}.csv (and .md); contexts in {out / 'contexts'}")
     if errors:
         # Non-zero so a scheduled run turns red. Previously a sweep in which

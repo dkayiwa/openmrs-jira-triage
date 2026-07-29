@@ -19,7 +19,7 @@ import os
 import sys
 
 from .run import ai_label_names, jira_from_env, load_config
-from .state import inspect
+from .state import PROPERTY_KEY, inspect
 
 
 def parse_launch(value: str | None) -> datetime.datetime:
@@ -78,6 +78,7 @@ def main() -> int:
     labeled = within = removed = 0
     violations: list[str] = []
     failed: list[str] = []
+    replayed: list[str] = []
     cohort_keys = jira.search_keys(cohort)
     for key in cohort_keys:
         # Per-ticket isolation: this walk is hundreds of requests long, and one
@@ -98,6 +99,18 @@ def main() -> int:
         if not st.bot_first_labeled_at:
             continue
         labeled += 1
+        # The changelog cannot distinguish a replayed label from a pinned-model
+        # one - the bot's credentials wrote both - so the entity property is
+        # consulted for the labelled tickets only. Without this the three
+        # pre-registered metrics would silently pool two different systems.
+        try:
+            prop = jira.get_property(key, PROPERTY_KEY) or {}
+        except Exception as e:
+            failed.append(f"{key}: reading {PROPERTY_KEY}: {type(e).__name__}: {e}"[:200])
+            continue
+        if prop.get("source", "api") != "api":
+            replayed.append(f"{key}: source={prop.get('source')} "
+                            f"classifier={prop.get('classifier')}")
         if sla_met(issue["fields"]["created"], st.bot_first_labeled_at, launch):
             within += 1
         if st.opted_out:
@@ -130,6 +143,16 @@ def main() -> int:
             print(f"  {f}")
         print("\nNO DECISION: the cohort is incomplete, so these numbers are a "
               "lower bound. Re-run once the failures above are resolved.")
+        return 1
+    if replayed:
+        print(f"\n{len(replayed)} of {labeled} labelled ticket(s) were not labelled by "
+              "the pinned model:")
+        for r in replayed:
+            print(f"  {r}")
+        print("\nNO DECISION: the pre-registered thresholds assume one pinned model and "
+              "prompt per label, so this cohort mixes two systems. Re-classify the "
+              "tickets above with the API path (--force), or exclude them by agreement "
+              "with the pilot owners before deciding.")
         return 1
     print(f"\nDECISION: {decide(pct24, removal_rate, intro, m)}")
     return 0

