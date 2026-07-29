@@ -1,0 +1,41 @@
+name: triage
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        type: choice
+        options: [dry-run, live]
+        default: dry-run
+        description: live applies labels/comments; dry-run only produces artifacts
+      limit:
+        default: "0"
+        description: max tickets this run (0 = all in scope)
+  # Enable after the dry-run gate is passed (>= 90% grader agreement on evals).
+  # Every 4 hours comfortably meets the pilot's 24h SLA despite cron drift.
+  # schedule:
+  #   - cron: "17 */4 * * *"
+
+permissions:
+  contents: read
+
+jobs:
+  triage:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - run: python -m triage.run --limit "${{ inputs.limit || '0' }}" ${{ inputs.mode == 'live' && '--live' || '' }}
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TRIAGE_BOT_ACCOUNT_ID: ${{ secrets.TRIAGE_BOT_ACCOUNT_ID }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: triage-out
+          path: out/

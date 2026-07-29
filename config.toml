@@ -1,0 +1,45 @@
+# O3 AI triage pilot configuration.
+# Everything that shapes pilot results is pre-registered here and committed
+# before launch, per the design doc's "decision rule determined before results
+# analyzed".
+
+[jira]
+base_url = "https://openmrs.atlassian.net"
+project = "O3"
+# Pinned cohort start: set to (launch date - 90d) ONCE at launch. A rolling
+# "-90d" would let tickets silently age out mid-pilot and skew denominators.
+cohort_created_since = "2026-04-29"
+# The development[pullrequests] clause only sees dev-panel links indexed by the
+# GitHub-for-Jira app, not PR URLs pasted in comments. Verified via preflight.
+scope_jql = 'project = O3 AND issuetype != Epic AND status = "To Do" AND created >= "{since}" AND development[pullrequests].all = 0 ORDER BY created ASC'
+# Auto-discovered when empty; pin to e.g. "customfield_10816" to skip discovery.
+acceptance_criteria_field = ""
+
+[labels]
+# NOTE: names differ from the design doc's ai-triage/* form because Jira Cloud
+# rejects '/' in labels (preflight has a charset test). One label per ticket.
+automation_candidate = "ai-triage-automation-candidate"
+needs_judgment = "ai-triage-needs-judgment"
+needs_more_info = "ai-triage-needs-more-info"
+
+[bots]
+# Comment authors the classifier must never see, in addition to every
+# accountType == "app" author (GitHub bot etc.) and the triage bot itself.
+blocked_account_ids = []
+
+[claude]
+model = "claude-opus-5"
+max_tokens = 16000
+
+[prompt]
+# Bump whenever prompt/system.md changes; stamped into comments + journal so
+# label removals can be correlated with prompt versions.
+version = "v1"
+
+[metrics]
+# Pre-registered success thresholds from the design doc. Do not tune after launch.
+sorted_within_24h_pct = 95
+max_label_removal_rate = 0.10
+min_intro_outcomes = 5
+intro_label = "intro"
+intro_rejected_label = "not-intro"
