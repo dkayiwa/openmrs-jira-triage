@@ -28,16 +28,24 @@ def _labels(value: str | None) -> set[str]:
     return set((value or "").replace(",", " ").split())
 
 
-def inspect(issue: dict, ai_labels: list[str], bot_account_id: str | None) -> TicketState:
+def inspect(issue: dict, ai_labels: list[str], bot_account_id: str | None,
+            histories: list[dict] | None = None) -> TicketState:
     """Walk the changelog's labels-field items.
 
     With no bot_account_id configured, every ai-triage removal counts as an
     opt-out (the safe direction), and manual-add violations are not attributed.
+
+    `histories` overrides the issue's embedded changelog; callers that must not
+    miss an opt-out pass the full paged history (JiraClient.changelog), since
+    expand=changelog truncates at 100 entries.
     """
     st = TicketState(
         ai_labels_present=[l for l in issue["fields"].get("labels", []) if l in ai_labels]
     )
-    for history in (issue.get("changelog") or {}).get("histories", []):
+    if histories is None:
+        histories = (issue.get("changelog") or {}).get("histories", [])
+    ai_label_set = set(ai_labels)
+    for history in histories:
         author = history.get("author") or {}
         author_id = author.get("accountId")
         is_bot = bot_account_id is not None and author_id == bot_account_id
@@ -46,10 +54,10 @@ def inspect(issue: dict, ai_labels: list[str], bot_account_id: str | None) -> Ti
                 continue
             before = _labels(item.get("fromString"))
             after = _labels(item.get("toString"))
-            if (before - after) & set(ai_labels) and not is_bot:
+            if (before - after) & ai_label_set and not is_bot:
                 st.opted_out = True
                 st.opted_out_by = author.get("displayName") or author_id
-            if (after - before) & set(ai_labels):
+            if (after - before) & ai_label_set:
                 if is_bot:
                     # Keep the earliest add regardless of history ordering.
                     # Timestamps within one response share a timezone, so

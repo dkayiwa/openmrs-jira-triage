@@ -24,6 +24,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from triage.classifier import LABEL_KEYS, Classifier  # noqa: E402
+from triage.context import content_hash  # noqa: E402
 from triage.run import load_config  # noqa: E402
 
 EVALS = ROOT / "evals"
@@ -49,6 +50,15 @@ def import_proposals(path: str, contexts_dir: str) -> None:
             src = pathlib.Path(contexts_dir) / (r["key"] + ".txt")
             if not src.exists():
                 print(f"skip {r['key']}: no context at {src}")
+                continue
+            # out/contexts/<KEY>.txt is overwritten by every dry-run, so a later
+            # run can replace the text this grade was made against. Freezing the
+            # new context against the old grade would silently corrupt the set
+            # that gates the >= 90% go-live decision.
+            graded_hash = (r.get("content_hash") or "").strip()
+            if graded_hash and content_hash(src.read_text()) != graded_hash:
+                print(f"skip {r['key']}: {src} changed since grading; re-run the "
+                      "dry-run for this ticket and re-grade it")
                 continue
             CONTEXTS.mkdir(exist_ok=True)
             shutil.copy(src, CONTEXTS / src.name)

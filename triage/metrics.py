@@ -18,9 +18,34 @@ import datetime
 import os
 import sys
 
-from .classifier import LABEL_KEYS
-from .run import jira_from_env, load_config
+from .run import ai_label_names, jira_from_env, load_config
 from .state import inspect
+
+
+def sla_met(created: str, labeled_at: str, launch: datetime.datetime) -> bool:
+    """Was the ticket sorted within 24h of entering scope?
+
+    Measured from max(created, launch) because the initial backlog cohort is
+    older than 24h by definition.
+    """
+    start = max(datetime.datetime.fromisoformat(created), launch)
+    return datetime.datetime.fromisoformat(labeled_at) - start <= datetime.timedelta(hours=24)
+
+
+def decide(pct24: float, removal_rate: float, intro: int, m: dict) -> str:
+    """The pre-registered decision rule. Committed before launch; never tuned after."""
+    passes = [
+        pct24 >= m["sorted_within_24h_pct"],
+        removal_rate <= m["max_label_removal_rate"],
+        intro >= m["min_intro_outcomes"],
+    ]
+    if all(passes):
+        return "ADOPT"
+    # Removal rate is the kill metric: past double the threshold, no amount of
+    # throughput or intro output earns an extension.
+    if removal_rate <= 2 * m["max_label_removal_rate"] and sum(passes) >= 2:
+        return "EXTEND (two weeks)"
+    return "STOP"
 
 
 def main() -> int:
@@ -33,22 +58,26 @@ def main() -> int:
     if not m.get("pilot_launch"):
         sys.exit("set [metrics].pilot_launch in config.toml at launch - it anchors the 24h SLA")
     launch = datetime.datetime.fromisoformat(m["pilot_launch"] + "T00:00:00+00:00")
-    ai_labels = [cfg["labels"][k] for k in LABEL_KEYS]
+    ai_labels = ai_label_names(cfg)
 
-    cohort_jql = (
+    cohort = (
         f"project = {cfg['jira']['project']} AND issuetype != Epic "
         f"AND created >= \"{cfg['jira']['cohort_created_since']}\""
     )
     labeled = within = removed = 0
-    for key in jira.search_keys(cohort_jql):
+    violations: list[str] = []
+    for key in jira.search_keys(cohort):
         issue = jira.issue(key, ["created", "labels"], expand_changelog=True)
-        st = inspect(issue, ai_labels, bot_id)
+        st = inspect(issue, ai_labels, bot_id, jira.changelog(key, issue.get("changelog")))
+        # Collected before the bot-labeled filter: a maintainer hand-applying an
+        # ai-triage label to a ticket the bot never touched is the violation
+        # most worth seeing.
+        if st.human_adds:
+            violations.append(f"{key}: {', '.join(st.human_adds)}")
         if not st.bot_first_labeled_at:
             continue
         labeled += 1
-        created = datetime.datetime.fromisoformat(issue["fields"]["created"])
-        labeled_at = datetime.datetime.fromisoformat(st.bot_first_labeled_at)
-        if labeled_at - max(created, launch) <= datetime.timedelta(hours=24):
+        if sla_met(issue["fields"]["created"], st.bot_first_labeled_at, launch):
             within += 1
         if st.opted_out:
             removed += 1
@@ -59,28 +88,22 @@ def main() -> int:
     removal_rate = removed / labeled
     intro_quoted = ", ".join(f'"{l}"' for l in (m["intro_label"], m["intro_rejected_label"]))
     ai_quoted = ", ".join(f'"{l}"' for l in ai_labels)
-    intro_jql = (
-        f"project = {cfg['jira']['project']} "
-        f"AND labels in ({intro_quoted}) AND labels in ({ai_quoted})"
-    )
-    intro = len(jira.search_keys(intro_jql))
+    # Scoped to the same pre-registered cohort as the other two metrics, so all
+    # three denominators mean the same thing even if an ai-triage label is
+    # hand-applied to a ticket outside the window.
+    intro = len(jira.search_keys(
+        f"{cohort} AND labels in ({intro_quoted}) AND labels in ({ai_quoted})"
+    ))
 
     print(f"tickets labeled    : {labeled}")
     print(f"sorted within 24h  : {pct24:.0f}%  (target >= {m['sorted_within_24h_pct']}%)")
     print(f"label removal rate : {removal_rate:.2f}  (target <= {m['max_label_removal_rate']})")
     print(f"intro outcomes     : {intro}  (target >= {m['min_intro_outcomes']})")
+    print(f"convention adds    : {len(violations)}  (non-bot ai-triage label adds)")
+    for v in violations:
+        print(f"  {v}")
 
-    passes = [
-        pct24 >= m["sorted_within_24h_pct"],
-        removal_rate <= m["max_label_removal_rate"],
-        intro >= m["min_intro_outcomes"],
-    ]
-    if all(passes):
-        print("\nDECISION: ADOPT")
-    elif removal_rate <= 2 * m["max_label_removal_rate"] and sum(passes) >= 2:
-        print("\nDECISION: EXTEND (two weeks)")
-    else:
-        print("\nDECISION: STOP")
+    print(f"\nDECISION: {decide(pct24, removal_rate, intro, m)}")
     return 0
 
 

@@ -37,9 +37,10 @@ echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env   # .env is gitignored and auto-loade
 ```
 
 Useful flags: `--keys O3-4522,O3-5823` (specific tickets), `--no-classify`
-(context assembly only), `--force` (reclassify already-labeled tickets in
-dry-run), `--live` (real writes; needs `JIRA_EMAIL`, `JIRA_API_TOKEN`,
-`TRIAGE_BOT_ACCOUNT_ID`).
+(context assembly only), `--force` (reclassify already-labeled tickets; in
+`--live` this re-spends on classification and comments again on any label
+flip, but opt-outs are still respected), `--live` (real writes; needs
+`JIRA_EMAIL`, `JIRA_API_TOKEN`, `TRIAGE_BOT_ACCOUNT_ID`).
 
 ## What to hand to Dennis & Veronica
 
@@ -73,10 +74,15 @@ phase, every human label-removal gets added here as a new case.
 5. **Dry-run the whole cohort, grade, iterate** until the eval gate passes.
 6. **Enable writes:** add the four repo secrets, uncomment the `schedule` block
    in `.github/workflows/triage.yml`, or run `python -m triage.run --live`.
-7. **Weekly:** `python -m triage.metrics` prints the three pilot metrics and a
-   draft ADOPT / EXTEND / STOP against the pre-registered thresholds, computed
-   purely from Jira changelogs (set `pilot_launch` in config first). Pair with
-   a native Jira filter subscription for the dashboard digest.
+7. **Weekly:** `python -m triage.metrics` prints the three pilot metrics, any
+   non-bot `ai-triage-*` label adds (convention violations), and a draft
+   ADOPT / EXTEND / STOP against the pre-registered thresholds, computed purely
+   from Jira changelogs (set `pilot_launch` in config first). Pair with a native
+   Jira filter subscription for the dashboard digest.
+   Never run `--live` locally while the scheduled sweep may be running: the
+   workflow's `concurrency` group only serialises runs inside Actions, and two
+   sweeps that both read a ticket before either labels it will each post a
+   comment to every watcher.
 8. **Process note for maintainers:** removing an `ai-triage-*` label opts the
    ticket out permanently - including after promoting a ticket to `intro`.
    Leave the ai-triage label in place; the intro metric counts tickets holding

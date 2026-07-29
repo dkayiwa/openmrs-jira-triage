@@ -75,6 +75,24 @@ class JiraClient:
             if not token:
                 return keys
 
+    def _page_rest(self, path: str, item_key: str, out: list[dict], total: int) -> list[dict]:
+        """Append pages of `path` to `out` until it holds `total` items.
+
+        Jira caps embedded sub-resources (the issue GET's first page of
+        comments or changelog entries) at 100, so anything longer must be
+        completed from the dedicated endpoint.
+        """
+        while len(out) < total:
+            data = self._check(self._get(path, params={"startAt": len(out), "maxResults": 100}))
+            # /comment wraps items in "comments"; /changelog wraps them in
+            # "values" (both verified live against openmrs.atlassian.net).
+            page = data.get(item_key) or data.get("values") or []
+            if not page:
+                break
+            out += page
+            total = data.get("total", total)
+        return out
+
     def comments(self, key: str, embedded: dict | None) -> list[dict]:
         """Full comment list, paging past the issue GET's embedded first page.
 
@@ -84,26 +102,36 @@ class JiraClient:
         """
         emb = embedded or {}
         out = list(emb.get("comments", []))
-        total = emb.get("total", len(out))
-        while len(out) < total:
-            data = self._check(self._get(
-                f"/rest/api/2/issue/{key}/comment",
-                params={"startAt": len(out), "maxResults": 100},
-            ))
-            page = data.get("comments", [])
-            if not page:
-                break
-            out += page
-            total = data.get("total", total)
-        return out
+        return self._page_rest(f"/rest/api/2/issue/{key}/comment", "comments",
+                               out, emb.get("total", len(out)))
+
+    def changelog(self, key: str, embedded: dict | None) -> list[dict]:
+        """Full changelog history, paging past the issue GET's embedded page.
+
+        The changelog is the opt-out state store and expand=changelog embeds
+        only the first 100 entries - so on a heavily-edited ticket the entries
+        dropped are the *newest*, which is exactly where an opt-out removal
+        lives. Missing one would re-label a ticket a human opted out of.
+        """
+        emb = embedded or {}
+        out = list(emb.get("histories", []))
+        return self._page_rest(f"/rest/api/2/issue/{key}/changelog", "histories",
+                               out, emb.get("total", len(out)))
 
     def issue(self, key: str, fields: list[str], expand_changelog: bool = False) -> dict:
-        # expand=changelog embeds up to the first 100 history entries, plenty
-        # for young pilot tickets; page /changelog directly if that ever grows.
+        # expand=changelog embeds only the first 100 history entries; callers
+        # that must not miss one complete it via changelog() below.
         params = {"fields": ",".join(fields)}
         if expand_changelog:
             params["expand"] = "changelog"
-        return self._check(self._get(f"/rest/api/2/issue/{key}", params=params))
+        issue = self._check(self._get(f"/rest/api/2/issue/{key}", params=params))
+        if expand_changelog and "changelog" not in issue:
+            # A ticket with no history still comes back with an empty changelog
+            # object, so an absent key means the expansion was not honoured. It
+            # must not be read as "never touched": that would make every
+            # opt-out invisible and re-label tickets humans opted out of.
+            raise JiraError(f"{key}: expand=changelog returned no changelog")
+        return issue
 
     # -- writes (live mode only) --------------------------------------------
 
@@ -124,8 +152,13 @@ class JiraClient:
                                              json={"body": body}, timeout=self.timeout))
 
     def get_property(self, key: str, prop: str) -> dict | None:
+        # 404 means "never triaged" (the normal first-run case); anything else
+        # must fail loudly - swallowing a 401/500 here would silently reclassify
+        # every ticket on every live run instead of reporting broken auth.
         resp = self._get(f"/rest/api/2/issue/{key}/properties/{prop}")
-        return resp.json().get("value") if resp.status_code == 200 else None
+        if resp.status_code == 404:
+            return None
+        return (self._check(resp) or {}).get("value")
 
     def set_property(self, key: str, prop: str, value: dict) -> None:
         resp = self.session.put(self._url(f"/rest/api/2/issue/{key}/properties/{prop}"),

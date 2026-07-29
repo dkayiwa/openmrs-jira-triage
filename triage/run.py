@@ -1,8 +1,9 @@
 """Triage pilot runner.
 
 Dry-run is the default: it writes proposals, contexts and a journal under
-out/ and touches nothing in Jira. --live (gated on credentials and a bot
-account id) applies exactly one ai-triage-* label plus one comment per ticket.
+out/ and touches nothing in Jira. --live (gated on credentials, and on the
+configured bot account id actually matching those credentials) applies exactly
+one ai-triage-* label plus one comment per ticket.
 """
 from __future__ import annotations
 
@@ -18,7 +19,7 @@ import tomllib
 from . import context as ctx
 from .classifier import LABEL_KEYS, Classifier
 from .jira import JiraClient
-from .state import PROPERTY_KEY, inspect
+from .state import PROPERTY_KEY, TicketState, inspect
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
@@ -42,6 +43,15 @@ def load_config() -> dict:
         return tomllib.load(fh)
 
 
+def ai_label_names(cfg: dict) -> list[str]:
+    """The pilot's ai-triage-* label names.
+
+    Single-sourced because run.py applies these and metrics.py measures them:
+    a divergence between the two would silently measure the wrong labels.
+    """
+    return [cfg["labels"][k] for k in LABEL_KEYS]
+
+
 def jira_from_env(cfg: dict) -> JiraClient:
     return JiraClient(
         os.environ.get("JIRA_BASE_URL", cfg["jira"]["base_url"]),
@@ -50,11 +60,52 @@ def jira_from_env(cfg: dict) -> JiraClient:
     )
 
 
+def bot_identity_error(jira: JiraClient, bot_id: str | None) -> str | None:
+    """Describe a TRIAGE_BOT_ACCOUNT_ID that cannot belong to these credentials.
+
+    A wrong bot id fails silently and badly: the bot's own label flips read as
+    human removals (permanently opting those tickets out of the pilot), its own
+    adds are logged as convention violations, and its own comments leak into
+    classifier contexts. Returns None when unauthenticated (nothing to compare).
+    """
+    if not (bot_id and jira.authenticated):
+        return None
+    me = jira.myself()
+    if not me:
+        return None
+    actual = me.get("accountId")
+    if actual and actual != bot_id:
+        return (f"TRIAGE_BOT_ACCOUNT_ID is {bot_id} but these credentials are "
+                f"{me.get('displayName') or '?'} ({actual})")
+    return None
+
+
+def plan_ticket(st: TicketState, unchanged: bool, force: bool,
+                can_classify: bool) -> str | None:
+    """The skip action for this ticket, or None to classify it.
+
+    Opt-out is tested first and unconditionally: --force must never re-label a
+    ticket a human removed an ai-triage label from.
+    """
+    if st.opted_out:
+        return "skip-opted-out"
+    if st.ai_labels_present and unchanged and not force:
+        return "skip-already-triaged"
+    if not can_classify:
+        return "context-only"
+    return None
+
+
 def plan_label_writes(present: list[str], label: str) -> tuple[list[str], list[str], bool]:
     """(labels_to_add, labels_to_remove, post_comment).
 
     Comment only when the label is new for the ticket: re-runs after content
     edits or a lost property must never post duplicate comments to watchers.
+
+    The trade this makes: a crash between the label write and the comment write
+    leaves the ticket labelled with no comment, and no later run will add one
+    (the label is already there). The journal's error row is the recovery
+    signal. A missing comment is quieter than a duplicate one to every watcher.
     """
     is_new = label not in present
     stale = [l for l in present if l != label]
@@ -76,29 +127,42 @@ def comment_body(cfg: dict, c) -> str:
     return "\n".join(lines)
 
 
-def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, proposals: list) -> pathlib.Path:
-    base = out / f"proposals-{stamp:%Y%m%d-%H%M}"
+def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, proposals: list,
+                    live: bool) -> pathlib.Path:
+    # Seconds included: two quick --keys runs in the same minute would
+    # otherwise overwrite a grading sheet someone had already started on.
+    base = out / f"proposals-{stamp:%Y%m%d-%H%M%S}"
     url = cfg["jira"]["base_url"] + "/browse/"
     with open(base.with_suffix(".csv"), "w", newline="") as fh:
         w = csv.writer(fh)
+        # content_hash pins each grade to the exact context it was made against,
+        # so importing into the eval set can detect a context that has since
+        # been overwritten by a later dry-run.
         w.writerow(
             ["key", "url", "summary", "proposed_label", "confidence", "rationale",
-             "missing_info", "verification_steps", "grade(ok/wrong)", "correct_label", "grader_notes"]
+             "missing_info", "verification_steps", "content_hash",
+             "grade(ok/wrong)", "correct_label", "grader_notes"]
         )
-        for issue, c in proposals:
+        for issue, c, chash in proposals:
             w.writerow(
                 [issue["key"], url + issue["key"], issue["fields"].get("summary", ""), c.label,
                  f"{c.confidence:.2f}", c.rationale, "; ".join(c.missing_info),
-                 "; ".join(c.verification_steps), "", "", ""]
+                 "; ".join(c.verification_steps), chash, "", "", ""]
             )
     with open(base.with_suffix(".md"), "w") as fh:
+        # The mode is stated because this file is also written on live runs,
+        # where it is an audit trail of writes that already happened - not a
+        # preview of writes that did not.
         fh.write(
             f"# Triage proposals - {stamp:%Y-%m-%d %H:%M} UTC "
-            f"(prompt {cfg['prompt']['version']}, dry-run)\n\n"
-            "Grade in the matching CSV: `ok` or `wrong` in grade(ok/wrong); when wrong, set "
-            "correct_label to automation_candidate / needs_judgment / needs_more_info.\n\n"
+            f"(prompt {cfg['prompt']['version']}, {'LIVE - labels and comments applied' if live else 'dry-run'})\n\n"
         )
-        for issue, c in proposals:
+        if not live:
+            fh.write(
+                "Grade in the matching CSV: `ok` or `wrong` in grade(ok/wrong); when wrong, set "
+                "correct_label to automation_candidate / needs_judgment / needs_more_info.\n\n"
+            )
+        for issue, c, _ in proposals:
             fh.write(f"## [{issue['key']}]({url}{issue['key']}) {issue['fields'].get('summary', '')}\n\n")
             fh.write(f"**{c.label}** (confidence {c.confidence:.2f})\n\n{c.rationale}\n\n")
             if c.missing_info:
@@ -108,7 +172,7 @@ def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, prop
     return base
 
 
-def main(argv=None) -> int:
+def main(argv=None, out: pathlib.Path | None = None) -> int:
     ap = argparse.ArgumentParser(description="OpenMRS O3 AI triage pilot")
     ap.add_argument("--live", action="store_true", help="apply labels/comments (default: dry-run)")
     ap.add_argument("--limit", type=int, default=0, help="max tickets this run (0 = all)")
@@ -123,8 +187,20 @@ def main(argv=None) -> int:
     bot_id = os.environ.get("TRIAGE_BOT_ACCOUNT_ID")
     if args.live and not (jira.authenticated and bot_id):
         sys.exit("--live needs JIRA_EMAIL, JIRA_API_TOKEN and TRIAGE_BOT_ACCOUNT_ID")
+    mismatch = bot_identity_error(jira, bot_id)
+    if mismatch and args.live:
+        sys.exit(mismatch)
+    if mismatch:
+        print(f"WARN: {mismatch}", file=sys.stderr)
+    # Gated on pilot_launch so this stays quiet during pre-launch grading, when
+    # there are no bot comments or ai-triage labels for it to be about; once the
+    # pilot is live it fires before any classification is paid for.
+    if not bot_id and cfg["metrics"].get("pilot_launch"):
+        print("WARN: TRIAGE_BOT_ACCOUNT_ID unset; the bot's own comments will not be "
+              "filtered out of contexts and every ai-triage removal counts as an opt-out",
+              file=sys.stderr)
 
-    out = ROOT / "out"
+    out = out or ROOT / "out"
     (out / "contexts").mkdir(parents=True, exist_ok=True)
     stamp = datetime.datetime.now(datetime.timezone.utc)
 
@@ -132,7 +208,7 @@ def main(argv=None) -> int:
     if not ac_field:
         print("WARN: Acceptance Criteria field not found; classifying without it", file=sys.stderr)
 
-    ai_labels = [cfg["labels"][k] for k in LABEL_KEYS]
+    ai_labels = ai_label_names(cfg)
     blocked = list(cfg["bots"]["blocked_account_ids"]) + ([bot_id] if bot_id else [])
 
     if args.keys:
@@ -173,31 +249,41 @@ def main(argv=None) -> int:
         # Jira write failure) must not abort the rest of the sweep.
         try:
             issue = jira.issue(key, fields, expand_changelog=True)
-            st = inspect(issue, ai_labels, bot_id)
+            st = inspect(issue, ai_labels, bot_id,
+                         jira.changelog(key, issue.get("changelog")))
             text = ctx.assemble(jira, issue, ac_field, blocked)
             chash = ctx.content_hash(text)
             (out / "contexts" / f"{key}.txt").write_text(text)
             row["hash"] = chash
 
+            # Dry-run skips the property read: nothing was written, so the
+            # stored hash reflects the last *live* run, and re-grading the same
+            # unchanged ticket would just re-spend on classification.
+            #
+            # The label is a function of the content AND the prompt, so both are
+            # compared: a prompt bump must re-sweep the cohort rather than leave
+            # it graded under two prompt versions. Re-classification is quiet
+            # unless the label actually flips.
+            prop = {} if not args.live else (jira.get_property(key, PROPERTY_KEY) or {})
             unchanged = (
                 not args.live
-                or (jira.get_property(key, PROPERTY_KEY) or {}).get("contentHash") == chash
+                or (prop.get("contentHash") == chash
+                    and prop.get("prompt") == cfg["prompt"]["version"])
             )
-            if st.opted_out:
-                row["action"] = "skip-opted-out"
-                row["by"] = st.opted_out_by
-            elif st.ai_labels_present and unchanged and not args.force:
-                row["action"] = "skip-already-triaged"
-                row["labels"] = st.ai_labels_present
-            elif classifier is None:
-                row["action"] = "context-only"
+            action = plan_ticket(st, unchanged, args.force, classifier is not None)
+            if action:
+                row["action"] = action
+                if action == "skip-opted-out":
+                    row["by"] = st.opted_out_by
+                elif action == "skip-already-triaged":
+                    row["labels"] = st.ai_labels_present
             else:
                 c = classifier.classify(text)
                 if c.refused:
                     row["action"] = "error-refusal"
                 else:
                     row.update(action="proposed", label=c.label, confidence=c.confidence, model=c.model)
-                    proposals.append((issue, c))
+                    proposals.append((issue, c, chash))
                     if args.live:
                         label = cfg["labels"][c.label]
                         add, remove, post_comment = plan_label_writes(st.ai_labels_present, label)
@@ -225,7 +311,7 @@ def main(argv=None) -> int:
         print(f"  {key}: {row['action']}{suffix}")
 
     if proposals:
-        base = write_proposals(cfg, out, stamp, proposals)
+        base = write_proposals(cfg, out, stamp, proposals, args.live)
         print(f"\nGrading sheet: {base}.csv (and .md); contexts in {out / 'contexts'}")
     return 0
 

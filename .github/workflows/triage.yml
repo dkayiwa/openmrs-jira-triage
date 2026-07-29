@@ -37,8 +37,11 @@ jobs:
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -s tests -q
       # Scheduled runs are live by definition; manual dispatches choose.
-      - run: python -m triage.run --limit "${{ inputs.limit || '0' }}" ${{ (github.event_name == 'schedule' || inputs.mode == 'live') && '--live' || '' }}
+      # LIMIT goes through env, not ${{ }} interpolation into the shell line:
+      # a dispatch input is arbitrary text and would otherwise be executed.
+      - run: python -m triage.run --limit "$LIMIT" ${{ (github.event_name == 'schedule' || inputs.mode == 'live') && '--live' || '' }}
         env:
+          LIMIT: ${{ inputs.limit || '0' }}
           JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           TRIAGE_BOT_ACCOUNT_ID: ${{ secrets.TRIAGE_BOT_ACCOUNT_ID }}

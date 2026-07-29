@@ -14,7 +14,7 @@ import sys
 
 from . import context as ctx
 from .jira import JiraError
-from .run import jira_from_env, load_config
+from .run import bot_identity_error, jira_from_env, load_config
 
 
 def check(label: str, ok: bool, detail: str = "") -> bool:
@@ -39,6 +39,17 @@ def main(argv=None) -> int:
     ok &= check("jira reachable", True, f"{info.get('baseUrl')} ({info.get('deploymentType')})")
     me = jira.myself()
     print(f"       auth: {'as ' + (me.get('displayName') or '?') if me else 'anonymous (read-only)'}")
+
+    # Checked here because a wrong bot id is silent at runtime: the bot's own
+    # label flips would read as human opt-outs and permanently skip tickets.
+    bot_id = os.environ.get("TRIAGE_BOT_ACCOUNT_ID")
+    if not bot_id:
+        print("       TRIAGE_BOT_ACCOUNT_ID: unset (required for --live)")
+    elif not jira.authenticated:
+        print(f"       TRIAGE_BOT_ACCOUNT_ID: {bot_id} (unverified - no bot credentials)")
+    else:
+        mismatch = bot_identity_error(jira, bot_id)
+        ok &= check("TRIAGE_BOT_ACCOUNT_ID matches credentials", not mismatch, mismatch or bot_id)
 
     statuses: set[str] = set()
     for itype in jira.project_statuses(cfg["jira"]["project"]):
@@ -65,14 +76,21 @@ def main(argv=None) -> int:
 
     if args.scratch and jira.authenticated:
         slash_label = "ai-triage/charset-test"
+        # Only the *add* may count as evidence: wrapping the cleanup removal in
+        # the same try would report a failed removal as "slash rejected", the
+        # opposite conclusion, and leave the label on the scratch ticket.
         try:
             jira.update_labels(args.scratch, [slash_label], [])
-            jira.update_labels(args.scratch, [], [slash_label])
+        except JiraError:
+            check("slash rejected in labels", True, "hyphenated ai-triage-* names are required")
+        else:
             check("slash rejected in labels", False,
                   f"Jira accepted {slash_label!r}; the doc's ai-triage/* names would work after all")
             ok = False
-        except JiraError:
-            check("slash rejected in labels", True, "hyphenated ai-triage-* names are required")
+            try:
+                jira.update_labels(args.scratch, [], [slash_label])
+            except JiraError:
+                print(f"       WARN: could not remove {slash_label} from {args.scratch}")
         hyphen_label = "ai-triage-charset-test"
         try:
             jira.update_labels(args.scratch, [hyphen_label], [])

@@ -65,6 +65,16 @@ class Classifier:
         )
         if response.stop_reason == "refusal":
             return Classification("", "", [], [], 0.0, response.model, refused=True)
+        if response.stop_reason == "max_tokens":
+            # Thinking is on by default on Opus 5 and shares the max_tokens
+            # budget with the response, so a hard ticket can truncate the JSON.
+            # Caught here because the bare JSONDecodeError it otherwise causes
+            # is undiagnosable, and it would recur on every sweep: the content
+            # hash is unchanged, so the ticket never stops being retried.
+            raise RuntimeError(
+                f"classification truncated at max_tokens={self.max_tokens}; "
+                "raise [claude].max_tokens in config.toml"
+            )
         block = next((b for b in response.content if b.type == "text"), None)
         if block is None:
             raise RuntimeError(f"no text block in response (stop_reason={response.stop_reason})")
