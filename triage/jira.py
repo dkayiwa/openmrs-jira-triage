@@ -75,48 +75,55 @@ class JiraClient:
             if not token:
                 return keys
 
-    def _page_rest(self, path: str, item_key: str, out: list[dict], total: int) -> list[dict]:
-        """Append pages of `path` to `out` until it holds `total` items.
+    def _complete(self, path: str, embedded: dict | None, embedded_key: str,
+                  page_key: str) -> list[dict]:
+        """Every item of a sub-resource, cheaply when the issue GET sufficed.
 
-        Jira caps embedded sub-resources (the issue GET's first page of
-        comments or changelog entries) at 100, so anything longer must be
-        completed from the dedicated endpoint.
+        The embedded page cannot be extended, only replaced. Jira returns the
+        *newest* window there, and does not describe it consistently - verified
+        live: LUI-45's embedded comments report startAt 35 of total 135, while
+        TRUNK-324's embedded changelog reports startAt 0 yet returns the newest
+        100 in descending order, opposite to the dedicated endpoint's ascending
+        order. Appending dedicated pages to that window therefore duplicates
+        the overlap and silently drops the oldest entries. So the embedded page
+        is used only when it is already complete; once truncated it is
+        discarded and the dedicated endpoint is read from the start.
         """
-        while len(out) < total:
-            data = self._check(self._get(path, params={"startAt": len(out), "maxResults": 100}))
-            # /comment wraps items in "comments"; /changelog wraps them in
-            # "values" (both verified live against openmrs.atlassian.net).
-            page = data.get(item_key) or data.get("values") or []
-            if not page:
-                break
-            out += page
+        emb = embedded or {}
+        items = list(emb.get(embedded_key, []))
+        total = emb.get("total", len(items))
+        if len(items) >= total:
+            return items
+        items = []
+        while True:
+            data = self._check(self._get(path, params={"startAt": len(items),
+                                                       "maxResults": 100}))
+            page = data.get(page_key) or []
+            items += page
             total = data.get("total", total)
-        return out
+            if not page or len(items) >= total:
+                return items
 
     def comments(self, key: str, embedded: dict | None) -> list[dict]:
-        """Full comment list, paging past the issue GET's embedded first page.
+        """Every comment on the ticket.
 
-        The visible-information contract includes every human comment, so a
-        chatty ticket must not silently lose its newest comments to the
-        embedded page limit.
+        The visible-information contract covers every human comment, so a
+        chatty ticket must not silently lose any to the embedded page limit.
         """
-        emb = embedded or {}
-        out = list(emb.get("comments", []))
-        return self._page_rest(f"/rest/api/2/issue/{key}/comment", "comments",
-                               out, emb.get("total", len(out)))
+        return self._complete(f"/rest/api/2/issue/{key}/comment", embedded,
+                              "comments", "comments")
 
     def changelog(self, key: str, embedded: dict | None) -> list[dict]:
-        """Full changelog history, paging past the issue GET's embedded page.
+        """Every changelog entry on the ticket.
 
-        The changelog is the opt-out state store and expand=changelog embeds
-        only the first 100 entries - so on a heavily-edited ticket the entries
-        dropped are the *newest*, which is exactly where an opt-out removal
-        lives. Missing one would re-label a ticket a human opted out of.
+        This is the opt-out state store: a missed non-bot label removal would
+        re-label a ticket a human opted out of. The bot's own first label add
+        (the 24h SLA's start point) is likewise only findable in the full
+        history. The dedicated endpoint wraps entries in "values", not
+        "histories".
         """
-        emb = embedded or {}
-        out = list(emb.get("histories", []))
-        return self._page_rest(f"/rest/api/2/issue/{key}/changelog", "histories",
-                               out, emb.get("total", len(out)))
+        return self._complete(f"/rest/api/2/issue/{key}/changelog", embedded,
+                              "histories", "values")
 
     def issue(self, key: str, fields: list[str], expand_changelog: bool = False) -> dict:
         # expand=changelog embeds only the first 100 history entries; callers

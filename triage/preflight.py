@@ -54,13 +54,18 @@ def main(argv=None) -> int:
     statuses: set[str] = set()
     for itype in jira.project_statuses(cfg["jira"]["project"]):
         statuses.update(s["name"] for s in itype["statuses"])
-    ok &= check('"To Do" status exists', "To Do" in statuses, f"project statuses: {sorted(statuses)}")
+    # Reads the configured status rather than a literal, so renaming the pilot's
+    # in-scope status cannot leave preflight validating one the pipeline no
+    # longer uses while every live ticket is skipped as out of scope.
+    scope_status = cfg["jira"]["scope_status"]
+    ok &= check(f'"{scope_status}" status exists', scope_status in statuses,
+                f"project statuses: {sorted(statuses)}")
 
     ac = ctx.discover_ac_field(jira, cfg["jira"].get("acceptance_criteria_field", ""))
     ok &= check("Acceptance Criteria field", bool(ac), ac or "not found")
 
     jql = cfg["jira"]["scope_jql"].format(since=cfg["jira"]["cohort_created_since"])
-    dev_clause = " AND development[pullrequests].all = 0"
+    dev_clause = cfg["jira"]["dev_panel_clause"]
     try:
         n = len(jira.search_keys(jql))
         ok &= check("scope JQL (with development[] clause)", True, f"{n} ticket(s); doc estimates ~35")

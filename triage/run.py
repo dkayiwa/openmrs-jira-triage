@@ -23,6 +23,21 @@ from .state import PROPERTY_KEY, TicketState, inspect
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
+# A systemic fault (missing permission, rotated key, API outage) fails every
+# ticket. Each failure re-spends a paid classification on the next sweep, so the
+# sweep stops rather than working through the whole cohort six times a day.
+CONSECUTIVE_ERROR_LIMIT = 5
+
+# The grading sheet's columns. evals/run_evals.py reads several of these by
+# name, so they are named once here; a round-trip test pins the two together.
+# content_hash pins each grade to the exact context it was made against, so the
+# import can detect a context overwritten by a later dry-run.
+PROPOSAL_COLUMNS = [
+    "key", "url", "summary", "proposed_label", "confidence", "rationale",
+    "missing_info", "verification_steps", "content_hash",
+    "grade(ok/wrong)", "correct_label", "grader_notes",
+]
+
 
 def _load_dotenv(env: pathlib.Path | None = None) -> None:
     """Load .env into os.environ (existing env vars win)."""
@@ -70,25 +85,31 @@ def bot_identity_error(jira: JiraClient, bot_id: str | None) -> str | None:
     """
     if not (bot_id and jira.authenticated):
         return None
+    # Fails closed: an unusable /myself means the check could not run, which is
+    # not the same as passing. Proceeding unverified is how the silent
+    # cohort-wide opt-out this guard exists to prevent would happen anyway.
     me = jira.myself()
-    if not me:
-        return None
-    actual = me.get("accountId")
-    if actual and actual != bot_id:
+    actual = (me or {}).get("accountId")
+    if not actual:
+        return "could not verify TRIAGE_BOT_ACCOUNT_ID: /myself returned no account"
+    if actual != bot_id:
         return (f"TRIAGE_BOT_ACCOUNT_ID is {bot_id} but these credentials are "
                 f"{me.get('displayName') or '?'} ({actual})")
     return None
 
 
-def plan_ticket(st: TicketState, unchanged: bool, force: bool,
-                can_classify: bool) -> str | None:
+def plan_ticket(st: TicketState, unchanged: bool, force: bool, can_classify: bool,
+                out_of_scope: bool = False) -> str | None:
     """The skip action for this ticket, or None to classify it.
 
-    Opt-out is tested first and unconditionally: --force must never re-label a
-    ticket a human removed an ai-triage label from.
+    Opt-out and out-of-scope are tested first and unconditionally: --force is
+    about reclassifying already-triaged tickets, never about re-labelling one a
+    human opted out of, or one that has left the pilot's scope.
     """
     if st.opted_out:
         return "skip-opted-out"
+    if out_of_scope:
+        return "skip-out-of-scope"
     if st.ai_labels_present and unchanged and not force:
         return "skip-already-triaged"
     if not can_classify:
@@ -112,13 +133,30 @@ def plan_label_writes(present: list[str], label: str) -> tuple[list[str], list[s
     return ([label] if is_new else [], stale, is_new)
 
 
+def wiki_safe(text: str) -> str:
+    """Neutralise Jira wiki constructs in model output that act on third parties.
+
+    Ticket text is untrusted and reaches the model, so the model's output is
+    untrusted too. In a v2 comment body `[~accountid:...]` renders as a real
+    @mention that notifies that account, and `!url!` embeds a remote image
+    fetched by everyone who views the ticket - both actions on people who never
+    asked, re-fired on every content change. Cohort tickets already contain
+    literal accountid tokens, so this is reachable, not theoretical.
+
+    Escaping `[` and `!` disables mentions, links and images. The safety does
+    not depend on how Jira renders the escape: either way the construct no
+    longer fires.
+    """
+    return text.replace("[", "\\[").replace("!", "\\!")
+
+
 def comment_body(cfg: dict, c) -> str:
     label = cfg["labels"][c.label]
-    lines = [f"AI triage: {{{{{label}}}}}", "", c.rationale]
+    lines = [f"AI triage: {{{{{label}}}}}", "", wiki_safe(c.rationale)]
     if c.label == "needs_more_info" and c.missing_info:
-        lines += ["", "Missing information:"] + [f"- {m}" for m in c.missing_info]
+        lines += ["", "Missing information:"] + [f"- {wiki_safe(m)}" for m in c.missing_info]
     if c.label == "automation_candidate" and c.verification_steps:
-        lines += ["", "How to verify:"] + [f"- {v}" for v in c.verification_steps]
+        lines += ["", "How to verify:"] + [f"- {wiki_safe(v)}" for v in c.verification_steps]
     lines += [
         "",
         "_Applied by the triage pilot bot from this ticket's visible content only. "
@@ -135,14 +173,7 @@ def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, prop
     url = cfg["jira"]["base_url"] + "/browse/"
     with open(base.with_suffix(".csv"), "w", newline="") as fh:
         w = csv.writer(fh)
-        # content_hash pins each grade to the exact context it was made against,
-        # so importing into the eval set can detect a context that has since
-        # been overwritten by a later dry-run.
-        w.writerow(
-            ["key", "url", "summary", "proposed_label", "confidence", "rationale",
-             "missing_info", "verification_steps", "content_hash",
-             "grade(ok/wrong)", "correct_label", "grader_notes"]
-        )
+        w.writerow(PROPOSAL_COLUMNS)
         for issue, c, chash in proposals:
             w.writerow(
                 [issue["key"], url + issue["key"], issue["fields"].get("summary", ""), c.label,
@@ -218,7 +249,7 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
         try:
             keys = jira.search_keys(jql)
         except Exception as e:
-            dev_clause = " AND development[pullrequests].all = 0"
+            dev_clause = cfg["jira"]["dev_panel_clause"]
             if dev_clause in jql and "development" in str(e).lower():
                 print("WARN: development[] JQL clause rejected here; sweeping without the "
                       "no-linked-PRs filter", file=sys.stderr)
@@ -238,6 +269,7 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
 
     fields = ctx.ISSUE_FIELDS + ([ac_field] if ac_field else [])
     proposals: list = []
+    errors = consecutive = 0
     journal = out / "journal.jsonl"
     for key in keys:
         row: dict = {
@@ -270,11 +302,21 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                 or (prop.get("contentHash") == chash
                     and prop.get("prompt") == cfg["prompt"]["version"])
             )
-            action = plan_ticket(st, unchanged, args.force, classifier is not None)
+            # Scope is re-checked only for live writes: a ticket can transition
+            # out of "To Do" between the JQL sweep and this fetch, and labelling
+            # it then invites a removal - which is a permanent opt-out and counts
+            # against the removal-rate metric. Dry-run stays permissive so any
+            # ticket can still be inspected with --keys.
+            status = (issue["fields"].get("status") or {}).get("name")
+            out_of_scope = args.live and status != cfg["jira"]["scope_status"]
+            action = plan_ticket(st, unchanged, args.force, classifier is not None,
+                                 out_of_scope)
             if action:
                 row["action"] = action
                 if action == "skip-opted-out":
                     row["by"] = st.opted_out_by
+                elif action == "skip-out-of-scope":
+                    row["status"] = status
                 elif action == "skip-already-triaged":
                     row["labels"] = st.ai_labels_present
             else:
@@ -283,7 +325,6 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                     row["action"] = "error-refusal"
                 else:
                     row.update(action="proposed", label=c.label, confidence=c.confidence, model=c.model)
-                    proposals.append((issue, c, chash))
                     if args.live:
                         label = cfg["labels"][c.label]
                         add, remove, post_comment = plan_label_writes(st.ai_labels_present, label)
@@ -297,22 +338,46 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         })
                         row["action"] = "labeled" if post_comment else "refreshed"
+                    # Recorded only once the writes have landed: the live sheet
+                    # is headed "labels and comments applied", so a ticket whose
+                    # write raised must not appear in it.
+                    proposals.append((issue, c, chash))
         except Exception as e:
             row["action"] = "error"
             row["error"] = f"{type(e).__name__}: {e}"[:300]
         if st and st.human_adds:
             row["convention_violation_adds"] = st.human_adds
         row["at"] = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        # An errored ticket writes no property, so its content hash never
+        # changes and the next sweep classifies it again - a systemic fault
+        # (a missing entity-property permission, a rotated API key, truncation)
+        # would otherwise re-spend on every ticket every four hours, silently.
+        # Stopping early caps that at CONSECUTIVE_ERROR_LIMIT paid calls.
+        if row["action"].startswith("error"):
+            errors += 1
+            consecutive += 1
+        else:
+            consecutive = 0
         with open(journal, "a") as fh:
             fh.write(json.dumps(row) + "\n")
         suffix = f" -> {row['label']}" if row.get("label") else ""
         if row["action"] == "error":
             suffix = f" ({row['error']})"
         print(f"  {key}: {row['action']}{suffix}")
+        if consecutive >= CONSECUTIVE_ERROR_LIMIT:
+            print(f"\nABORT: {consecutive} tickets in a row failed; stopping the sweep "
+                  "rather than re-spending on every remaining ticket", file=sys.stderr)
+            break
 
     if proposals:
         base = write_proposals(cfg, out, stamp, proposals, args.live)
         print(f"\nGrading sheet: {base}.csv (and .md); contexts in {out / 'contexts'}")
+    if errors:
+        # Non-zero so a scheduled run turns red. Previously a sweep in which
+        # every ticket failed still exited 0, so the only evidence was a line
+        # inside an artifact nobody opens.
+        print(f"\n{errors} of {len(keys)} ticket(s) failed", file=sys.stderr)
+        return 1
     return 0
 
 

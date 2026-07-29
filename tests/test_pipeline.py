@@ -26,7 +26,7 @@ from triage import context as ctx  # noqa: E402
 from triage import metrics, run  # noqa: E402
 from triage.classifier import LABEL_KEYS, SCHEMA, Classification, Classifier  # noqa: E402
 from triage.jira import JiraClient, JiraError  # noqa: E402
-from triage.metrics import decide, sla_met  # noqa: E402
+from triage.metrics import decide, parse_launch, sla_met  # noqa: E402
 from triage.run import (  # noqa: E402
     _load_dotenv,
     bot_identity_error,
@@ -44,6 +44,7 @@ def issue(labels=(), histories=(), comments=(), **fields):
     base = {
         "summary": "Fix the widget", "description": "It is broken.",
         "labels": list(labels), "issuelinks": [], "parent": None,
+        "status": {"name": "To Do"},
         "comment": {"comments": list(comments), "total": len(comments)},
     }
     base.update(fields)
@@ -178,6 +179,20 @@ class StateTests(unittest.TestCase):
         st = inspect(issue(labels=[AI[0], "intro"]), AI, "bot")
         self.assertEqual(st.ai_labels_present, [AI[0]])
 
+    def test_truncated_embedded_changelog_raises_rather_than_truncating(self):
+        # The convenience default must not become a quiet correctness hole: a
+        # truncated page can spot an opt-out but cannot find the bot's first add.
+        iss = issue()
+        iss["changelog"] = {"histories": [{"items": []}] * 100, "total": 264}
+        with self.assertRaises(ValueError) as caught:
+            inspect(iss, AI, "bot")
+        self.assertIn("truncated", str(caught.exception))
+
+    def test_complete_embedded_changelog_is_accepted(self):
+        iss = issue(histories=[label_change("bot", "", AI[0])])
+        iss["changelog"]["total"] = 1
+        self.assertIsNone(inspect(iss, AI, "bot").opted_out_by)
+
     def test_bot_first_label_time_captured(self):
         st = inspect(
             issue(histories=[
@@ -243,6 +258,39 @@ class CommentTests(unittest.TestCase):
         self.assertIn("- run the report", body)
 
 
+class WikiSafeTests(unittest.TestCase):
+    """Model output is untrusted: it is derived from untrusted ticket text."""
+
+    def test_account_mention_is_neutralised(self):
+        # Verified live that Jira renders this from a v2 body as a real @mention,
+        # notifying that account. Cohort tickets already contain such tokens.
+        c = Classification("needs_more_info", "Ask [~accountid:712020:abc] about it.",
+                           ["ping [~accountid:712020:def]"], [], 0.5, "m")
+        body = comment_body(load_config(), c)
+        self.assertIn("\\[~accountid:712020:abc]", body)
+        # No mention token survives unescaped: strip the escaped brackets and
+        # nothing that could open a mention should remain.
+        self.assertNotIn("[~", body.replace("\\[", ""))
+
+    def test_remote_image_embed_is_neutralised(self):
+        c = Classification("automation_candidate", "See !https://attacker.example/p.png!",
+                           [], ["run !https://attacker.example/q.png!"], 0.5, "m")
+        body = comment_body(load_config(), c)
+        self.assertIn("\\!https://attacker.example/p.png\\!", body)
+        self.assertNotIn("!", body.replace("\\!", ""))
+
+    def test_ordinary_prose_survives_readably(self):
+        c = Classification("needs_more_info", "No reproduction steps.", ["repro steps"], [], 0.8, "m")
+        body = comment_body(load_config(), c)
+        self.assertIn("No reproduction steps.", body)
+        self.assertIn("- repro steps", body)
+
+    def test_our_own_label_markup_is_untouched(self):
+        cfg = load_config()
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        self.assertIn("{{" + cfg["labels"]["needs_judgment"] + "}}", comment_body(cfg, c))
+
+
 class WritePlanTests(unittest.TestCase):
     def test_fresh_ticket_gets_label_and_comment(self):
         self.assertEqual(plan_label_writes([], AI[0]), ([AI[0]], [], True))
@@ -261,24 +309,20 @@ def stub_client(pages):
 
 
 class PaginationTests(unittest.TestCase):
-    def test_comments_page_past_truncated_embedded_list(self):
-        client = stub_client([StubResponse({"comments": [{"body": "third"}], "total": 3})])
-        embedded = {"comments": [{"body": "first"}, {"body": "second"}], "total": 3}
-        result = client.comments("O3-1", embedded)
-        self.assertEqual([c["body"] for c in result], ["first", "second", "third"])
-        self.assertEqual(client.session.calls[0]["startAt"], 2)
+    """Truncated embedded pages are replaced, never extended.
 
-    def test_changelog_pages_past_embedded_100_entry_limit(self):
-        # expand=changelog truncates at 100 and drops the *newest* entries -
-        # exactly where an opt-out removal lives. The dedicated endpoint wraps
-        # items in "values", not "histories".
-        embedded = {"histories": [{"id": str(i)} for i in range(100)], "total": 102}
-        client = stub_client([StubResponse({"values": [{"id": "100"}, {"id": "101"}], "total": 102})])
-        result = client.changelog("O3-1", embedded)
-        self.assertEqual(len(result), 102)
-        self.assertEqual(result[-1]["id"], "101")
-        self.assertIn("/changelog", client.session.calls[0]["url"])
-        self.assertEqual(client.session.calls[0]["startAt"], 100)
+    Jira puts the *newest* window in the issue GET's embedded page and does not
+    describe its position consistently (LUI-45: startAt 35 of 135 comments;
+    TRUNK-324: startAt 0 while returning the newest 100 changelog entries,
+    descending, against the dedicated endpoint's ascending order). Appending to
+    it duplicates the overlap and drops the oldest entries.
+    """
+
+    def test_untruncated_embedded_page_is_used_as_is(self):
+        client = stub_client([])
+        result = client.comments("O3-1", {"comments": [{"body": "only"}], "total": 1})
+        self.assertEqual([c["body"] for c in result], ["only"])
+        self.assertEqual(client.session.calls, [])
 
     def test_untruncated_changelog_costs_no_extra_request(self):
         client = stub_client([])
@@ -286,13 +330,51 @@ class PaginationTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         self.assertEqual(client.session.calls, [])
 
-    def test_opt_out_in_the_paged_tail_is_detected(self):
-        # The whole point of paging: a removal past entry 100 must still count.
+    def test_truncated_comments_are_refetched_from_the_start(self):
+        # Real LUI-45 shape: the embedded window is comments 35..134 of 135.
+        embedded = {"comments": [{"body": f"c{i}"} for i in range(35, 135)],
+                    "startAt": 35, "maxResults": 100, "total": 135}
+        client = stub_client([
+            StubResponse({"comments": [{"body": f"c{i}"} for i in range(100)], "total": 135}),
+            StubResponse({"comments": [{"body": f"c{i}"} for i in range(100, 135)], "total": 135}),
+        ])
+        result = [c["body"] for c in client.comments("LUI-45", embedded)]
+        self.assertEqual(len(result), 135)
+        self.assertEqual(len(set(result)), 135, "no duplicates")
+        self.assertIn("c0", result, "the oldest comment must not be dropped")
+        self.assertEqual([c["startAt"] for c in client.session.calls], [0, 100])
+
+    def test_truncated_changelog_is_refetched_from_the_start(self):
+        # Real TRUNK-324 shape: embedded holds the newest 100 of 264, and the
+        # dedicated endpoint wraps entries in "values" ascending.
+        embedded = {"histories": [{"id": str(i)} for i in range(263, 163, -1)],
+                    "startAt": 0, "maxResults": 100, "total": 264}
+        client = stub_client([
+            StubResponse({"values": [{"id": str(i)} for i in range(100)], "total": 264}),
+            StubResponse({"values": [{"id": str(i)} for i in range(100, 200)], "total": 264}),
+            StubResponse({"values": [{"id": str(i)} for i in range(200, 264)], "total": 264}),
+        ])
+        result = [h["id"] for h in client.changelog("TRUNK-324", embedded)]
+        self.assertEqual(len(result), 264)
+        self.assertEqual(len(set(result)), 264, "no duplicates")
+        self.assertIn("0", result, "the oldest entry must not be dropped")
+        self.assertEqual([c["startAt"] for c in client.session.calls], [0, 100, 200])
+
+    def test_opt_out_past_the_embedded_window_is_detected(self):
         embedded = {"histories": [{"items": []}] * 100, "total": 101}
         client = stub_client([StubResponse(
-            {"values": [label_change("u1", AI[2], "")], "total": 101})])
+            {"values": [{"items": []}] * 100 + [label_change("u1", AI[2], "")], "total": 101})])
         st = inspect(issue(), AI, "bot", client.changelog("O3-1", embedded))
         self.assertTrue(st.opted_out)
+
+    def test_a_single_manual_add_is_not_double_counted(self):
+        # Duplicated history would report one action as two violations.
+        embedded = {"histories": [{"items": []}] * 100, "total": 101}
+        client = stub_client([StubResponse(
+            {"values": [label_change("u1", "", AI[0], display="Maintainer")]
+                       + [{"items": []}] * 100, "total": 101})])
+        st = inspect(issue(), AI, "bot", client.changelog("O3-1", embedded))
+        self.assertEqual(st.human_adds, ["Maintainer"])
 
 
 class ChangelogExpansionTests(unittest.TestCase):
@@ -347,6 +429,19 @@ class BotIdentityTests(unittest.TestCase):
     def test_anonymous_client_cannot_check(self):
         self.assertIsNone(bot_identity_error(self._Jira("bot", authenticated=False), "bot"))
 
+    def test_unusable_myself_fails_closed(self):
+        # "Could not check" is not "passed": proceeding unverified is exactly how
+        # the silent cohort-wide opt-out this guard prevents would still happen.
+        class NoMyself:
+            authenticated = True
+
+            def myself(self):
+                return None
+
+        message = bot_identity_error(NoMyself(), "bot")
+        self.assertIsNotNone(message)
+        self.assertIn("could not verify", message)
+
     def test_unset_bot_id_is_not_a_mismatch(self):
         self.assertIsNone(bot_identity_error(self._Jira("bot"), None))
 
@@ -373,6 +468,19 @@ class PlanTicketTests(unittest.TestCase):
 
     def test_no_classifier_stops_at_context(self):
         self.assertEqual(plan_ticket(TicketState(), True, False, False), "context-only")
+
+    def test_out_of_scope_ticket_is_skipped(self):
+        self.assertEqual(plan_ticket(TicketState(), False, False, True, out_of_scope=True),
+                         "skip-out-of-scope")
+
+    def test_force_does_not_override_scope(self):
+        self.assertEqual(plan_ticket(TicketState(), False, True, True, out_of_scope=True),
+                         "skip-out-of-scope")
+
+    def test_opt_out_is_reported_ahead_of_scope(self):
+        st = TicketState(opted_out=True)
+        self.assertEqual(plan_ticket(st, False, False, True, out_of_scope=True),
+                         "skip-opted-out")
 
 
 class DecisionRuleTests(unittest.TestCase):
@@ -411,6 +519,22 @@ class DecisionRuleTests(unittest.TestCase):
 
     def test_one_of_three_stops(self):
         self.assertEqual(decide(50.0, 0.05, 1, self.M), "STOP")
+
+    def test_launch_date_is_parsed_as_midnight_utc(self):
+        self.assertEqual(parse_launch("2026-08-01"), self.LAUNCH)
+
+    def test_unset_launch_date_names_the_config_field(self):
+        with self.assertRaises(SystemExit) as caught:
+            parse_launch("")
+        self.assertIn("pilot_launch", str(caught.exception))
+
+    def test_timestamp_instead_of_a_date_names_the_config_field(self):
+        # Appending a time to this produced an opaque "Invalid isoformat string"
+        # that said nothing about which field was wrong.
+        with self.assertRaises(SystemExit) as caught:
+            parse_launch("2026-08-01T00:00:00+00:00")
+        self.assertIn("pilot_launch", str(caught.exception))
+        self.assertIn("bare date", str(caught.exception))
 
 
 def load_evals_module():
@@ -456,9 +580,39 @@ class ProposalSheetTests(unittest.TestCase):
 class EvalImportTests(unittest.TestCase):
     """A grade must stay pinned to the context it was actually made against."""
 
-    HEADER = ["key", "url", "summary", "proposed_label", "confidence", "rationale",
-              "missing_info", "verification_steps", "content_hash",
-              "grade(ok/wrong)", "correct_label", "grader_notes"]
+    HEADER = run.PROPOSAL_COLUMNS
+
+    def test_writer_and_reader_agree_on_every_column(self):
+        # A real round trip: write a sheet, grade it, import it. A column rename
+        # in write_proposals used to leave the reader's tests green while
+        # import_proposals silently found no gradable rows.
+        module = load_evals_module()
+        cfg = load_config()
+        c = Classification("needs_more_info", "No repro.", ["repro steps"], [], 0.8, "m")
+        text = "TICKET: O3-1\nSUMMARY: Fix the widget\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "contexts").mkdir()
+            (d / "contexts" / "O3-1.txt").write_text(text)
+            stamp = datetime.datetime(2026, 8, 1, 9, 0, tzinfo=datetime.timezone.utc)
+            base = run.write_proposals(cfg, d, stamp,
+                                       [(issue(), c, ctx.content_hash(text))], live=False)
+            sheet = base.with_suffix(".csv")
+            with open(sheet) as fh:
+                rows = list(csv.DictReader(fh))
+            rows[0]["grade(ok/wrong)"] = "ok"          # the grader's edit
+            with open(sheet, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=run.PROPOSAL_COLUMNS)
+                w.writeheader()
+                w.writerows(rows)
+            module.GRADED = d / "graded.csv"
+            module.CONTEXTS = d / "frozen"
+            with contextlib.redirect_stdout(io.StringIO()) as log:
+                module.import_proposals(str(sheet), str(d / "contexts"))
+            with open(module.GRADED) as fh:
+                graded = list(csv.DictReader(fh))
+        self.assertEqual([r["key"] for r in graded], ["O3-1"], log.getvalue())
+        self.assertEqual(graded[0]["expected_label"], "needs_more_info")
 
     def _import(self, context_text, graded_hash, label="needs_more_info"):
         module = load_evals_module()
@@ -565,12 +719,13 @@ class MetricsWiringTests(unittest.TestCase):
 
 
 class LiveRunTests(unittest.TestCase):
-    """main() in --live: exactly one label and one comment per ticket, ever."""
+    """main() in --live: one label at a time, one comment per label decision."""
 
-    def _run(self, jira, label="needs_more_info", extra_args=()):
+    def _run(self, jira, label="needs_more_info", extra_args=(), live=True, out=None):
         classification = Classification(label, "Because.", ["repro steps"], [], 0.9, "m")
-        argv = ["--live", "--keys", "O3-1", *extra_args]
+        argv = (["--live"] if live else []) + ["--keys", "O3-1", *extra_args]
         with tempfile.TemporaryDirectory() as d:
+            d = str(out) if out else d
             # main() reports progress on stdout/stderr; the assertions read the
             # journal and the recorded writes, so keep the test output readable.
             with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
@@ -623,6 +778,77 @@ class LiveRunTests(unittest.TestCase):
         row = self._run(jira)
         self.assertEqual(row["action"], "refreshed")
         self.assertEqual([w[0] for w in jira.writes], ["property"])
+
+    def test_ticket_transitioned_out_of_scope_is_untouched(self):
+        # The race: it matched status = "To Do" in the sweep, then moved before
+        # this fetch. Labelling it invites a removal, which is a permanent
+        # opt-out and counts against the removal-rate kill metric.
+        jira = RecordingJira({"O3-1": issue(status={"name": "In Progress"})})
+        row = self._run(jira)
+        self.assertEqual(jira.writes, [])
+        self.assertEqual(row["action"], "skip-out-of-scope")
+        self.assertEqual(row["status"], "In Progress")
+
+    def test_scope_is_not_enforced_in_dry_run(self):
+        # Dry-run is the inspection and grading tool; --keys must still work on
+        # any ticket.
+        jira = RecordingJira({"O3-1": issue(status={"name": "In Progress"})})
+        row = self._run(jira, live=False)
+        self.assertEqual(jira.writes, [])
+        self.assertEqual(row["action"], "proposed")
+
+    def test_failed_write_is_absent_from_the_live_audit_sheet(self):
+        # The sheet is headed "labels and comments applied"; a ticket whose write
+        # raised must not be listed under that claim.
+        class Failing(RecordingJira):
+            def add_comment(self, key, body):
+                raise JiraError("PUT /issue/O3-1 -> 403: Edit Issues missing")
+
+        jira = Failing({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            self._run(jira, out=out)
+            sheets = list(out.glob("proposals-*.md"))
+        self.assertEqual(sheets, [], "no sheet should be written for a failed-only run")
+
+    def test_sweep_stops_after_consecutive_failures(self):
+        # A systemic fault would otherwise re-spend a paid call on every ticket
+        # of every four-hourly sweep, silently.
+        class Failing(RecordingJira):
+            def __init__(self, issues):
+                super().__init__(issues)
+                self.fetches = 0
+
+            def issue(self, key, fields, expand_changelog=False):
+                self.fetches += 1
+                raise JiraError("500 Internal Server Error")
+
+        keys = [f"O3-{i}" for i in range(20)]
+        jira = Failing({k: issue() for k in keys})
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: StubClassifier(None)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = run.main(["--live"], out=Path(d))
+        self.assertEqual(rc, 1, "a failed sweep must not exit 0")
+        self.assertEqual(jira.fetches, run.CONSECUTIVE_ERROR_LIMIT)
+
+    def test_all_tickets_failing_returns_nonzero(self):
+        class Failing(RecordingJira):
+            def issue(self, key, fields, expand_changelog=False):
+                raise JiraError("boom")
+
+        jira = Failing({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: StubClassifier(None)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = run.main(["--live", "--keys", "O3-1"], out=Path(d))
+        self.assertEqual(rc, 1)
 
     def test_opted_out_ticket_is_untouched_even_with_force(self):
         jira = RecordingJira({"O3-1": issue(histories=[label_change("u1", AI[2], "")])})
@@ -746,6 +972,27 @@ class ConfigTests(unittest.TestCase):
         jql = cfg["jira"]["scope_jql"].format(since=cfg["jira"]["cohort_created_since"])
         self.assertIn('created >= "20', jql)
         self.assertNotIn("{since}", jql)
+
+    def test_dev_panel_clause_is_a_substring_of_scope_jql(self):
+        # run.py and preflight.py both strip this clause by substring match to
+        # retry the sweep; drift would silently disable both fallbacks.
+        cfg = load_config()
+        self.assertIn(cfg["jira"]["dev_panel_clause"], cfg["jira"]["scope_jql"])
+
+    def test_cohort_jql_is_wider_than_scope_jql(self):
+        # The metrics denominator must still find tickets the bot labelled that
+        # have since left "To Do" or gained a linked PR.
+        cfg = load_config()
+        cohort = cfg["jira"]["cohort_jql"].format(since=cfg["jira"]["cohort_created_since"])
+        self.assertNotIn("{since}", cohort)
+        self.assertNotIn(cfg["jira"]["scope_status"], cohort)
+        self.assertNotIn(cfg["jira"]["dev_panel_clause"], cohort)
+
+    def test_scope_status_matches_the_status_in_scope_jql(self):
+        # These are two statements of the same fact; drift between them would
+        # make every swept ticket look out of scope and silently stop all writes.
+        cfg = load_config()
+        self.assertIn(f'status = "{cfg["jira"]["scope_status"]}"', cfg["jira"]["scope_jql"])
 
 
 if __name__ == "__main__":

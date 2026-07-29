@@ -22,6 +22,22 @@ from .run import ai_label_names, jira_from_env, load_config
 from .state import inspect
 
 
+def parse_launch(value: str | None) -> datetime.datetime:
+    """Midnight UTC on the pre-registered launch date.
+
+    A bare YYYY-MM-DD only: appending a time to anything else yields a malformed
+    string and an opaque "Invalid isoformat string" from fromisoformat, which
+    says nothing about which config field is wrong.
+    """
+    if not value:
+        sys.exit("set [metrics].pilot_launch in config.toml at launch - it anchors the 24h SLA")
+    try:
+        date = datetime.date.fromisoformat(value)
+    except ValueError:
+        sys.exit(f"[metrics].pilot_launch must be a bare date like 2026-08-01, not {value!r}")
+    return datetime.datetime.combine(date, datetime.time(), datetime.timezone.utc)
+
+
 def sla_met(created: str, labeled_at: str, launch: datetime.datetime) -> bool:
     """Was the ticket sorted within 24h of entering scope?
 
@@ -55,20 +71,25 @@ def main() -> int:
     if not bot_id:
         sys.exit("TRIAGE_BOT_ACCOUNT_ID is required to attribute the bot's label changes")
     m = cfg["metrics"]
-    if not m.get("pilot_launch"):
-        sys.exit("set [metrics].pilot_launch in config.toml at launch - it anchors the 24h SLA")
-    launch = datetime.datetime.fromisoformat(m["pilot_launch"] + "T00:00:00+00:00")
+    launch = parse_launch(m.get("pilot_launch"))
     ai_labels = ai_label_names(cfg)
 
-    cohort = (
-        f"project = {cfg['jira']['project']} AND issuetype != Epic "
-        f"AND created >= \"{cfg['jira']['cohort_created_since']}\""
-    )
+    cohort = cfg["jira"]["cohort_jql"].format(since=cfg["jira"]["cohort_created_since"])
     labeled = within = removed = 0
     violations: list[str] = []
-    for key in jira.search_keys(cohort):
-        issue = jira.issue(key, ["created", "labels"], expand_changelog=True)
-        st = inspect(issue, ai_labels, bot_id, jira.changelog(key, issue.get("changelog")))
+    failed: list[str] = []
+    cohort_keys = jira.search_keys(cohort)
+    for key in cohort_keys:
+        # Per-ticket isolation: this walk is hundreds of requests long, and one
+        # unreadable ticket must not discard every request before it. A metric
+        # computed over an incomplete cohort is worse than no metric, so any
+        # failure suppresses the decision below rather than skewing it quietly.
+        try:
+            issue = jira.issue(key, ["created", "labels"], expand_changelog=True)
+            st = inspect(issue, ai_labels, bot_id, jira.changelog(key, issue.get("changelog")))
+        except Exception as e:
+            failed.append(f"{key}: {type(e).__name__}: {e}"[:200])
+            continue
         # Collected before the bot-labeled filter: a maintainer hand-applying an
         # ai-triage label to a ticket the bot never touched is the violation
         # most worth seeing.
@@ -103,6 +124,13 @@ def main() -> int:
     for v in violations:
         print(f"  {v}")
 
+    if failed:
+        print(f"\n{len(failed)} of {len(cohort_keys)} cohort ticket(s) could not be read:")
+        for f in failed:
+            print(f"  {f}")
+        print("\nNO DECISION: the cohort is incomplete, so these numbers are a "
+              "lower bound. Re-run once the failures above are resolved.")
+        return 1
     print(f"\nDECISION: {decide(pct24, removal_rate, intro, m)}")
     return 0
 

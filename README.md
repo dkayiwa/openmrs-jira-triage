@@ -12,9 +12,12 @@ construction:
   description, Acceptance Criteria, parent, linked tickets, and comments
   filtered to human authors (`accountType != "app"` plus a blocklist). The
   exact text sent to the model is saved to `out/contexts/<KEY>.txt` for audit.
-- **One `ai-triage-*` label + one comment per ticket, nothing else.** Writes
-  live in one function, gated behind `--live`; the bot's permission scheme
-  (below) backs this up.
+- **One `ai-triage-*` label at a time, one comment per label decision, nothing
+  else.** Writes are gated behind `--live` and the bot's permission scheme
+  (below). A re-run that reaches the same label is silent; only a label that is
+  new to the ticket is commented on, so an edit that genuinely changes the
+  classification posts a second comment explaining the new label rather than
+  leaving it unexplained.
 - **Label removal = permanent opt-out.** Detected from the issue changelog
   (any non-bot removal of an ai-triage label), so there is no external state
   to lose. Non-bot label *adds* are flagged as convention violations.
@@ -63,7 +66,11 @@ phase, every human label-removal gets added here as a new case.
    trustworthy; snapshot the cohort only after the clean-slate backfill.
 2. **Pin the cohort.** Set `cohort_created_since` to launch minus 90 days and
    commit. Tickets created during the pilot enter scope automatically.
-3. **Bot account** ("OpenMRS Triage Bot"): API token, and a permission scheme
+3. **Bot account** ("OpenMRS Triage Bot") — do not replace this account mid-pilot.
+   Opt-out attribution keys on a single `TRIAGE_BOT_ACCOUNT_ID`, so swapping in a
+   new account makes every label change the old one made read as a human removal:
+   the whole cohort registers as opted out and the weekly decision flips to STOP.
+   Rotate the API *token* freely; keep the account. It needs a permission scheme
    granting only Browse Projects, Edit Issues (labels need it), and Add
    Comments on O3 - no Transition, Delete, Assign, or Link. Note Edit Issues
    is not field-granular in Jira, so "never edits ticket text" is enforced by

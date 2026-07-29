@@ -12,6 +12,22 @@ cohort_created_since = "2026-04-29"
 # The development[pullrequests] clause only sees dev-panel links indexed by the
 # GitHub-for-Jira app, not PR URLs pasted in comments. Verified via preflight.
 scope_jql = 'project = O3 AND issuetype != Epic AND status = "To Do" AND created >= "{since}" AND development[pullrequests].all = 0 ORDER BY created ASC'
+# Must match the status named in scope_jql (the tests assert this). Re-checked
+# per ticket in --live: a ticket transitioned out of scope between the sweep and
+# the fetch must not be labelled, because the maintainer's removal of that
+# label is a permanent opt-out and counts against the removal-rate metric.
+scope_status = "To Do"
+# Broken out because both run.py and preflight.py retry the sweep without it
+# when Jira rejects the dev-panel clause, and they match it by substring - an
+# edit to the spacing inside scope_jql alone would silently disable both
+# fallbacks. The tests assert this is a substring of scope_jql.
+dev_panel_clause = " AND development[pullrequests].all = 0"
+# The metrics cohort is deliberately WIDER than scope_jql: it must still find
+# tickets the bot labelled that have since left "To Do" or gained a linked PR,
+# or the removal-rate denominator would shrink as the pilot progressed. Pinned
+# here rather than built in Python because it is the denominator of all three
+# pre-registered metrics.
+cohort_jql = 'project = O3 AND issuetype != Epic AND created >= "{since}"'
 # Auto-discovered when empty; pin to e.g. "customfield_10816" to skip discovery.
 acceptance_criteria_field = ""
 

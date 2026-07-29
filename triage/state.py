@@ -35,15 +35,24 @@ def inspect(issue: dict, ai_labels: list[str], bot_account_id: str | None,
     With no bot_account_id configured, every ai-triage removal counts as an
     opt-out (the safe direction), and manual-add violations are not attributed.
 
-    `histories` overrides the issue's embedded changelog; callers that must not
-    miss an opt-out pass the full paged history (JiraClient.changelog), since
-    expand=changelog truncates at 100 entries.
+    `histories` is the full paged history from JiraClient.changelog. It may be
+    omitted only when the issue's embedded changelog is already complete: an
+    embedded page that Jira truncated holds just the newest window, which is
+    enough to spot an opt-out but not enough to find the bot's first label add
+    (the 24h SLA's start point). Rather than truncate silently, that case raises
+    - the convenience default must not become a quiet correctness hole.
     """
     st = TicketState(
         ai_labels_present=[l for l in issue["fields"].get("labels", []) if l in ai_labels]
     )
     if histories is None:
-        histories = (issue.get("changelog") or {}).get("histories", [])
+        changelog = issue.get("changelog") or {}
+        histories = changelog.get("histories", [])
+        if len(histories) < changelog.get("total", len(histories)):
+            raise ValueError(
+                f"{issue.get('key')}: embedded changelog is truncated "
+                f"({len(histories)} of {changelog['total']}); pass JiraClient.changelog()"
+            )
     ai_label_set = set(ai_labels)
     for history in histories:
         author = history.get("author") or {}
