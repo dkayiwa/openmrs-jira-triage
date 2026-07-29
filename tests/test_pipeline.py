@@ -24,7 +24,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from triage import context as ctx  # noqa: E402
 from triage import metrics, run  # noqa: E402
-from triage.classifier import LABEL_KEYS, SCHEMA, Classification, Classifier  # noqa: E402
+from triage.classifier import (  # noqa: E402
+    LABEL_KEYS,
+    SCHEMA,
+    Classification,
+    Classifier,
+    validate_classification,
+)
 from triage.jira import JiraClient, JiraError  # noqa: E402
 from triage.metrics import decide, parse_launch, sla_met  # noqa: E402
 from triage.run import (  # noqa: E402
@@ -850,6 +856,34 @@ class LiveRunTests(unittest.TestCase):
                 rc = run.main(["--live", "--keys", "O3-1"], out=Path(d))
         self.assertEqual(rc, 1)
 
+    def test_replayed_classification_writes_to_jira_without_a_claude_call(self):
+        # The point of agent-classifier mode: a live run with no Anthropic
+        # credential at all. Classifier is patched to explode if constructed.
+        jira = RecordingJira({"O3-1": issue()})
+        text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
+
+        def explode(*a):
+            raise AssertionError("the API classifier must not be constructed")
+
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            path.write_text(json.dumps({
+                "prompt_version": "v1", "classifier": "session-agent",
+                "classifications": {"O3-1": dict(GOOD, content_hash=ctx.content_hash(text))},
+            }))
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", explode), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = run.main(["--live", "--keys", "O3-1",
+                               "--classifications", str(path)], out=Path(d))
+        self.assertEqual(rc, 0)
+        self.assertEqual([w[0] for w in jira.writes], ["labels", "comment", "property"])
+        # Attribution recorded, so an audit can separate replayed labels from
+        # pinned-model ones - they are not the same experiment.
+        self.assertEqual(jira.properties["O3-1"]["classifier"], "session-agent")
+
     def test_opted_out_ticket_is_untouched_even_with_force(self):
         jira = RecordingJira({"O3-1": issue(histories=[label_change("u1", AI[2], "")])})
         row = self._run(jira, extra_args=["--force"])
@@ -953,6 +987,86 @@ class ClassifierTests(unittest.TestCase):
         fmt = sent["extra_body"]["output_config"]["format"]
         self.assertEqual(fmt["type"], "json_schema")
         self.assertEqual(fmt["schema"]["properties"]["label"]["enum"], LABEL_KEYS)
+
+
+GOOD = {"label": "needs_more_info", "rationale": "No repro.",
+        "missing_info": ["repro steps"], "verification_steps": [], "confidence": 0.9}
+
+
+class ValidateClassificationTests(unittest.TestCase):
+    def test_valid_object_has_no_errors(self):
+        self.assertEqual(validate_classification(dict(GOOD)), [])
+
+    def test_missing_required_field_is_reported(self):
+        data = dict(GOOD)
+        del data["confidence"]
+        self.assertIn("missing 'confidence'", validate_classification(data))
+
+    def test_label_outside_the_enum_is_reported(self):
+        self.assertTrue(any("must be one of" in e for e in
+                            validate_classification(dict(GOOD, label="looks_fine"))))
+
+    def test_wrong_types_are_reported(self):
+        self.assertTrue(any("array of strings" in e for e in
+                            validate_classification(dict(GOOD, missing_info="repro"))))
+        self.assertTrue(any("must be a number" in e for e in
+                            validate_classification(dict(GOOD, confidence="high"))))
+
+    def test_unexpected_field_is_reported(self):
+        self.assertTrue(any("unexpected field" in e for e in
+                            validate_classification(dict(GOOD, sneaky="x"))))
+
+
+class FileClassifierTests(unittest.TestCase):
+    """Replaying classifications made outside the pipeline."""
+
+    def _write(self, tmp, entry, prompt_version="v1", classifier="agent"):
+        path = Path(tmp) / "c.json"
+        path.write_text(json.dumps({
+            "prompt_version": prompt_version, "classifier": classifier,
+            "classifications": {"O3-1": entry},
+        }))
+        return path
+
+    def test_replays_the_classification_for_a_matching_context(self):
+        text = "TICKET: O3-1\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, dict(GOOD, content_hash=ctx.content_hash(text)))
+            fc = run.FileClassifier(path, "v1")
+        c = fc.classify(text)
+        self.assertEqual(c.label, "needs_more_info")
+        self.assertEqual(c.model, "agent")
+
+    def test_edited_context_finds_no_classification(self):
+        # The hash is the staleness guard: a label made against older text must
+        # never reach Jira.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, dict(GOOD, content_hash=ctx.content_hash("TICKET: O3-1\n")))
+            fc = run.FileClassifier(path, "v1")
+        with self.assertRaises(RuntimeError) as caught:
+            fc.classify("TICKET: O3-1 (edited)\n")
+        self.assertIn("changed since it was classified", str(caught.exception))
+
+    def test_prompt_version_mismatch_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, dict(GOOD, content_hash="abc"), prompt_version="v0")
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("v0", str(caught.exception))
+
+    def test_missing_content_hash_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, dict(GOOD))
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("content_hash", str(caught.exception))
+
+    def test_invalid_classification_is_refused_before_any_write(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write(tmp, dict(GOOD, content_hash="abc", label="not_a_label"))
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("not a valid classification", str(caught.exception))
 
 
 class ConfigTests(unittest.TestCase):

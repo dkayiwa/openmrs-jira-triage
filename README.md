@@ -45,6 +45,64 @@ Useful flags: `--keys O3-4522,O3-5823` (specific tickets), `--no-classify`
 flip, but opt-outs are still respected), `--live` (real writes; needs
 `JIRA_EMAIL`, `JIRA_API_TOKEN`, `TRIAGE_BOT_ACCOUNT_ID`).
 
+## Running without an Anthropic API key
+
+The Claude call is the only step that needs an Anthropic credential — Jira reads
+work anonymously on a public project. So the pipeline splits into three, and the
+middle step can be done by whatever you like, including an agent in a Claude
+Code session using your own account:
+
+```sh
+# 1. gather - no Anthropic credential, writes contexts + a manifest
+.venv/bin/python -m triage.run --no-classify --limit 5
+
+# 2. classify - read out/manifest.json (it embeds the JSON schema and the
+#    content hash of each context) and write out/classifications.json
+
+# 3. apply - replays those classifications; makes no Claude call
+.venv/bin/python -m triage.run --classifications out/classifications.json --live
+```
+
+`out/classifications.json` looks like this; `content_hash` comes from the
+manifest and is required:
+
+```json
+{
+  "prompt_version": "v1",
+  "classifier": "who or what produced these",
+  "classifications": {
+    "O3-4522": {
+      "content_hash": "15e75ed5e4489c82",
+      "label": "needs_more_info",
+      "rationale": "at most two sentences, posted to the ticket",
+      "missing_info": ["which report was being run"],
+      "verification_steps": [],
+      "confidence": 0.93
+    }
+  }
+}
+```
+
+Lookup is by content hash, not ticket key, so staleness is caught for free: if
+the ticket is edited between being classified and being applied, the freshly
+assembled context hashes differently, no classification matches, and the stale
+label is never written. A `prompt_version` that disagrees with `config.toml`,
+a missing `content_hash`, or anything failing the schema aborts before any
+write. The `classifier` string is recorded in each ticket's entity property so
+an audit can tell replayed labels from pinned-model ones.
+
+> **This is not the pilot's measured path.** The eval gate and the three
+> pre-registered metrics assume one pinned model and prompt version per label.
+> Replayed classifications are useful for grading, for spot-checking the rubric,
+> and for running without API access — but mixing them into the live cohort
+> makes the removal-rate metric a measurement of two different systems. The
+> scheduled sweep in `.github/workflows/triage.yml` still uses
+> `ANTHROPIC_API_KEY`, and has to: a cron run has no session to borrow.
+
+For local runs that *do* use the API, a key is not the only option — the client
+is constructed zero-arg, so an `ant auth login` profile is picked up
+automatically with no `.env` at all.
+
 ## What to hand to Dennis & Veronica
 
 A dry run produces `out/proposals-<stamp>.md` (readable) and `.csv` (gradable).

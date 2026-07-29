@@ -30,6 +30,37 @@ SCHEMA = {
 }
 
 
+def validate_classification(data: dict) -> list[str]:
+    """Schema violations in one classification object; empty when valid.
+
+    The API path has this enforced server-side by output_config. Anything
+    produced elsewhere - an agent in a Claude Code session, a hand-written file -
+    is unvalidated input on its way to a public Jira ticket, so it is checked
+    here before it can be applied.
+    """
+    errors = []
+    props = SCHEMA["properties"]
+    for key in SCHEMA["required"]:
+        if key not in data:
+            errors.append(f"missing {key!r}")
+    for key, value in data.items():
+        spec = props.get(key)
+        if spec is None:
+            errors.append(f"unexpected field {key!r}")
+            continue
+        if spec["type"] == "string" and not isinstance(value, str):
+            errors.append(f"{key} must be a string")
+        elif spec["type"] == "number" and not isinstance(value, (int, float)):
+            errors.append(f"{key} must be a number")
+        elif spec["type"] == "array" and (
+            not isinstance(value, list) or any(not isinstance(x, str) for x in value)
+        ):
+            errors.append(f"{key} must be an array of strings")
+        if "enum" in spec and value not in spec["enum"]:
+            errors.append(f"{key} must be one of {spec['enum']}")
+    return errors
+
+
 @dataclass
 class Classification:
     label: str

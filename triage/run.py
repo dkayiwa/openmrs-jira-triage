@@ -17,7 +17,13 @@ import sys
 import tomllib
 
 from . import context as ctx
-from .classifier import LABEL_KEYS, Classifier
+from .classifier import (
+    LABEL_KEYS,
+    SCHEMA,
+    Classification,
+    Classifier,
+    validate_classification,
+)
 from .jira import JiraClient
 from .state import PROPERTY_KEY, TicketState, inspect
 
@@ -73,6 +79,53 @@ def jira_from_env(cfg: dict) -> JiraClient:
         os.environ.get("JIRA_EMAIL"),
         os.environ.get("JIRA_API_TOKEN"),
     )
+
+
+class FileClassifier:
+    """Serves classifications produced outside the pipeline.
+
+    Same interface as Classifier, so a run needs no Anthropic credential: an
+    agent in a Claude Code session (or anything else) reads out/contexts/*.txt
+    and writes a classifications file, and this replays it.
+
+    Lookup is by content hash rather than ticket key, which makes staleness
+    detection free: if the ticket was edited between being classified and being
+    applied, the freshly assembled context hashes differently and no
+    classification is found, so the stale label is never written.
+    """
+
+    def __init__(self, path: pathlib.Path, prompt_version: str):
+        doc = json.loads(path.read_text())
+        if doc.get("prompt_version") != prompt_version:
+            sys.exit(f"{path}: classified against prompt {doc.get('prompt_version')!r} "
+                     f"but config.toml pins {prompt_version!r}")
+        self.model = doc.get("classifier") or "unattributed"
+        self.by_hash: dict[str, Classification] = {}
+        for key, entry in (doc.get("classifications") or {}).items():
+            entry = dict(entry)
+            chash = entry.pop("content_hash", None)
+            if not chash:
+                sys.exit(f"{path}: {key} has no content_hash, so it cannot be matched "
+                         "to a context safely")
+            errors = validate_classification(entry)
+            if errors:
+                sys.exit(f"{path}: {key} is not a valid classification: {'; '.join(errors)}")
+            self.by_hash[chash] = Classification(
+                label=entry["label"], rationale=entry["rationale"],
+                missing_info=list(entry["missing_info"]),
+                verification_steps=list(entry["verification_steps"]),
+                confidence=float(entry["confidence"]), model=self.model,
+            )
+
+    def classify(self, context: str) -> Classification:
+        chash = ctx.content_hash(context)
+        found = self.by_hash.get(chash)
+        if found is None:
+            raise RuntimeError(
+                f"no classification for content hash {chash}; the ticket changed "
+                "since it was classified, or it was never classified"
+            )
+        return found
 
 
 def bot_identity_error(jira: JiraClient, bot_id: str | None) -> str | None:
@@ -209,6 +262,9 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     ap.add_argument("--limit", type=int, default=0, help="max tickets this run (0 = all)")
     ap.add_argument("--keys", help="comma-separated issue keys (skips the JQL sweep)")
     ap.add_argument("--no-classify", action="store_true", help="fetch and assemble contexts only")
+    ap.add_argument("--classifications", metavar="JSON",
+                    help="apply classifications from a file instead of calling Claude "
+                         "(no Anthropic credential needed; see README)")
     ap.add_argument("--force", action="store_true",
                     help="reclassify already-triaged tickets (opt-outs are still respected)")
     args = ap.parse_args(argv)
@@ -261,7 +317,14 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     print(f"{len(keys)} ticket(s) in scope")
 
     classifier = None
-    if not args.no_classify:
+    if args.no_classify and args.classifications:
+        sys.exit("--no-classify and --classifications are contradictory")
+    if args.classifications:
+        classifier = FileClassifier(pathlib.Path(args.classifications),
+                                    cfg["prompt"]["version"])
+        print(f"replaying {len(classifier.by_hash)} classification(s) by "
+              f"{classifier.model}; no Claude call will be made")
+    elif not args.no_classify:
         classifier = Classifier(
             cfg["claude"]["model"], cfg["claude"]["max_tokens"],
             (ROOT / "prompt" / "system.md").read_text(),
@@ -269,6 +332,7 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
 
     fields = ctx.ISSUE_FIELDS + ([ac_field] if ac_field else [])
     proposals: list = []
+    manifest: dict = {}
     errors = consecutive = 0
     journal = out / "journal.jsonl"
     for key in keys:
@@ -287,6 +351,11 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             chash = ctx.content_hash(text)
             (out / "contexts" / f"{key}.txt").write_text(text)
             row["hash"] = chash
+            manifest[key] = {
+                "content_hash": chash,
+                "summary": issue["fields"].get("summary", ""),
+                "context": f"contexts/{key}.txt",
+            }
 
             # Dry-run skips the property read: nothing was written, so the
             # stored hash reflects the last *live* run, and re-grading the same
@@ -335,6 +404,10 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                         jira.set_property(key, PROPERTY_KEY, {
                             "contentHash": chash, "label": label,
                             "prompt": cfg["prompt"]["version"],
+                            # Recorded so a later audit can tell which labels
+                            # came from the pinned model and which from a
+                            # replayed file - they are not the same experiment.
+                            "classifier": c.model,
                             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         })
                         row["action"] = "labeled" if post_comment else "refreshed"
@@ -368,6 +441,19 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             print(f"\nABORT: {consecutive} tickets in a row failed; stopping the sweep "
                   "rather than re-spending on every remaining ticket", file=sys.stderr)
             break
+
+    if manifest:
+        # Self-describing so whatever classifies these contexts (an agent in a
+        # session, a script) has the schema, the prompt version and the content
+        # hashes in one place, and can write a classifications file back.
+        (out / "manifest.json").write_text(json.dumps({
+            "at": stamp.isoformat(),
+            "prompt_version": cfg["prompt"]["version"],
+            "mode": "live" if args.live else "dry-run",
+            "classification_schema": SCHEMA,
+            "tickets": manifest,
+        }, indent=2) + "\n")
+        print(f"\nManifest: {out / 'manifest.json'} ({len(manifest)} ticket(s))")
 
     if proposals:
         base = write_proposals(cfg, out, stamp, proposals, args.live)
