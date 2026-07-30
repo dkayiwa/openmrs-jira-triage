@@ -168,6 +168,12 @@ class StubSession:
         self.calls.append({"method": "POST", "url": url, **(json or {})})
         return self.pages.pop(0)
 
+    def put(self, url, params=None, json=None, timeout=None):
+        assert timeout is not None, "every network call must carry a timeout"
+        self.calls.append({"method": "PUT", "url": url, "params": params or {},
+                           "body": json})
+        return self.pages.pop(0)
+
     def delete(self, url, timeout=None):
         assert timeout is not None, "every network call must carry a timeout"
         self.calls.append({"method": "DELETE", "url": url})
@@ -1348,6 +1354,29 @@ class SearchKeysTests(unittest.TestCase):
             client.search_keys("project = O3")
         self.assertIn("not advancing", str(cm.exception))
 
+    def test_an_unusable_myself_reads_as_no_account_not_a_crash(self):
+        # bot_identity_error depends on this returning None rather than raising:
+        # it is how "the check could not run" is distinguished from "the ids
+        # match", and getting that backwards means proceeding unverified with a
+        # bot id that could make the whole cohort read as opted out.
+        self.assertIsNone(stub_client([StubResponse({}, 500)]).myself())
+        self.assertEqual(
+            stub_client([StubResponse({"accountId": "bot"})]).myself()["accountId"], "bot")
+
+    def test_the_get_fallback_still_paginates(self):
+        # Falling back to GET on the first page must not lose the cursor: an
+        # anonymous sweep would silently see only the first 100 tickets of the
+        # cohort and report success on the rest.
+        client = stub_client([
+            StubResponse({}, 401),
+            StubResponse({"issues": [{"key": "O3-1"}], "nextPageToken": "t1"}),
+            StubResponse({}, 401),
+            StubResponse({"issues": [{"key": "O3-2"}]}),
+        ])
+        self.assertEqual(client.search_keys("project = O3"), ["O3-1", "O3-2"])
+        self.assertEqual(client.session.calls[3]["nextPageToken"], "t1",
+                         "the GET fallback dropped the page token")
+
     def test_an_unauthenticated_post_falls_back_to_get(self):
         client = stub_client([StubResponse({}, 401),
                               StubResponse({"issues": [{"key": "O3-1"}]})])
@@ -1372,6 +1401,72 @@ class ChangelogExpansionTests(unittest.TestCase):
     def test_changelog_not_required_when_not_requested(self):
         client = stub_client([StubResponse({"key": "O3-1", "fields": {}})])
         self.assertEqual(client.issue("O3-1", ["summary"])["key"], "O3-1")
+
+
+class WriteMethodTests(unittest.TestCase):
+    """The three methods that actually touch a public ticket.
+
+    Coverage found these at 0%: every live-run test stubs the client with
+    RecordingJira, which overrides all three, so the real bodies had never
+    executed. They are the only code in the repo that changes something a
+    person can see, and they were the least exercised.
+    """
+
+    def test_labels_are_sent_as_add_and_remove_operations(self):
+        client = stub_client([StubResponse({}, 204)])
+        client.update_labels("O3-1", ["ai-triage-needs-judgment"], ["ai-triage-x"])
+        call = client.session.calls[0]
+        self.assertEqual(call["method"], "PUT")
+        self.assertTrue(call["url"].endswith("/rest/api/2/issue/O3-1"))
+        self.assertEqual(call["body"], {"update": {"labels": [
+            {"add": "ai-triage-needs-judgment"}, {"remove": "ai-triage-x"}]}},
+            "a malformed ops list is a label write that silently does nothing")
+
+    def test_a_notify_suppressed_edit_falls_back_to_a_notifying_one(self):
+        # notifyUsers=false needs project admin, which the README says the bot
+        # may not have. Untested, this fallback is the difference between the
+        # pilot labelling the cohort and 403-ing on every single ticket.
+        client = stub_client([StubResponse({}, 403), StubResponse({}, 204)])
+        client.update_labels("O3-1", ["ai-triage-needs-judgment"], [])
+        first, second = client.session.calls
+        self.assertEqual(first["params"], {"notifyUsers": "false"})
+        self.assertEqual(second["params"], {}, "the retry must drop notifyUsers")
+        self.assertEqual(first["body"], second["body"], "the retry must send the same edit")
+
+    def test_a_second_403_is_raised_not_swallowed(self):
+        # The fallback exists for the notifyUsers permission alone. A 403 for
+        # any other reason - Edit Issues missing - must surface, or the sweep
+        # records a label it never applied and never comments on the ticket
+        # again, because the label's presence suppresses the comment.
+        client = stub_client([StubResponse({}, 403), StubResponse({}, 403)])
+        with self.assertRaises(JiraError):
+            client.update_labels("O3-1", ["ai-triage-needs-judgment"], [])
+
+    def test_a_comment_posts_its_body_and_returns_the_created_id(self):
+        client = stub_client([StubResponse({"id": "10501"})])
+        posted = client.add_comment("O3-1", "AI triage: {{ai-triage-needs-judgment}}")
+        self.assertEqual(posted["id"], "10501")
+        call = client.session.calls[0]
+        self.assertEqual(call["method"], "POST")
+        self.assertTrue(call["url"].endswith("/rest/api/2/issue/O3-1/comment"))
+        self.assertEqual(call["body"], "AI triage: {{ai-triage-needs-judgment}}")
+
+    def test_a_property_write_is_a_put_to_the_named_property(self):
+        client = stub_client([StubResponse({}, 200)])
+        client.set_property("O3-1", "ai-triage", {"contentHash": "abc"})
+        call = client.session.calls[0]
+        self.assertEqual(call["method"], "PUT")
+        self.assertTrue(call["url"].endswith("/rest/api/2/issue/O3-1/properties/ai-triage"))
+        self.assertEqual(call["body"], {"contentHash": "abc"})
+
+    def test_a_failed_property_write_raises_with_the_status(self):
+        # Silence here means every sweep re-classifies and re-charges the whole
+        # cohort forever, because the content hash it compares against is never
+        # stored. The message carries the status so preflight's probe can say why.
+        client = stub_client([StubResponse({"errorMessages": ["no permission"]}, 403)])
+        with self.assertRaises(JiraError) as caught:
+            client.set_property("O3-1", "ai-triage", {"contentHash": "abc"})
+        self.assertIn("403", str(caught.exception))
 
 
 class PropertyTests(unittest.TestCase):
@@ -2892,6 +2987,60 @@ class MetricsReportInvariantTests(unittest.TestCase):
         iss["key"] = key
         return iss
 
+    def test_one_unreadable_ticket_does_not_discard_the_cohort_walked_before_it(self):
+        # Coverage found this handler at 0%. The walk is hundreds of requests
+        # long, so a single 500 escaping the loop throws away every paid read
+        # before it AND the `failed` list explaining why - which is the opposite
+        # of the per-ticket isolation the comment above it promises.
+        good = self._ticket("O3-1", "2026-08-10T09:00:00.000+0000",
+                            "2026-08-10T10:00:00.000+0000")
+
+        class OneBadTicket(MetricsJira):
+            def issue(self, key, fields, expand_changelog=False):
+                if key == "O3-BAD":
+                    raise JiraError("500 Internal Server Error")
+                return self.issues[key]
+
+        cfg = load_config()
+        cfg["metrics"] = dict(cfg["metrics"], pilot_launch=self.LAUNCH)
+        jira = OneBadTicket({"O3-1": good, "O3-BAD": good}, ("O3-1",) * 5,
+                            {"O3-1": {"source": "api", "classifier": "m"}})
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(metrics, "load_config", lambda: cfg), \
+             mock.patch.object(metrics, "jira_from_env", lambda c: jira), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = metrics.main()
+        report = out.getvalue()
+        self.assertIn("tickets labeled    : 1", report, "the readable ticket survived")
+        self.assertIn("O3-BAD", report, "the failure must be named, not dropped")
+        self.assertIn("NO DECISION", report, "an incomplete cohort cannot decide")
+        self.assertEqual(rc, 1)
+
+    def test_an_unparseable_timestamp_fails_its_own_ticket_only(self):
+        # The guard added when sla_met moved inside the per-ticket try. Coverage
+        # says it had never run: a ticket whose `created` fromisoformat cannot
+        # parse would otherwise raise out of the loop and discard the whole walk.
+        good = self._ticket("O3-1", "2026-08-10T09:00:00.000+0000",
+                            "2026-08-10T10:00:00.000+0000")
+        bad = self._ticket("O3-2", "not a timestamp",
+                           "2026-08-10T10:00:00.000+0000")
+        cfg = load_config()
+        cfg["metrics"] = dict(cfg["metrics"], pilot_launch=self.LAUNCH)
+        jira = MetricsJira({"O3-1": good, "O3-2": bad}, ("O3-1",) * 5,
+                           {"O3-1": {"source": "api", "classifier": "m"},
+                            "O3-2": {"source": "api", "classifier": "m"}})
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(metrics, "load_config", lambda: cfg), \
+             mock.patch.object(metrics, "jira_from_env", lambda c: jira), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = metrics.main()
+        report = out.getvalue()
+        self.assertIn("tickets labeled    : 1", report)
+        self.assertIn("computing the 24h SLA", report,
+                      "the report must say which step failed, not just that one did")
+        self.assertIn("O3-2", report)
+        self.assertEqual(rc, 1)
+
     def test_the_verdict_always_agrees_with_the_printed_pass_flags(self):
         # The rounding that made "94.6%" print as "95%" against a ">= 95%" target
         # is why each line now carries its own PASS/FAIL.
@@ -3146,6 +3295,72 @@ class LiveRunTests(unittest.TestCase):
         self.assertEqual(len(manifest["tickets"]), 2)
         self.assertFalse(manifest["complete"],
                          "a manifest covering 2 of 5 tickets is not complete")
+
+    def test_live_without_credentials_refuses_to_start(self):
+        # The guard against a --live run that would sweep anonymously: it cannot
+        # write, so every ticket fails, but it would fail them five at a time on
+        # a schedule while looking like a configured pilot.
+        jira = RecordingJira({"O3-1": issue()})
+        jira.authenticated = False
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit) as caught:
+                run.main(["--live", "--keys", "O3-1"], out=Path(d))
+        self.assertIn("TRIAGE_BOT_ACCOUNT_ID", str(caught.exception))
+
+    def test_a_rejected_dev_panel_clause_sweeps_without_it_rather_than_dying(self):
+        # Jira rejects development[] where the GitHub app is not installed. The
+        # fallback matches on the error text, and if that match is wrong the
+        # sweep dies on its first call instead of degrading - so the condition
+        # itself needs exercising against a realistic message.
+        cfg = load_config()
+        clause = cfg["jira"]["dev_panel_clause"]
+
+        class ClauseRejected(RecordingJira):
+            def __init__(self, issues):
+                super().__init__(issues)
+                self.queries = []
+
+            def search_keys(self, jql):
+                self.queries.append(jql)
+                if clause in jql:
+                    raise JiraError("400: Field 'development' does not exist or you "
+                                    "do not have permission to view it.")
+                return list(self.issues)
+
+        jira = ClauseRejected({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: StubClassifier(None)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(err):
+                run.main(["--no-classify"], out=Path(d))
+        self.assertEqual(len(jira.queries), 2, "it must retry without the clause")
+        self.assertNotIn(clause, jira.queries[1])
+        self.assertIn("development[] JQL clause rejected", err.getvalue(),
+                      "degrading to an unfiltered sweep must be said out loud")
+
+    def test_an_unrelated_search_failure_is_not_swallowed_as_a_clause_problem(self):
+        # The fallback is scoped to the clause. A 500 or an auth failure must
+        # still abort, or a broken Jira produces a confident empty cohort.
+        class Broken(RecordingJira):
+            def search_keys(self, jql):
+                raise JiraError("500 Internal Server Error")
+
+        jira = Broken({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: StubClassifier(None)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(JiraError):
+                run.main(["--no-classify"], out=Path(d))
 
     def test_all_tickets_failing_returns_nonzero(self):
         class Failing(RecordingJira):
