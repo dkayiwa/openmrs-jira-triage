@@ -584,7 +584,7 @@ class DocumentedSurfaceTests(unittest.TestCase):
                          "the README names flags no module accepts")
 
     def test_every_runnable_the_readme_names_exists(self):
-        targets = set(re.findall(r'python -m (triage\.[a-z_]+)', self.readme))
+        targets = set(re.findall(r'python -m ((?:triage|evals)\.[a-z_]+)', self.readme))
         targets |= set(re.findall(r'python (evals/[a-z_]+\.py)', self.readme))
         self.assertGreater(len(targets), 2, "extraction found nothing to check")
         for target in targets:

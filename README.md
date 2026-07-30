@@ -338,6 +338,45 @@ phase, every human label-removal gets added here as a new case.
    that never arrives. The label names in it are pinned to `config.toml` by the
    test suite, so a rename breaks the build rather than the announcement.
 
+## Verifying a change
+
+```bash
+.venv/bin/python -m unittest discover -s tests -q     # 378 tests, ~3s, no network
+.venv/bin/python -m triage.preflight                  # the go-live gate, read-only
+```
+
+Both are offline except preflight, and CI runs both before any sweep. Two more
+cost real API calls and are deliberately not in the suite:
+
+```bash
+.venv/bin/python -m evals.run_evals                   # the graded gate (needs cases)
+.venv/bin/python -m evals.injection_eval              # run before a prompt change
+```
+
+**What is already verified, so you neither redo it nor assume it is missing.**
+Every module is mutation-tested; branch coverage is 96% and what remains is
+inert (`sys.exit(main())`, one-line delegations). The sanitisers are fuzzed
+against their stated invariants, the HTML report is checked by parsing it
+rather than by reading it for escapes, the opt-out guarantee is exercised
+across sweeps rather than against a fixture, and `injection_eval.py` tests the
+threat model `triage/classifier.py` asserts in its docstring.
+
+**Reaching for a tool, cheapest and most mechanical first.** Coverage before
+mutation: coverage grades what no test *reaches*, mutation only grades the
+tests that exist, so mutation on an unreached line tells you nothing while
+looking productive. Then fuzz anything parsing untrusted input, and mutate
+last, where judgement is actually needed. Learned the slow way here - the
+pipeline's entire write path (`update_labels`, `add_comment`, `set_property`)
+turned out never to have executed in a test, and a five-second coverage run
+found it after a lot of careful mutation had not.
+
+**The failure mode this code has, repeatedly.** Not crashes - a path reporting
+success without the evidence that success implies. A gate passing on a probe
+that tested nothing; a paging helper answering "no opt-out" from history it
+never fetched; `ANTHROPIC_API_KEY set` proving only that a variable exists. A
+green suite is weak evidence against this class, so when you add a guard, ask
+what it would do if the thing it checks were unavailable rather than false.
+
 ## Layout
 
 ```
