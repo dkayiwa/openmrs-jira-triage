@@ -2,6 +2,9 @@
 # ticket: a major release landing mid-pilot would first be noticed by a live run.
 anthropic>=0.92,<1
 requests>=2.31,<3
-# Test-only, but listed here because CI installs this file before running the
-# tests, and the workflow-invariant test must actually run there.
+# Runtime, not test-only: triage/run.py reads .github/workflows/triage.yml on
+# every --live run to refuse a sweep that could race the scheduled one, and that
+# check fails CLOSED when it cannot parse the file - so dropping PyYAML from a
+# production install blocks live runs rather than degrading quietly. Also used by
+# the workflow-invariant tests, which is why CI needs it too.
 PyYAML>=6,<7

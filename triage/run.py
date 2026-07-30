@@ -1,9 +1,14 @@
 """Triage pilot runner.
 
-Dry-run is the default: it writes proposals, contexts and a journal under
-out/ and touches nothing in Jira. --live (gated on credentials, and on the
-configured bot account id actually matching those credentials) applies exactly
-one ai-triage-* label plus one comment per ticket.
+Dry-run is the default: it writes contexts, a journal, the grading sheet
+(.csv/.md) and the comment report (.html) under out/, and touches nothing in
+Jira. --live applies exactly one ai-triage-* label plus one comment per ticket,
+and is gated on three things: the credentials, the configured bot account id
+actually matching them, and no scheduled sweep being able to race this one
+(see schedule_conflict).
+
+Scope is Jira's dev panel plus a GitHub backstop: a ticket whose PR the panel
+has not indexed is still excluded if an open PR names its key.
 """
 from __future__ import annotations
 
@@ -84,6 +89,20 @@ def jira_from_env(cfg: dict) -> JiraClient:
         os.environ.get("JIRA_EMAIL"),
         os.environ.get("JIRA_API_TOKEN"),
     )
+
+
+def github_from_env(cfg: dict) -> GitHubClient | None:
+    """The open-PR backstop client, or None when config disables it.
+
+    Single-sourced for the same reason as ai_label_names: the sweep and preflight
+    both build this, and a divergence would let preflight verify a backstop the
+    sweep is not running (or the reverse), which is exactly the check nobody
+    would think to make.
+    """
+    gh_cfg = cfg.get("github") or {}
+    if not gh_cfg.get("check_open_prs", False):
+        return None
+    return GitHubClient(gh_cfg.get("org", "openmrs"), os.environ.get("GITHUB_TOKEN"))
 
 
 def classification_entry_schema() -> dict:
@@ -478,7 +497,8 @@ pre { background:var(--pre-bg); border:1px solid var(--line); border-radius:6px;
 
 def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime,
                          proposals: list, live: bool, source: str,
-                         excluded: list[dict]) -> pathlib.Path:
+                         excluded: list[dict], swept: int | None = None,
+                         errors: int = 0) -> pathlib.Path:
     """Every label and comment this run writes (or would write), as one page.
 
     The reviewable artifact: Dennis and Veronica sign off on the wording before
@@ -515,10 +535,25 @@ def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime
         f'<p class="lede">{stamp:%Y-%m-%d %H:%M} UTC &middot; prompt '
         f'<code>{esc(cfg["prompt"]["version"])}</code> &middot; '
         f'{"LIVE - labels and comments applied" if live else "dry run - nothing written"}'
-        f' &middot; {len(rows)} ticket(s) in scope'
+        f' &middot; {len(rows)} ticket(s) labelled'
         + (f", {len(excluded)} excluded as already in review" if excluded else "")
+        + (f" &middot; {swept} in scope" if swept is not None else "")
         + "</p>",
     ]
+    # The lede's "N in scope" is the honest denominator; a reader can see the gap
+    # for themselves. Only errors get a warning box, because the arithmetic gap
+    # is normally deliberate: in steady state most of the cohort is already
+    # labelled and skipped, so warning on "labelled + excluded < swept" would
+    # fire on every routine sweep and train operators to ignore the banner.
+    # Errors are the signal - they are also the only way the sweep truncates,
+    # since the breaker trips on consecutive failures.
+    if errors:
+        parts.append('<div class="note"><strong>This run did not complete '
+                     f'cleanly.</strong> {errors} of {swept} ticket(s) errored, and '
+                     "the sweep stops early if enough fail in a row - so tickets "
+                     "may be missing from this report entirely. Check "
+                     "<code>out/journal.jsonl</code> for the per-ticket outcome "
+                     "before treating this as a complete record.</div>")
     if not live:
         parts.append(
             '<p class="meta">Every comment below is rendered by the same '
@@ -649,10 +684,8 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     # The dev-panel backstop. Off by config or by flag, and reported either way:
     # a sweep whose scope is wider than the pilot documented must say so in its
     # own log, not only in whatever the operator remembered to pass.
-    gh_cfg = cfg.get("github") or {}
-    github = None
-    if gh_cfg.get("check_open_prs", False) and not args.no_pr_check:
-        github = GitHubClient(gh_cfg.get("org", "openmrs"), os.environ.get("GITHUB_TOKEN"))
+    github = None if args.no_pr_check else github_from_env(cfg)
+    if github:
         auth = ("GITHUB_TOKEN" if github.authenticated else
                 f"unauthenticated, {github.min_interval:.0f}s between searches")
         print(f"open-PR backstop: on (org {github.org}, {auth})")
@@ -757,8 +790,20 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             # sheet, not just what gets written.
             provisional = plan_ticket(st, unchanged, args.force, classifier is not None,
                                       out_of_scope)
+            # Consulted only where the answer can change something. It cannot for
+            # a ticket already skipped for a permanent reason; and outside the
+            # gather step it cannot for an already-triaged one either, because
+            # the manifest the answer would alter is written under --no-classify
+            # only. Gather still asks - it deliberately offers already-triaged
+            # tickets for re-classification, so one in review must drop out
+            # there. Skipping the rest matters: in steady state most of the
+            # cohort is already triaged, and each search costs 2.5s of throttle
+            # and one more chance of the secondary rate limit that fails a
+            # ticket outright.
+            deaf_to_answer = provisional in ("skip-opted-out", "skip-out-of-scope") or (
+                provisional == "skip-already-triaged" and not args.no_classify)
             open_prs: list[str] = []
-            if github and provisional not in ("skip-opted-out", "skip-out-of-scope"):
+            if github and not deaf_to_answer:
                 open_prs = github.open_pr_urls(key)
             action = plan_ticket(st, unchanged, args.force, classifier is not None,
                                  out_of_scope, bool(open_prs))
@@ -874,7 +919,7 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     if proposals:
         base = write_proposals(cfg, out, stamp, proposals, args.live, source)
         report = write_comment_report(cfg, base, stamp, proposals, args.live, source,
-                                     excluded)
+                                      excluded, swept=len(keys), errors=errors)
         print(f"\nGrading sheet: {base}.csv (and .md); contexts in {out / 'contexts'}")
         wrote = "what was written" if args.live else "what would be written"
         print(f"Comment report ({wrote}): {report}")

@@ -95,11 +95,12 @@ _GITHUB_PATCHES = []
 
 
 def setUpModule():
+    # One patch point: preflight builds its client through run.github_from_env,
+    # so both entry points resolve GitHubClient in run's namespace.
     StubGitHub.reset()
-    for module in (run, preflight):
-        patch = mock.patch.object(module, "GitHubClient", StubGitHub)
-        patch.start()
-        _GITHUB_PATCHES.append(patch)
+    patch = mock.patch.object(run, "GitHubClient", StubGitHub)
+    patch.start()
+    _GITHUB_PATCHES.append(patch)
 
 
 def tearDownModule():
@@ -937,6 +938,39 @@ class BotIdentityTests(unittest.TestCase):
         self.assertIsNone(bot_identity_error(self._Jira("bot"), None))
 
 
+class PromptVersionTests(unittest.TestCase):
+    """The prompt file and config.toml must name the same version.
+
+    prompt/system.md says "keep in sync with [prompt].version" and nothing
+    enforced it. The drift is silent and it corrupts the pilot's only way to
+    explain a label: comments and journal rows stamp config's version while the
+    rubric that produced them is a different file, so a removal gets correlated
+    to a prompt the model never saw. Bumping the two by hand is exactly the
+    moment they diverge.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.prompt = (Path(run.__file__).resolve().parent.parent
+                      / "prompt" / "system.md").read_text()
+        cls.cfg = load_config()
+
+    def test_the_prompt_header_names_the_pinned_version(self):
+        pinned = self.cfg["prompt"]["version"]
+        header = self.prompt.splitlines()[0]
+        found = re.search(r"prompt version:\s*(\S+)", header)
+        self.assertIsNotNone(found, f"no version header in prompt/system.md: {header!r}")
+        self.assertEqual(found.group(1), pinned,
+                         "prompt/system.md and config.toml name different prompt versions")
+
+    def test_the_prompt_still_defines_every_label_the_pipeline_applies(self):
+        # The classifier's schema accepts exactly these keys; a prompt that
+        # stopped describing one would leave the model guessing at a label the
+        # pipeline will happily write to a public ticket.
+        for key in LABEL_KEYS:
+            self.assertIn(key, self.prompt, f"{key} is applied but never defined")
+
+
 class ScheduleGuardTests(unittest.TestCase):
     """Refuses a local --live run that could race the scheduled sweep.
 
@@ -1389,6 +1423,33 @@ class OpenPrBackstopWiringTests(unittest.TestCase):
         self.assertEqual(row["action"], "skip-opted-out")
         self.assertEqual(StubGitHub.searched, [])
 
+    def test_an_already_triaged_ticket_costs_no_search_outside_gather(self):
+        # Steady state: most of the cohort is already labelled, and for those the
+        # answer changes nothing outside gather - the manifest it would alter is
+        # only written under --no-classify. Paying ~30 throttled searches per
+        # sweep to change a journal string also buys ~30 more chances of the
+        # secondary rate limit, which fails tickets outright.
+        jira = RecordingJira({"O3-1": issue()})
+        StubGitHub.reset({})
+        first, _ = self._run(jira, live=True)[0], None   # writes label + property
+        # A PR appears afterwards. The ticket is now genuinely already-triaged:
+        # label present, stored hash and prompt both match.
+        StubGitHub.reset({"O3-1": ["https://github.com/openmrs/repo/pull/9"]})
+        _, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "skip-already-triaged")
+        self.assertEqual(StubGitHub.searched, [],
+                         "searched GitHub for a ticket whose answer cannot matter")
+
+    def test_gather_still_asks_about_already_triaged_tickets(self):
+        # --no-classify writes the manifest, and deliberately offers labelled
+        # tickets for re-classification. One that is now in review has to drop
+        # out there, so gather must still consult GitHub.
+        StubGitHub.reset({"O3-1": ["https://github.com/openmrs/repo/pull/9"]})
+        jira = RecordingJira({"O3-1": issue(labels=[AI[2]])})
+        _, row = self._run(jira, extra_args=["--no-classify"])
+        self.assertEqual(StubGitHub.searched, ["O3-1"])
+        self.assertEqual(row["action"], "skip-open-pr")
+
     def test_an_out_of_scope_ticket_costs_no_search(self):
         StubGitHub.reset({"O3-1": ["https://github.com/openmrs/repo/pull/9"]})
         jira = RecordingJira({"O3-1": issue(status={"name": "In Progress"})})
@@ -1528,7 +1589,6 @@ class EvalGateTests(unittest.TestCase):
                     row["content_hash"] = ctx.content_hash(text) if text else ""
                 w.writerow(row)
         labels = list(labels_returned)
-        module.Classifier = lambda *a: StubClassifier(None)
 
         class Sequenced:
             def classify(self, text):
@@ -2652,11 +2712,13 @@ class CommentReportTests(unittest.TestCase):
 
     STAMP = datetime.datetime(2026, 8, 1, 9, 30, 15, tzinfo=datetime.timezone.utc)
 
-    def _report(self, proposals, live=False, source="api", excluded=(), out=None):
+    def _report(self, proposals, live=False, source="api", excluded=(), out=None,
+                swept=None, errors=0):
         with tempfile.TemporaryDirectory() as d:
             base = Path(out or d) / "proposals-20260801-093015"
             return run.write_comment_report(load_config(), base, self.STAMP, proposals,
-                                            live, source, list(excluded)).read_text()
+                                            live, source, list(excluded),
+                                            swept=swept, errors=errors).read_text()
 
     def test_the_body_is_the_one_jira_would_receive(self):
         # Rendered from comment_body(), not restated: a report assembled
@@ -2718,6 +2780,30 @@ class CommentReportTests(unittest.TestCase):
         # write_comment_report is only called when there are proposals, but a
         # division by zero here would abort a run after its writes had landed.
         self.assertIn("Summary", self._report([]))
+
+    def test_the_lede_states_the_real_denominator(self):
+        # len(proposals) is not the cohort. A live run is the record of what was
+        # written to public tickets, so the report must not present "however many
+        # we got through" as the scope.
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], swept=32)
+        self.assertIn("1 ticket(s) labelled", page)
+        self.assertIn("32 in scope", page)
+
+    def test_an_errored_run_warns_that_tickets_may_be_missing(self):
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], swept=32, errors=3)
+        self.assertIn("did not complete cleanly", page)
+        self.assertIn("3 of 32", page)
+
+    def test_a_steady_state_sweep_does_not_cry_wolf(self):
+        # The common live run: most of the cohort is already labelled and
+        # skipped, so labelled + excluded is far below swept with nothing wrong.
+        # Warning on that arithmetic would fire every sweep and teach operators
+        # to ignore the banner that matters.
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], swept=32, errors=0)
+        self.assertNotIn("did not complete cleanly", page)
 
     def test_a_run_produces_the_report_beside_the_grading_sheet(self):
         StubGitHub.reset()

@@ -98,10 +98,15 @@ class GitHubClient:
                 self._sleep(wait)
         self._last_request = self._now()
 
+    def _request(self, query: str):
+        """The search request itself. One definition, so the retry below cannot
+        drift from the first attempt."""
+        return self.session.get(SEARCH_URL, params={"q": query, "per_page": 100},
+                                timeout=self.timeout)
+
     def _search(self, query: str) -> dict:
         self._throttle()
-        resp = self.session.get(SEARCH_URL, params={"q": query, "per_page": 100},
-                                timeout=self.timeout)
+        resp = self._request(query)
         if resp.status_code in (403, 429):
             resp = self._retry_after_rate_limit(resp, query)
         if resp.status_code >= 400:
@@ -127,8 +132,7 @@ class GitHubClient:
             )
         self._sleep(wait)
         self._last_request = self._now()
-        return self.session.get(SEARCH_URL, params={"q": query, "per_page": 100},
-                                timeout=self.timeout)
+        return self._request(query)
 
     @staticmethod
     def _retry_delay(resp) -> float | None:

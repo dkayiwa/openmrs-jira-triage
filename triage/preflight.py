@@ -2,9 +2,10 @@
 
 Verifies connectivity/auth, that the scope JQL runs (including the
 development[] clause), that the Acceptance Criteria field and "To Do" status
-exist, and - with --scratch and bot credentials - that Jira really rejects '/'
-in labels, which is why config.toml uses hyphenated ai-triage-* names instead
-of the design doc's ai-triage/* form.
+exist, that the GitHub open-PR backstop can run the same search the sweep will,
+and - with --scratch and bot credentials - that Jira really rejects '/' in
+labels, which is why config.toml uses hyphenated ai-triage-* names instead of
+the design doc's ai-triage/* form.
 """
 from __future__ import annotations
 
@@ -13,9 +14,8 @@ import os
 import sys
 
 from . import context as ctx
-from .github import GitHubClient
 from .jira import JiraError
-from .run import bot_identity_error, jira_from_env, load_config
+from .run import bot_identity_error, github_from_env, jira_from_env, load_config
 from .state import PROPERTY_KEY
 
 
@@ -109,12 +109,13 @@ def main(argv=None) -> int:
     # The dev-panel backstop. Probed with a single search rather than the whole
     # cohort: unauthenticated search allows 10/min, so sweeping every in-scope
     # key here would take minutes and teach nothing the sweep will not report.
-    gh_cfg = cfg.get("github") or {}
-    if not gh_cfg.get("check_open_prs", False):
+    # Built by the same factory the sweep uses, so preflight cannot pass against a
+    # differently-configured backstop than the one that will run.
+    gh = github_from_env(cfg)
+    if gh is None:
         print("       open-PR backstop: disabled in config.toml; scope rests on Jira's "
               "dev panel alone")
     else:
-        gh = GitHubClient(gh_cfg.get("org", "openmrs"), os.environ.get("GITHUB_TOKEN"))
         gh_label = "github open-PR backstop"
         # A key the sweep will actually ask about, so a probe that passes proves
         # the query the pipeline runs - not a simpler one.

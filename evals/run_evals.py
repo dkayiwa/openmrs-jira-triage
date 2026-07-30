@@ -35,6 +35,10 @@ CONTEXTS = EVALS / "contexts"
 
 GRADED_COLUMNS = ["key", "expected_label", "content_hash", "notes"]
 
+# A security boundary, not a formatting check: the key becomes a filesystem
+# path below. Defined once so a tightening cannot land on only one caller.
+KEY_RE = re.compile(r"[A-Z][A-Z0-9]*-\d+")
+
 
 def import_proposals(path: str, contexts_dir: str) -> None:
     rows: dict[str, dict] = {}
@@ -49,7 +53,7 @@ def import_proposals(path: str, contexts_dir: str) -> None:
                 continue
             # The key becomes a filesystem path below and is stored for later
             # reads, so it is bounded to a Jira key shape rather than trusted.
-            if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", (r.get("key") or "").strip()):
+            if not KEY_RE.fullmatch((r.get("key") or "").strip()):
                 print(f"skip {r.get('key')!r}: not a Jira issue key")
                 continue
             # An `ok` grade copies the proposal's own label into expected_label.
@@ -119,7 +123,7 @@ def load_cases() -> list[dict]:
     for row in rows:
         key = (row.get("key") or "").strip()
         expected = (row.get("expected_label") or "").strip()
-        if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", key):
+        if not KEY_RE.fullmatch(key):
             rejected.append(f"{key!r}: not a Jira issue key")
             continue
         if expected not in LABEL_KEYS:
