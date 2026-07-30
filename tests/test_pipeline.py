@@ -733,6 +733,41 @@ class ContextTests(unittest.TestCase):
         self.assertIn("PARENT O3-0: Parent summary", text)
         self.assertIn("Parent desc", text)
 
+    def test_an_unreachable_parent_is_declared_not_quietly_omitted(self):
+        # out/contexts/<KEY>.txt is the pilot's audit trail - the claim that this
+        # is exactly what the model saw. If the parent fetch fails and the
+        # context just drops it, a reviewer reading that file infers the model
+        # weighed a parent body it never received, and grades the label against
+        # evidence that was not there.
+        class NoParent(StubJira):
+            def issue(self, key, fields, expand_changelog=False):
+                raise JiraError("403")
+
+        text = ctx.assemble(NoParent(), issue(parent={"key": "O3-0"}), None, [])
+        self.assertIn("PARENT O3-0", text)
+        self.assertIn("(parent description unavailable)", text)
+
+    def test_inward_links_are_included_alongside_outward_ones(self):
+        # "is blocked by" is inward. Dropping that direction hides exactly the
+        # dependency that makes a ticket not ready to work on - the difference
+        # between an automation candidate and one that is blocked.
+        linked = issue(issuelinks=[
+            {"type": {"inward": "is blocked by"},
+             "inwardIssue": {"key": "O3-9", "fields": {"summary": "The blocker"}}},
+            {"type": {"outward": "relates to"},
+             "outwardIssue": {"key": "O3-8", "fields": {"summary": "The relative"}}},
+        ])
+        text = ctx.assemble(StubJira(), linked, None, [])
+        self.assertIn("- is blocked by O3-9: The blocker", text)
+        self.assertIn("- relates to O3-8: The relative", text)
+
+    def test_an_empty_description_is_marked_as_empty(self):
+        # A blank stretch where the description should be reads as a formatting
+        # artefact; "(empty)" is a fact. For needs_more_info - the label that
+        # turns on what the ticket does not say - that is the whole signal.
+        text = ctx.assemble(StubJira(), issue(description=None), None, [])
+        self.assertIn("DESCRIPTION:\n(empty)", text)
+
     def test_acceptance_criteria_included_when_configured(self):
         text = ctx.assemble(StubJira(), issue(customfield_1="Given X then Y"), "customfield_1", [])
         self.assertIn("ACCEPTANCE CRITERIA:\nGiven X then Y", text)
@@ -3292,6 +3327,49 @@ class ClassifierTests(unittest.TestCase):
         self.assertEqual(c.verification_steps, [])  # null coerces to empty
         self.assertEqual(c.confidence, 0.75)        # string coerces to float
         self.assertFalse(c.refused)
+
+    def test_a_boolean_confidence_survives_normalisation_to_reach_the_bool_guard(self):
+        # A composition bug, not a unit bug: ClampTests already proves
+        # clamp_classification coerces a boolean and says so, and
+        # ValidateClassificationTests already proves the file path refuses one.
+        # Both passed while this path was broken, because classify() normalises
+        # with float() first and float(True) is 1.0 - so by the time either
+        # guard ran, the boolean was an ordinary maximum confidence. The comment
+        # posted to the public ticket then claims the model was certain when it
+        # never said so, with nothing on stderr and nothing in the errors list.
+        # Only a test at the seam can see it.
+        payload = json.dumps({"label": "needs_judgment", "rationale": "A clinical call.",
+                              "missing_info": [], "verification_steps": [],
+                              "confidence": True})
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err):
+            _, c = self._classify(FakeResponse("end_turn", [FakeBlock(payload)]))
+        self.assertEqual(c.confidence, 1.0)
+        self.assertIn("boolean", err.getvalue(),
+                      "coercing a boolean to full confidence must not be silent")
+
+    def test_an_unusable_classification_is_refused_on_the_api_path_too(self):
+        # The last check before a label reaches a public ticket, and nothing
+        # tested it: the raise could be deleted and the suite stayed green.
+        # ValidateClassificationTests covers the validator as a unit and
+        # FileClassifierTests covers the file path, but neither runs it through
+        # classify() - so an off-enum label would have been handed back as a
+        # Classification and only blown up later, in run.py's label lookup,
+        # after the ticket had already been chosen for a write.
+        payload = json.dumps({"label": "banana", "rationale": "r", "missing_info": [],
+                              "verification_steps": [], "confidence": 0.9})
+        with self.assertRaises(RuntimeError) as caught:
+            self._classify(FakeResponse("end_turn", [FakeBlock(payload)]))
+        self.assertIn("unusable", str(caught.exception))
+        self.assertIn("label must be one of", str(caught.exception))
+
+    def test_a_numeric_string_confidence_is_still_normalised(self):
+        # The bool exclusion must not cost the normalisation it sits inside.
+        payload = json.dumps({"label": "needs_judgment", "rationale": "r",
+                              "missing_info": [], "verification_steps": [],
+                              "confidence": "0.5"})
+        _, c = self._classify(FakeResponse("end_turn", [FakeBlock(payload)]))
+        self.assertEqual(c.confidence, 0.5)
 
     def test_refusal_is_reported_not_parsed(self):
         _, c = self._classify(FakeResponse("refusal", []))

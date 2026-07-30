@@ -202,8 +202,18 @@ class Classifier:
         for field in ("missing_info", "verification_steps"):
             if data.get(field) is None:
                 data[field] = []
+        # Booleans are excluded deliberately. float(True) is 1.0, so normalising
+        # one here disarms BOTH bool guards below - clamp_classification's
+        # isinstance(confidence, bool) and validate_classification's - because
+        # by the time either runs the boolean is already an ordinary 1.0. The
+        # result is a comment on a public ticket claiming the maximum possible
+        # confidence, with no note and no error, from a model that never
+        # expressed one. Each mechanism was right when it was written; together
+        # they cancelled. Leave the bool for clamp_classification, which
+        # converts it and says so.
         try:
-            data["confidence"] = float(data["confidence"])
+            if not isinstance(data["confidence"], bool):
+                data["confidence"] = float(data["confidence"])
         except (KeyError, TypeError, ValueError):
             pass
         notes = clamp_classification(data)
