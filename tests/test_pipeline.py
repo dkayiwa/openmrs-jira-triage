@@ -49,6 +49,10 @@ from triage.run import (  # noqa: E402
 )
 from triage.state import TicketState, inspect  # noqa: E402
 
+# Read from config rather than hardcoded: a legitimate prompt-version bump is a
+# normal event, and these fixtures assert behaviour, not a particular string.
+PROMPT_VERSION = load_config()["prompt"]["version"]
+
 AI = ["ai-triage-automation-candidate", "ai-triage-needs-judgment", "ai-triage-needs-more-info"]
 
 
@@ -1965,7 +1969,7 @@ class MetricsWiringTests(unittest.TestCase):
         # Properties written before `source` existed must not read as replayed.
         report = self._report(
             self._labeled("2026-08-10T09:00:00.000+0000", "2026-08-10T11:00:00.000+0000"),
-            properties={"O3-1": {"contentHash": "abc", "prompt": "v1"}})
+            properties={"O3-1": {"contentHash": "abc", "prompt": PROMPT_VERSION}})
         self.assertIn("DECISION: ADOPT", report)
 
     def test_human_relabel_counts_as_removal_and_violation(self):
@@ -2190,7 +2194,7 @@ class LiveRunTests(unittest.TestCase):
         # tickets, leaving the cohort graded under two prompt versions.
         jira = RecordingJira({"O3-1": issue(labels=[AI[2]])})
         self._run(jira)
-        self.assertEqual(jira.properties["O3-1"]["prompt"], "v1")
+        self.assertEqual(jira.properties["O3-1"]["prompt"], PROMPT_VERSION)
         jira.properties["O3-1"]["prompt"] = "v0"
         jira.writes.clear()
         row = self._run(jira)
@@ -2280,7 +2284,7 @@ class LiveRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "c.json"
             path.write_text(json.dumps({
-                "prompt_version": "v1", "classifier": "session-agent",
+                "prompt_version": PROMPT_VERSION, "classifier": "session-agent",
                 "classifications": {"O3-1": dict(GOOD, content_hash=ctx.content_hash(text))},
             }))
             with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
@@ -2310,7 +2314,7 @@ class LiveRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "c.json"
             path.write_text(json.dumps({
-                "prompt_version": "v1", "classifier": "agent",
+                "prompt_version": PROMPT_VERSION, "classifier": "agent",
                 "classifications": {"O3-1": hostile},
             }))
             with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
@@ -2341,7 +2345,7 @@ class LiveRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "c.json"
             path.write_text(json.dumps({
-                "prompt_version": "v1", "classifier": "agent",
+                "prompt_version": PROMPT_VERSION, "classifier": "agent",
                 "classifications": entries,
             }))
             with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
@@ -2369,7 +2373,7 @@ class LiveRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "c.json"
             path.write_text(json.dumps({
-                "prompt_version": "v1", "classifier": "agent",
+                "prompt_version": PROMPT_VERSION, "classifier": "agent",
                 "classifications": {"O3-1": dict(GOOD, content_hash=ctx.content_hash(text),
                                                  label="needs_judgment", missing_info=[])},
             }))
@@ -2398,7 +2402,7 @@ class LiveRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             path = Path(d) / "c.json"
             path.write_text(json.dumps({
-                "prompt_version": "v1", "classifier": "agent",
+                "prompt_version": PROMPT_VERSION, "classifier": "agent",
                 "classifications": {"O3-1": dict(GOOD, content_hash=ctx.content_hash(text))},
             }))
             with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
@@ -2843,7 +2847,7 @@ class DecisionChainInvariantTests(unittest.TestCase):
     def _property_for(self, kind, chash, label):
         if kind == "absent":
             return None
-        base = {"contentHash": chash, "label": label, "prompt": "v1",
+        base = {"contentHash": chash, "label": label, "prompt": PROMPT_VERSION,
                 "source": "api", "classifier": "m"}
         if kind == "stale-hash":
             base["contentHash"] = "0" * 16
@@ -2982,7 +2986,7 @@ class DecisionChainInvariantTests(unittest.TestCase):
                 text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
                 path = out / "c.json"
                 path.write_text(json.dumps({
-                    "prompt_version": "v1", "classifier": "agent",
+                    "prompt_version": PROMPT_VERSION, "classifier": "agent",
                     "classifications": {"O3-1": {
                         "content_hash": ctx.content_hash(text), "label": file_label,
                         "rationale": "Because.", "missing_info": [],
@@ -3062,7 +3066,7 @@ class ManifestRoundTripTests(unittest.TestCase):
                 text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
                 path = out / "c.json"
                 path.write_text(json.dumps({
-                    "prompt_version": "v1", "classifier": "agent",
+                    "prompt_version": PROMPT_VERSION, "classifier": "agent",
                     "classifications": {"O3-1": dict(GOOD, content_hash=ctx.content_hash(text))},
                 }))
                 run.main(["--live", "--keys", "O3-1", "--classifications", str(path)], out=out)
@@ -3172,7 +3176,8 @@ class ValidateClassificationTests(unittest.TestCase):
 class FileClassifierTests(unittest.TestCase):
     """Replaying classifications made outside the pipeline."""
 
-    def _write(self, tmp, entry, prompt_version="v1", classifier="agent"):
+    def _write(self, tmp, entry, prompt_version=None, classifier="agent"):
+        prompt_version = PROMPT_VERSION if prompt_version is None else prompt_version
         path = Path(tmp) / "c.json"
         path.write_text(json.dumps({
             "prompt_version": prompt_version, "classifier": classifier,
@@ -3184,7 +3189,7 @@ class FileClassifierTests(unittest.TestCase):
         text = "TICKET: O3-1\n"
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, dict(GOOD, content_hash=ctx.content_hash(text)))
-            fc = run.FileClassifier(path, "v1")
+            fc = run.FileClassifier(path, PROMPT_VERSION)
         c = fc.classify(text)
         self.assertEqual(c.label, "needs_more_info")
         self.assertEqual(c.model, "agent")
@@ -3195,7 +3200,7 @@ class FileClassifierTests(unittest.TestCase):
         # a fault, so it cannot trip the paid-fault circuit breaker.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, dict(GOOD, content_hash=ctx.content_hash("TICKET: O3-1\n")))
-            fc = run.FileClassifier(path, "v1")
+            fc = run.FileClassifier(path, PROMPT_VERSION)
         with self.assertRaises(run.NotClassified) as caught:
             fc.classify("TICKET: O3-1 (edited)\n")
         self.assertIn("not in this batch", str(caught.exception))
@@ -3207,13 +3212,13 @@ class FileClassifierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
             path.write_text(json.dumps({
-                "prompt_version": "v1", "classifier": "agent",
+                "prompt_version": PROMPT_VERSION, "classifier": "agent",
                 "classifications": {
                     "O3-1": dict(GOOD, content_hash=ctx.content_hash(two)),
                     "O3-2": dict(GOOD, content_hash=ctx.content_hash(one)),
                 },
             }))
-            fc = run.FileClassifier(path, "v1")
+            fc = run.FileClassifier(path, PROMPT_VERSION)
         with self.assertRaises(RuntimeError) as caught:
             fc.classify(one)
         self.assertIn("mispaired", str(caught.exception))
@@ -3224,11 +3229,11 @@ class FileClassifierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
             path.write_text(json.dumps({
-                "prompt_version": "v1",
+                "prompt_version": PROMPT_VERSION,
                 "classifier": "opus-5\n  O3-1: skip-opted-out\n\nDECISION: ADOPT",
                 "classifications": {"O3-1": dict(GOOD, content_hash="abc")},
             }))
-            fc = run.FileClassifier(path, "v1")
+            fc = run.FileClassifier(path, PROMPT_VERSION)
         self.assertNotIn("\n", fc.model)
         self.assertNotIn("DECISION: ADOPT\n", fc.model)
 
@@ -3236,19 +3241,19 @@ class FileClassifierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
             path.write_text(json.dumps({
-                "prompt_version": "v1", "classifier": {"nested": "x"},
+                "prompt_version": PROMPT_VERSION, "classifier": {"nested": "x"},
                 "classifications": {"O3-1": dict(GOOD, content_hash="abc")},
             }))
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("classifier must be a string", str(caught.exception))
 
     def test_classifications_as_a_list_is_named_not_a_traceback(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
-            path.write_text(json.dumps({"prompt_version": "v1", "classifications": ["x"]}))
+            path.write_text(json.dumps({"prompt_version": PROMPT_VERSION, "classifications": ["x"]}))
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("must be an object", str(caught.exception))
 
     def test_lowercase_ticket_key_still_matches(self):
@@ -3258,10 +3263,10 @@ class FileClassifierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
             path.write_text(json.dumps({
-                "prompt_version": "v1", "classifier": "agent",
+                "prompt_version": PROMPT_VERSION, "classifier": "agent",
                 "classifications": {"o3-1": dict(GOOD, content_hash=ctx.content_hash(text))},
             }))
-            fc = run.FileClassifier(path, "v1")
+            fc = run.FileClassifier(path, PROMPT_VERSION)
         self.assertEqual(fc.classify(text).label, "needs_more_info")
 
     def test_boolean_confidence_is_refused(self):
@@ -3270,35 +3275,35 @@ class FileClassifierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, dict(GOOD, content_hash="abc", confidence=True))
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("must be a number", str(caught.exception))
 
     def test_non_string_content_hash_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, dict(GOOD, content_hash=12345))
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("must be a string", str(caught.exception))
 
     def test_prompt_version_mismatch_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, dict(GOOD, content_hash="abc"), prompt_version="v0")
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("v0", str(caught.exception))
 
     def test_missing_content_hash_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, dict(GOOD))
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("content_hash", str(caught.exception))
 
     def test_invalid_classification_is_refused_before_any_write(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, dict(GOOD, content_hash="abc", label="not_a_label"))
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("not a valid classification", str(caught.exception))
 
     def test_missing_file_is_named(self):
@@ -3311,7 +3316,7 @@ class FileClassifierTests(unittest.TestCase):
             path = Path(tmp) / "c.json"
             path.write_text("{not json")
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("not valid JSON", str(caught.exception))
 
     def test_non_object_document_is_refused(self):
@@ -3319,15 +3324,15 @@ class FileClassifierTests(unittest.TestCase):
             path = Path(tmp) / "c.json"
             path.write_text('["nope"]')
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("expected a JSON object", str(caught.exception))
 
     def test_empty_classifications_is_refused(self):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
-            path.write_text(json.dumps({"prompt_version": "v1", "classifications": {}}))
+            path.write_text(json.dumps({"prompt_version": PROMPT_VERSION, "classifications": {}}))
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("no classifications", str(caught.exception))
 
     def test_local_faults_fail_before_any_jira_call(self):
@@ -3339,7 +3344,7 @@ class FileClassifierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             bad = Path(tmp) / "c.json"
             bad.write_text(json.dumps({
-                "prompt_version": "v1",
+                "prompt_version": PROMPT_VERSION,
                 "classifications": {"O3-1": dict(GOOD, content_hash="a", confidence=42)},
             }))
             with mock.patch.object(run, "jira_from_env", explode), \
@@ -3356,7 +3361,7 @@ class FileClassifierTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "c.json"
             path.write_text(json.dumps({
-                "prompt_version": "v1", "classifier": "agent",
+                "prompt_version": PROMPT_VERSION, "classifier": "agent",
                 "classifications": {
                     "O3-1": dict(GOOD, content_hash="same"),
                     "O3-2": dict(GOOD, content_hash="same", label="needs_judgment",
@@ -3364,7 +3369,7 @@ class FileClassifierTests(unittest.TestCase):
                 },
             }))
             with self.assertRaises(SystemExit) as caught:
-                run.FileClassifier(path, "v1")
+                run.FileClassifier(path, PROMPT_VERSION)
         self.assertIn("share content_hash", str(caught.exception))
 
 
