@@ -1192,6 +1192,35 @@ class WritePlanTests(unittest.TestCase):
     def test_label_flip_removes_stale_and_comments(self):
         self.assertEqual(plan_label_writes([AI[2]], AI[0]), ([AI[0]], [AI[2]], True))
 
+    def test_no_label_is_ever_both_added_and_removed(self):
+        # Exhaustive over every present-set and choice, because this is the
+        # invariant the test doubles quietly rest on. RecordingJira models a
+        # write as (present - remove) + add, which has one meaning only while
+        # the two are disjoint; a plan that both added and removed a label
+        # would make the double's answer depend on an ordering it invents, and
+        # every sweep test would then assert against a Jira that does not
+        # exist. Twice this session the defect was in a double rather than in
+        # the code, so the assumptions they encode are worth stating out loud.
+        for size in range(len(AI) + 1):
+            for present in itertools.combinations(AI, size):
+                for chosen in AI:
+                    add, remove, _ = plan_label_writes(list(present), chosen)
+                    self.assertEqual(set(add) & set(remove), set(),
+                                     f"present={present} chosen={chosen}")
+
+    def test_every_plan_leaves_exactly_the_chosen_label(self):
+        # The planner's real contract, which nothing stated: whatever the
+        # ticket carried before, applying the plan leaves precisely one
+        # ai-triage label. Two would have the pipeline and metrics.py
+        # disagreeing about what the bot decided, and metrics counts labels.
+        for size in range(len(AI) + 1):
+            for present in itertools.combinations(AI, size):
+                for chosen in AI:
+                    add, remove, _ = plan_label_writes(list(present), chosen)
+                    after = [l for l in present if l not in remove] + list(add)
+                    self.assertEqual(sorted(set(after)), [chosen],
+                                     f"present={present} chosen={chosen} -> {after}")
+
 
 def stub_client(pages):
     client = JiraClient("https://example.invalid")
