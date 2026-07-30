@@ -380,6 +380,65 @@ class WorkflowInvariantTests(unittest.TestCase):
                      "ANTHROPIC_API_KEY", "GITHUB_TOKEN"):
             self.assertIn(name, self.sweep["env"], f"{name} is not passed to the sweep")
 
+    def test_the_job_cannot_hold_the_concurrency_group_indefinitely(self):
+        # This invariant only exists because of the one above. Never cancelling
+        # a running sweep is correct - it could be mid-write - but it means a
+        # wedged run owns the group, and GitHub keeps just one pending run per
+        # group and cancels the rest. On the default 6h timeout a single hang
+        # swallows the next 4-hourly sweeps, and the 24h SLA is a pre-registered
+        # metric, so it is missed with nothing reporting it.
+        timeout = self.job.get("timeout-minutes")
+        self.assertIsNotNone(timeout, "the job has no timeout-minutes")
+        self.assertLess(timeout, 4 * 60, "a timeout longer than the cron interval "
+                                         "cannot stop runs from queueing behind a hang")
+
+    def test_the_gate_runs_with_the_credentials_the_sweep_will_use(self):
+        # Running preflight only from a laptop proves the pipeline against a
+        # personal token. The backstop's production credential is github.token -
+        # repo-scoped, ephemeral, and searching a different org - and if it
+        # cannot do that, every ticket fails the backstop and the breaker aborts
+        # the first live sweep having written nothing.
+        idx = {}
+        for i, step in enumerate(self.steps):
+            line = str(step.get("run", ""))
+            if "triage.preflight" in line:
+                idx["gate"] = i
+            if "triage.run" in line:
+                idx["sweep"] = i
+        self.assertIn("gate", idx, "no step runs the preflight gate")
+        self.assertLess(idx["gate"], idx["sweep"], "the gate must run before the sweep")
+        gate_env = self.steps[idx["gate"]]["env"]
+        self.assertIn("github.token", gate_env["GITHUB_TOKEN"],
+                      "the gate must probe GitHub with the sweep's own token")
+        # Every credential the sweep gets, so the gate's report describes the
+        # sweep's environment rather than a subset of it.
+        for name in self.sweep["env"]:
+            if name == "LIMIT":
+                continue
+            self.assertIn(name, gate_env,
+                          f"the sweep has {name} but the gate does not, so the gate "
+                          "reports on an environment that is not the sweep's")
+
+    def test_the_local_live_guard_reads_this_exact_file(self):
+        # schedule_conflict() parses this file on every local --live run to
+        # refuse a sweep that could race the scheduled one. Every test of it
+        # uses synthetic YAML, so the coupling to the real file was unproven:
+        # a workflow edit could silently make the guard blind, and the failure
+        # only appears as two sweeps commenting on the same ticket. Checks both
+        # states against the real text, so enabling the schedule cannot quietly
+        # leave local --live unguarded.
+        root = Path(__file__).resolve().parent.parent
+        self.assertIsNone(run.schedule_conflict(root, in_ci=False),
+                          "the schedule is commented out, so local --live is allowed")
+        enabled = re.sub(r"^  # (schedule:|  - cron:)", r"  \1", self.text, flags=re.M)
+        self.assertIn("\n  schedule:", enabled, "the commented block did not uncomment")
+        with tempfile.TemporaryDirectory() as d:
+            wf = Path(d) / ".github" / "workflows"
+            wf.mkdir(parents=True)
+            (wf / "triage.yml").write_text(enabled)
+            self.assertIsNotNone(run.schedule_conflict(Path(d), in_ci=False),
+                                 "with the schedule live, local --live must be refused")
+
     def test_the_open_pr_backstop_is_not_left_unauthenticated_on_a_schedule(self):
         # Unauthenticated search allows 10/min, so a scheduled full-cohort sweep
         # would spend minutes throttling and risk failing tickets on the limit.

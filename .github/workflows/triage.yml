@@ -29,6 +29,14 @@ concurrency:
 jobs:
   triage:
     runs-on: ubuntu-latest
+    # Bounded because the concurrency group above never cancels a running sweep,
+    # which is right - a live sweep must not be killed mid-write - but means a
+    # wedged run holds the group. GitHub keeps at most one pending run per group
+    # and cancels the rest, so on the default 6h timeout a single hung sweep
+    # silently swallows the next 4-hourly runs and the 24h SLA - a pre-registered
+    # metric - is missed with nothing anywhere reporting it. A full 31-ticket
+    # sweep takes about seven minutes, so this only ever fires on a genuine hang.
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -36,6 +44,27 @@ jobs:
           python-version: "3.12"
       - run: pip install -r requirements.txt
       - run: python -m unittest discover -s tests -q
+      # Runs the gate with the credentials the sweep will actually use, on the
+      # runner the sweep will actually use. Until now the go-live gate was only
+      # ever run locally, against a personal GITHUB_TOKEN - so the open-PR
+      # backstop had never been exercised with `github.token`, which is a
+      # repo-scoped ephemeral token searching a DIFFERENT org. If it cannot, the
+      # backstop raises, that fails the ticket by design, and five in a row trip
+      # the breaker: the first live sweep would abort having done nothing, and
+      # the gate that passed locally would not have predicted it. Failing here
+      # costs one runner-minute instead.
+      - run: python -m triage.preflight
+        env:
+          JIRA_EMAIL: ${{ secrets.JIRA_EMAIL }}
+          JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
+          TRIAGE_BOT_ACCOUNT_ID: ${{ secrets.TRIAGE_BOT_ACCOUNT_ID }}
+          GITHUB_TOKEN: ${{ github.token }}
+          # Passed although preflight only reports on it: the gate's last line
+          # states whether a credential is present, and omitting it here would
+          # print "no env key" on a run whose sweep has one. A gate describing
+          # an environment that is not the sweep's is the fault this whole step
+          # exists to remove.
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
       # Scheduled runs are live by definition; manual dispatches choose.
       # LIMIT goes through env, not ${{ }} interpolation into the shell line:
       # a dispatch input is arbitrary text and would otherwise be executed.
