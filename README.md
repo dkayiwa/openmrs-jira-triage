@@ -223,6 +223,34 @@ phase, every human label-removal gets added here as a new case.
    edits notify watchers (comments always notify - Cloud has no off switch).
 4. **Preflight with the write test:** `python -m triage.preflight --scratch O3-XXXX`.
 5. **Dry-run the whole cohort, grade, iterate** until the eval gate passes.
+
+   **Grade the contested tickets first.** Unanimity teaches you least — a case
+   every model labels the same way was easy. Classify the frozen contexts with
+   two or three candidate models and grade where they *split*: that set is both
+   the model question and the largest pocket of prompt ambiguity, for a fraction
+   of the effort of grading the whole cohort. Measured on the launch cohort,
+   11 of 32 tickets split, and 6 of those 11 sat on the `needs_judgment`
+   boundary — the label the rubric finds hardest.
+
+   **Settle the model before launch, and don't shop for one after.** The three
+   metrics assume one pinned model and prompt version per label, so the choice is
+   pre-registered like the thresholds. Once grades exist,
+   `evals/run_evals.py --model <id> --model <id>` scores candidates against them
+   through the real classifier; that comparison is labelled as not the gate and
+   cannot change what the pinned model authorises.
+
+   What a pre-grading comparison found here, so the next person need not
+   re-derive it: **Haiku is unsuitable.** It agreed with Opus on 24/32, and all 8
+   of its disagreements moved *toward* `automation_candidate` — six from
+   `needs_judgment`, collapsing that label from 7 to 1. That is the harmful
+   direction: it tells a contributor a ticket blocked on a clinical or product
+   call is ready to build. Its confidence was also anti-informative, highest
+   exactly where the models disagreed (0.83 on split cases vs Opus's 0.62), so it
+   would flag nothing for review. **Sonnet was not resolved:** it differed on 5
+   of 32, which is within about twice the harness effect measured alongside it,
+   so that gap may be the test wrapper rather than the model. Note the stakes are
+   asymmetric — the saving from a cheaper model is a few dollars a month against
+   a kill metric that stops the pilot at four removals out of ~32.
 6. **Enable writes:** add the four repo secrets, uncomment the `schedule` block
    in `.github/workflows/triage.yml`, or run `python -m triage.run --live`.
    (`GITHUB_TOKEN` is not a fifth secret — the workflow passes the automatic
