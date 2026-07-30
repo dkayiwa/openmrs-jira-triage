@@ -3765,6 +3765,40 @@ class ClampTests(unittest.TestCase):
         self.assertTrue(all(len(s) <= 300 for s in data["verification_steps"]))
         self.assertTrue(notes, "the adjustment is reported, not silent")
 
+    def test_clamping_never_leaves_a_magnitude_for_validation_to_reject(self):
+        """clamp_classification's whole reason for existing, as a property.
+
+        Its docstring explains the stakes: a rejected classification writes no
+        entity property, so the ticket's content hash is unchanged and it is
+        re-classified and re-charged on EVERY sweep, forever, and five such in
+        a row abort the whole run. clamp exists so that a magnitude can never
+        be the reason. Individual cases were tested; the property was not, and
+        a magnitude clamp missed at one corner is a permanent recurring charge
+        on that ticket rather than a visible failure.
+
+        Every combination of the magnitude edges, which is what a fuzz over
+        40,000 random inputs was really sampling.
+        """
+        edges = {
+            "confidence": [0, 1, 0.5, -3, 95, True, False, 1.0000001, -1e-7, 1e308],
+            "rationale": ["ok", "", "   ", "\n\t ", "x" * 1999, "x" * 2000, "x" * 2001,
+                          "y" * 9000, " " * 3000],
+            "missing_info": [[], ["a"], ["b" * 299], ["c" * 300], ["d" * 301],
+                             ["e"] * 20, ["f"] * 21, ["g" * 500] * 25],
+        }
+        checked = 0
+        for conf, rat, items in itertools.product(
+                edges["confidence"], edges["rationale"], edges["missing_info"]):
+            data = {"label": "needs_more_info", "rationale": rat,
+                    "missing_info": list(items), "verification_steps": list(items),
+                    "confidence": conf}
+            clamp_classification(data)
+            errors = validate_classification(data)
+            self.assertEqual(errors, [], f"clamped but still rejected: conf={conf!r} "
+                                         f"len(rationale)={len(rat)} items={len(items)}")
+            checked += 1
+        self.assertGreater(checked, 500, "the product collapsed; this proves nothing")
+
     def test_confidence_is_clamped_into_range(self):
         data = dict(GOOD, confidence=95)
         clamp_classification(data)
