@@ -180,5 +180,10 @@ class GitHubClient:
         for item in data.get("items", []):
             cited = f"{item.get('title') or ''}\n{item.get('body') or ''}"
             if names_key(cited, key):
-                urls.append(item.get("html_url") or f"{self.org}#{item.get('number')}")
+                # html_url is what the API returns; url is the API-side
+                # fallback. Never synthesise "org#123" - it reaches the
+                # report as an href and renders as a link that goes nowhere,
+                # which is worse than plain text a reviewer can search for.
+                urls.append(item.get("html_url") or item.get("url")
+                            or f"{self.org} PR #{item.get('number')} (no URL returned)")
         return urls

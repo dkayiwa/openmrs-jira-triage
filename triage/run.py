@@ -2,7 +2,9 @@
 
 Dry-run is the default: it writes contexts, a journal, the grading sheet
 (.csv/.md) and the comment report (.html) under out/, and touches nothing in
-Jira. --live applies exactly one ai-triage-* label plus one comment per ticket,
+Jira. --live applies at most one ai-triage-* label per ticket, plus one comment
+the first time that label appears (a re-classification reaching the same label
+is silent),
 and is gated on three things: the credentials, the configured bot account id
 actually matching them, and no scheduled sweep being able to race this one
 (see schedule_conflict).
@@ -414,11 +416,20 @@ def comment_body(cfg: dict, c) -> str:
     return "\n".join(lines)
 
 
+def proposal_base(out: pathlib.Path, stamp: datetime.datetime) -> pathlib.Path:
+    """Shared stem for a run's artifacts.
+
+    Seconds included: two quick --keys runs in the same minute would otherwise
+    overwrite a grading sheet someone had already started on. Hoisted out of
+    write_proposals because the comment report is written on runs that produce
+    no grading sheet at all, and the two must still share a stamp.
+    """
+    return out / f"proposals-{stamp:%Y%m%d-%H%M%S}"
+
+
 def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, proposals: list,
                     live: bool, source: str = "api") -> pathlib.Path:
-    # Seconds included: two quick --keys runs in the same minute would
-    # otherwise overwrite a grading sheet someone had already started on.
-    base = out / f"proposals-{stamp:%Y%m%d-%H%M%S}"
+    base = proposal_base(out, stamp)
     url = cfg["jira"]["base_url"] + "/browse/"
     with open(base.with_suffix(".csv"), "w", newline="") as fh:
         w = csv.writer(fh)
@@ -847,6 +858,14 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                             jira.update_labels(key, add, remove)
                         if post_comment:
                             jira.add_comment(key, comment_body(cfg, c))
+                        # Recorded here, before the property write. Everything a
+                        # watcher can see has already landed; set_property is
+                        # internal bookkeeping. Dropping the ticket when only
+                        # that fails would hide a public comment from the page
+                        # headed "what the triage pilot wrote" - and the property
+                        # write is exactly the one preflight probes because it is
+                        # the permission most likely to be missing.
+                        proposals.append((issue, c, chash))
                         jira.set_property(key, PROPERTY_KEY, {
                             "contentHash": chash, "label": label,
                             "prompt": cfg["prompt"]["version"],
@@ -859,10 +878,9 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                             "at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
                         })
                         row["action"] = "labeled" if post_comment else "refreshed"
-                    # Recorded only once the writes have landed: the live sheet
-                    # is headed "labels and comments applied", so a ticket whose
-                    # write raised must not appear in it.
-                    proposals.append((issue, c, chash))
+                    else:
+                        # Dry run: nothing to land, so record it directly.
+                        proposals.append((issue, c, chash))
         except NotClassified as e:
             # Not a fault: a classifications file may cover a subset of the
             # sweep. Recorded as a skip so it never trips the error breaker.
@@ -916,13 +934,19 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
         }, indent=2) + "\n")
         print(f"\nManifest: {out / 'manifest.json'} ({len(manifest)} ticket(s) to classify)")
 
+    base = proposal_base(out, stamp)
+    # An empty grading sheet is noise, so that stays gated on proposals. The
+    # comment report is not: a sweep the breaker cut short, or one whose only
+    # outcome was open-PR exclusions, is exactly when its truncation banner and
+    # excluded list need to exist.
     if proposals:
-        base = write_proposals(cfg, out, stamp, proposals, args.live, source)
+        write_proposals(cfg, out, stamp, proposals, args.live, source)
+        print(f"\nGrading sheet: {base}.csv (and .md); contexts in {out / 'contexts'}")
+    if proposals or excluded or errors:
         report = write_comment_report(cfg, base, stamp, proposals, args.live, source,
                                       excluded, swept=len(keys), errors=errors)
-        print(f"\nGrading sheet: {base}.csv (and .md); contexts in {out / 'contexts'}")
         wrote = "what was written" if args.live else "what would be written"
-        print(f"Comment report ({wrote}): {report}")
+        print(f"\nComment report ({wrote}): {report}")
     if errors:
         # Non-zero so a scheduled run turns red. Previously a sweep in which
         # every ticket failed still exited 0, so the only evidence was a line

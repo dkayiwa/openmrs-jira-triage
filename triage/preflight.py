@@ -95,14 +95,14 @@ def main(argv=None) -> int:
     jql = cfg["jira"]["scope_jql"].format(since=cfg["jira"]["cohort_created_since"])
     dev_clause = cfg["jira"]["dev_panel_clause"]
     scope_label = "scope JQL (with development[] clause)"
-    got, keys = attempt(scope_label, lambda: jira.search_keys(jql))
-    if got:
+    scope_ok, keys = attempt(scope_label, lambda: jira.search_keys(jql))
+    if scope_ok:
         ok &= check(scope_label, True, f"{len(keys)} ticket(s); doc estimates ~35")
     else:
         ok = False
-        got, fallback = attempt("scope JQL without the development[] clause",
+        fallback_ok, fallback = attempt("scope JQL without the development[] clause",
                                 lambda: jira.search_keys(jql.replace(dev_clause, "")))
-        if got:
+        if fallback_ok:
             print(f"       without the clause: {len(fallback)} ticket(s) - the dev-panel "
                   "JQL may need auth or the GitHub-for-Jira app")
 
@@ -119,7 +119,7 @@ def main(argv=None) -> int:
         gh_label = "github open-PR backstop"
         # A key the sweep will actually ask about, so a probe that passes proves
         # the query the pipeline runs - not a simpler one.
-        probe_key = keys[0] if got and keys else cfg["jira"]["project"] + "-1"
+        probe_key = keys[0] if scope_ok and keys else cfg["jira"]["project"] + "-1"
         probed, urls = attempt(gh_label, lambda: gh.open_pr_urls(probe_key))
         if probed:
             auth = "GITHUB_TOKEN" if gh.authenticated else \
@@ -132,14 +132,39 @@ def main(argv=None) -> int:
                   "search fails; pass --no-pr-check to sweep without the backstop")
 
     if args.scratch and jira.authenticated:
+        # The hyphenated add runs FIRST and gates the slash conclusion. Without
+        # it, any Jira failure at all - a 404 from a mistyped --scratch key, a
+        # missing Edit Issues permission, a 5xx - reads as "slash rejected" and
+        # the go-live gate reports PASS on a probe that tested nothing.
+        hyphen_label = "ai-triage-charset-test"
+        hyphen_ok = False
+        try:
+            jira.update_labels(args.scratch, [hyphen_label], [])
+            hyphen_ok = True
+            ok &= check("hyphenated label accepted", True, hyphen_label)
+        except JiraError as e:
+            ok &= check("hyphenated label accepted", False, str(e)[:200])
+        finally:
+            try:
+                jira.update_labels(args.scratch, [], [hyphen_label])
+            except JiraError:
+                print(f"       WARN: could not remove {hyphen_label} from "
+                      f"{args.scratch}; remove manually")
+
         slash_label = "ai-triage/charset-test"
         # Only the *add* may count as evidence: wrapping the cleanup removal in
         # the same try would report a failed removal as "slash rejected", the
         # opposite conclusion, and leave the label on the scratch ticket.
         try:
             jira.update_labels(args.scratch, [slash_label], [])
-        except JiraError:
-            check("slash rejected in labels", True, "hyphenated ai-triage-* names are required")
+        except JiraError as e:
+            if hyphen_ok:
+                check("slash rejected in labels", True,
+                      "hyphenated ai-triage-* names are required")
+            else:
+                ok &= check("slash rejected in labels", False,
+                            "inconclusive - the hyphenated add failed too, so this "
+                            f"is not evidence about '/': {str(e)[:120]}")
         else:
             check("slash rejected in labels", False,
                   f"Jira accepted {slash_label!r}; the doc's ai-triage/* names would work after all")
@@ -187,17 +212,6 @@ def main(argv=None) -> int:
                 print(f"       WARN: could not delete the preflight property from "
                       f"{args.scratch}; remove manually")
 
-        hyphen_label = "ai-triage-charset-test"
-        try:
-            jira.update_labels(args.scratch, [hyphen_label], [])
-            ok &= check("hyphenated label accepted", True, hyphen_label)
-        except JiraError as e:
-            ok &= check("hyphenated label accepted", False, str(e)[:200])
-        finally:
-            try:
-                jira.update_labels(args.scratch, [], [hyphen_label])
-            except JiraError:
-                print(f"       WARN: could not remove {hyphen_label} from {args.scratch}; remove manually")
     else:
         print("       (label-charset write test skipped: pass --scratch O3-XXXX with bot credentials)")
 

@@ -86,8 +86,17 @@ def import_proposals(path: str, contexts_dir: str) -> None:
             # run can replace the text this grade was made against. Freezing the
             # new context against the old grade would silently corrupt the set
             # that gates the >= 90% go-live decision.
+            # Fails CLOSED on an absent hash, like the source gate above: with
+            # no hash there is nothing to prove the context on disk is the text
+            # that was graded, and freezing the wrong text corrupts the set that
+            # authorises go-live.
             graded_hash = (r.get("content_hash") or "").strip()
-            if graded_hash and content_hash(src.read_text()) != graded_hash:
+            if not graded_hash:
+                print(f"skip {r['key']}: no content_hash, so the sheet cannot show "
+                      "which text was graded; re-export the proposals CSV and "
+                      "re-grade from it")
+                continue
+            if content_hash(src.read_text()) != graded_hash:
                 print(f"skip {r['key']}: {src} changed since grading; re-run the "
                       "dry-run for this ticket and re-grade it")
                 continue
@@ -135,9 +144,13 @@ def load_cases() -> list[dict]:
             continue
         graded_hash = (row.get("content_hash") or "").strip()
         if not graded_hash:
-            print(f"WARN {key}: no content_hash recorded, so the frozen context "
-                  "cannot be verified against what was graded")
-        elif content_hash(frozen.read_text()) != graded_hash:
+            # Refused, not warned: the docstring above promises exactly this,
+            # and a case whose frozen text cannot be verified was still being
+            # scored into the gate that authorises go-live.
+            rejected.append(f"{key}: no content_hash recorded, so the frozen "
+                            "context cannot be verified against what was graded")
+            continue
+        if content_hash(frozen.read_text()) != graded_hash:
             rejected.append(f"{key}: frozen context has been edited since grading")
             continue
         cases.append({"key": key, "expected_label": expected, "context": frozen})

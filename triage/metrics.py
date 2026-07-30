@@ -106,14 +106,23 @@ def main() -> int:
         # entirely rather than counting it in the denominator while skipping its
         # contribution to the numerators.
         try:
-            prop = jira.get_property(key, PROPERTY_KEY) or {}
+            prop = jira.get_property(key, PROPERTY_KEY)
         except Exception as e:
             failed.append(f"{key}: reading {PROPERTY_KEY}: {type(e).__name__}: {e}"[:200])
             continue
         labeled += 1
-        if prop.get("source", "api") != "api":
-            replayed.append(f"{key}: source={prop.get('source')} "
-                            f"classifier={prop.get('classifier')}")
+        # A bot-labelled ticket with NO property is unknown provenance, not api
+        # provenance, and defaulting it to "api" failed open on precisely the
+        # case this withholding exists for. The property is written last, after
+        # the label and the comment, so a replayed label whose property write
+        # raised is public and unattributed - and would have been counted as
+        # pinned-model evidence. evals/run_evals.py already fails closed on an
+        # absent source column; this now matches it.
+        source = "absent" if prop is None else (prop or {}).get("source", "api")
+        if source != "api":
+            replayed.append(f"{key}: source={source} "
+                            f"classifier={(prop or {}).get('classifier')}")
+        prop = prop or {}
         if sla_met(issue["fields"]["created"], st.bot_first_labeled_at, launch):
             within += 1
         if st.opted_out:

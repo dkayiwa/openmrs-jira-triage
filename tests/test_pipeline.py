@@ -600,6 +600,18 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("[FAIL] bot can read and write entity properties", report)
 
+    def test_a_broken_scratch_ticket_cannot_masquerade_as_slash_rejection(self):
+        # The whole probe is "Jira refused the slash". Before the hyphen add
+        # gated it, ANY failure counted: a mistyped --scratch key (404), a
+        # missing Edit Issues permission (403), a 5xx. The gate then printed
+        # PASS on a probe that tested nothing, and the pilot would launch with
+        # its label names resting on an assumption nobody had checked.
+        rc, report = self._run(self.Stub(raises={"update_labels"}),
+                               argv=["--scratch", "O3-9999"])
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] slash rejected in labels", report)
+        self.assertIn("inconclusive", report)
+
     def test_a_jira_that_accepts_slashes_fails_the_gate(self):
         # The whole reason config.toml deviates from the design doc's names.
         rc, report = self._run(self.Stub(reject_slash=False), ["--scratch", "O3-1"])
@@ -1225,9 +1237,21 @@ class GitHubClientTests(unittest.TestCase):
         client = self._client([gh_response([pr(3, title="Refactor", body="No keys here")])])
         self.assertEqual(client.open_pr_urls("O3-5816"), [])
 
-    def test_a_missing_html_url_still_identifies_the_pr(self):
+    def test_a_missing_html_url_falls_back_to_the_api_url(self):
+        client = self._client([gh_response([
+            {"number": 7, "title": "O3-5816 fix",
+             "url": "https://api.github.com/repos/openmrs/r/pulls/7"}])])
+        self.assertEqual(client.open_pr_urls("O3-5816"),
+                         ["https://api.github.com/repos/openmrs/r/pulls/7"])
+
+    def test_with_no_url_at_all_the_fallback_is_not_a_link(self):
+        # This value is rendered as an href in the report a reviewer uses to
+        # confirm an exclusion. "openmrs#7" looks checkable and goes nowhere,
+        # which is worse than plain text they can search for.
         client = self._client([gh_response([{"number": 7, "title": "O3-5816 fix"}])])
-        self.assertEqual(client.open_pr_urls("O3-5816"), ["openmrs#7"])
+        got = client.open_pr_urls("O3-5816")[0]
+        self.assertNotRegex(got, r"^\S+#\d+$")
+        self.assertIn("7", got)
 
     def test_searches_are_throttled_below_the_unauthenticated_rate(self):
         client = self._client([gh_response([]), gh_response([])])
@@ -1675,16 +1699,18 @@ class EvalGateTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("missing", report)
 
-    def test_an_unverifiable_case_warns_but_still_scores(self):
-        # A hand-added row with no hash cannot be checked; it is surfaced rather
-        # than silently trusted or silently dropped.
+    def test_an_unverifiable_case_is_refused_not_scored(self):
+        # Previously this warned and then scored the case into the >= 90% gate,
+        # contradicting load_cases' own docstring ("refused rather than scored").
+        # With no hash there is nothing to prove the frozen text is what a human
+        # graded, and the gate it feeds authorises writing to public tickets.
         with tempfile.TemporaryDirectory() as tmp:
             case = self._case("O3-1")
             case["content_hash"] = ""
             rc, report = self._run(tmp, [case], ["needs_more_info"])
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 1)
         self.assertIn("no content_hash recorded", report)
-        self.assertIn("agreement: 1/1", report)
+        self.assertNotIn("agreement:", report)
 
     def test_the_result_names_the_model_and_prompt_it_gated(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -1941,11 +1967,16 @@ class EvalImportTests(unittest.TestCase):
                                source="file", grade="wrong", correct_label="needs_judgment")
         self.assertEqual([r["expected_label"] for r in rows], ["needs_judgment"])
 
-    def test_sheet_without_a_hash_column_still_imports(self):
-        # Proposals CSVs produced before the column existed stay usable.
+    def test_sheet_without_a_hash_column_is_refused(self):
+        # Every proposals CSV this pipeline writes carries content_hash, so a
+        # sheet lacking it was hand-made or round-tripped through a tool that
+        # dropped the column - the same unknown provenance the source gate
+        # refuses. Importing it froze whatever out/contexts holds *now* as the
+        # answer key for a grade made against text nobody can identify.
         text = "TICKET: O3-1\n"
-        rows, _ = self._import(text, "")
-        self.assertEqual([r["key"] for r in rows], ["O3-1"])
+        rows, printed = self._import(text, "")
+        self.assertEqual(rows, [])
+        self.assertIn("no content_hash", printed)
 
 
 class MetricsJira:
@@ -1980,6 +2011,12 @@ class MetricsWiringTests(unittest.TestCase):
     def _report(self, issue_json, intro_keys=("O3-1",) * 5, properties=None):
         cfg = load_config()
         cfg["metrics"] = dict(cfg["metrics"], pilot_launch="2026-08-01")
+        # A live run writes the property alongside the label, so the default
+        # fixture supplies one. A bot-labelled ticket *without* one is unknown
+        # provenance and now withholds the decision - which is its own test
+        # below, not the state every other metric test should be run in.
+        if properties is None:
+            properties = {"O3-1": {"source": "api", "classifier": "m"}}
         jira = MetricsJira({"O3-1": issue_json}, intro_keys, properties)
         with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
              mock.patch.object(metrics, "load_config", lambda: cfg), \
@@ -2024,6 +2061,19 @@ class MetricsWiringTests(unittest.TestCase):
                                        "2026-08-10T11:00:00.000+0000"),
                          properties="raise")
         self.assertIn("resolve the failures above", str(caught.exception))
+
+    def test_a_bot_label_with_no_property_withholds_the_decision(self):
+        # The property is written after the label and the comment, so a replayed
+        # label whose property write raised is public and unattributed. Defaulting
+        # that to source=api counted it as pinned-model evidence - failing open on
+        # exactly the case the withholding exists for, and silently: the report
+        # would print ADOPT over a cohort that mixes two systems.
+        report = self._report(self._labeled("2026-08-01T09:00:00.000+0000",
+                                            "2026-08-01T10:00:00.000+0000"),
+                              properties={})
+        self.assertIn("NO DECISION", report)
+        self.assertIn("source=absent", report)
+        self.assertNotIn("DECISION: ADOPT", report)
 
     def test_a_property_without_source_counts_as_api(self):
         # Properties written before `source` existed must not read as replayed.
