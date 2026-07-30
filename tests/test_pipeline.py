@@ -40,7 +40,8 @@ from triage.classifier import (  # noqa: E402
     validate_classification,
 )
 from triage.jira import JiraClient, JiraError  # noqa: E402
-from triage.metrics import decide, parse_launch, sla_met  # noqa: E402
+from triage.metrics import (decide, parse_launch, sla_met,  # noqa: E402
+                            validate_thresholds)
 from triage.run import (  # noqa: E402
     _load_dotenv,
     bot_identity_error,
@@ -1083,6 +1084,19 @@ class PreflightTests(unittest.TestCase):
         rc, report = self._run(Amnesiac(), ["--scratch", "O3-1"])
         self.assertEqual(rc, 1)
         self.assertIn("[FAIL] bot can read and write entity properties", report)
+
+    def test_a_threshold_in_the_wrong_unit_fails_the_gate(self):
+        # Checked at the gate rather than only in metrics.py because of when
+        # each runs: the thresholds are pre-registered and typed once, and
+        # metrics.py does not read them until a week into the pilot, by which
+        # point the sweeps they judge have already happened. Written as 10
+        # instead of 0.10, the kill metric can never fire again.
+        cfg = load_config()
+        cfg["metrics"] = dict(cfg["metrics"], max_label_removal_rate=10)
+        with mock.patch.object(preflight, "load_config", lambda: cfg):
+            rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 1, "the gate passed a config that disables the kill metric")
+        self.assertIn("[FAIL] [metrics] thresholds", report)
 
     def test_a_future_pilot_launch_fails_the_gate(self):
         # Caught here rather than only in metrics.py because of timing: the
@@ -2540,6 +2554,42 @@ class DecisionRuleTests(unittest.TestCase):
              self.assertRaises(SystemExit) as caught:
             metrics.main()
         self.assertIn("TRIAGE_BOT_ACCOUNT_ID", str(caught.exception))
+
+    def test_a_removal_rate_in_the_wrong_unit_disables_the_kill_metric(self):
+        """The threshold that can stop the pilot, silently switched off.
+
+        [metrics] sets sorted_within_24h_pct = 95 (out of 100) and, on the very
+        next line, max_label_removal_rate = 0.10 (out of 1). Writing 10 in the
+        second field, meaning "10%", is the natural mistake. The comparison is
+        `removal_rate <= threshold` and every rate is <= 10, so the kill metric
+        can never fail again.
+
+        Measured on a cohort with 26% of its labels removed - nearly triple the
+        real threshold - the verdict flips from STOP to ADOPT. Nothing in the
+        report looks wrong; it prints the threshold it was handed.
+        """
+        good = {"sorted_within_24h_pct": 95, "max_label_removal_rate": 0.10,
+                "min_intro_outcomes": 5}
+        self.assertEqual(decide(100.0, 0.26, 5, good), "STOP")
+        self.assertEqual(decide(100.0, 0.26, 5, dict(good, max_label_removal_rate=10)),
+                         "ADOPT", "if this is no longer ADOPT the guard below is moot")
+        self.assertIn("disables the kill metric",
+                      " ".join(validate_thresholds(dict(good, max_label_removal_rate=10))))
+
+    def test_an_sla_percentage_written_as_a_fraction_is_caught(self):
+        # The mirror error, and the safe direction - 0.95 makes the SLA
+        # trivially pass rather than trivially fail - but a pre-registered
+        # threshold that always passes is not a threshold.
+        good = {"sorted_within_24h_pct": 95, "max_label_removal_rate": 0.10,
+                "min_intro_outcomes": 5}
+        self.assertEqual(validate_thresholds(good), [])
+        self.assertIn("percentage out of 100",
+                      " ".join(validate_thresholds(dict(good, sorted_within_24h_pct=0.95))))
+        self.assertIn("whole number",
+                      " ".join(validate_thresholds(dict(good, min_intro_outcomes=2.5))))
+
+    def test_the_shipped_config_passes_its_own_threshold_check(self):
+        self.assertEqual(validate_thresholds(load_config()["metrics"]), [])
 
     def test_a_label_predating_the_launch_is_refused_not_measured(self):
         # The bug, precisely stated. sla_met starts from max(created, launch),

@@ -278,18 +278,28 @@ def check_pilot_launch(cfg: dict) -> bool:
     run for weeks without it - but a value that is set and impossible fails,
     the same split as the Anthropic credential above.
     """
+    from .metrics import validate_thresholds
+
+    # The thresholds are pre-registered, set once, and never re-read with fresh
+    # eyes - and a unit error in them changes the verdict rather than the
+    # numbers. Checked at the gate because metrics.py first reads them a week
+    # into the pilot, when the sweeps they judge have already happened.
+    errors = validate_thresholds(cfg["metrics"])
+    ok = check("[metrics] thresholds are in their documented units",
+               not errors, "; ".join(errors)[:200])
+
     value = cfg["metrics"].get("pilot_launch")
     if not value:
         print("       [metrics].pilot_launch: unset - set it at launch; "
               "`python -m triage.metrics` needs it to anchor the 24h SLA")
-        return True
+        return ok
     try:
         from .metrics import parse_launch
 
         parse_launch(value)
     except SystemExit as e:
-        return check("[metrics].pilot_launch is a date in the past", False, str(e)[:200])
-    return check("[metrics].pilot_launch is a date in the past", True, value)
+        return ok & check("[metrics].pilot_launch is a plausible date", False, str(e)[:200])
+    return ok & check("[metrics].pilot_launch is a plausible date", True, value)
 
 
 def check_anthropic(cfg: dict) -> bool:

@@ -101,6 +101,44 @@ def sla_met(created: str, labeled_at: str, launch: datetime.datetime) -> bool:
     return labeled - start <= datetime.timedelta(hours=24)
 
 
+def validate_thresholds(m: dict) -> list[str]:
+    """Unit errors in the pre-registered thresholds; empty if they are sane.
+
+    [metrics] puts a percentage and a fraction next to each other:
+
+        sorted_within_24h_pct  = 95      # out of 100
+        max_label_removal_rate = 0.10    # out of 1
+
+    so writing 10 in the second field, meaning "10%", is the natural mistake -
+    and it silently disables the kill metric. Measured: a cohort with 26% of
+    its labels removed, which is nearly triple the real threshold, decides
+    ADOPT instead of STOP. The removal rate is the one metric that can stop the
+    pilot, the comparison is `<=`, and every rate is <= 10, so it can never
+    fail again. Nothing in the report looks wrong; it prints the threshold it
+    was given.
+
+    These are pre-registered and set once, so they are never re-read with fresh
+    eyes after launch. That is exactly the kind of value worth range-checking
+    rather than trusting.
+    """
+    errors = []
+    pct = m.get("sorted_within_24h_pct")
+    if not isinstance(pct, (int, float)) or isinstance(pct, bool) or not 1 < pct <= 100:
+        errors.append(f"sorted_within_24h_pct is {pct!r}; it is a percentage out of 100 "
+                      "(95 means 95%), so a value at or below 1 is a fraction in the "
+                      "wrong field")
+    rate = m.get("max_label_removal_rate")
+    if not isinstance(rate, (int, float)) or isinstance(rate, bool) or not 0 < rate <= 1:
+        errors.append(f"max_label_removal_rate is {rate!r}; it is a fraction of 1 "
+                      "(0.10 means 10%), so a value above 1 disables the kill metric "
+                      "entirely - every removal rate would pass")
+    intro = m.get("min_intro_outcomes")
+    if not isinstance(intro, int) or isinstance(intro, bool) or intro < 0:
+        errors.append(f"min_intro_outcomes is {intro!r}; it counts tickets, so it must "
+                      "be a non-negative whole number")
+    return errors
+
+
 def decide(pct24: float, removal_rate: float, intro: int, m: dict) -> str:
     """The pre-registered decision rule. Committed before launch; never tuned after."""
     passes = [
@@ -124,6 +162,11 @@ def main() -> int:
     if not bot_id:
         sys.exit("TRIAGE_BOT_ACCOUNT_ID is required to attribute the bot's label changes")
     m = cfg["metrics"]
+    # Before anything is counted: a threshold in the wrong unit does not make
+    # the numbers wrong, it makes the verdict wrong, which is harder to notice.
+    threshold_errors = validate_thresholds(m)
+    if threshold_errors:
+        sys.exit("[metrics] thresholds are not usable:\n  " + "\n  ".join(threshold_errors))
     launch = parse_launch(m.get("pilot_launch"))
     ai_labels = ai_label_names(cfg)
 
