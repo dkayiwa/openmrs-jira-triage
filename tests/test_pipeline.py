@@ -99,7 +99,12 @@ class StubSession:
 
     def get(self, url, params=None, timeout=None):
         assert timeout is not None, "every network call must carry a timeout"
-        self.calls.append({"url": url, **(params or {})})
+        self.calls.append({"method": "GET", "url": url, **(params or {})})
+        return self.pages.pop(0)
+
+    def delete(self, url, timeout=None):
+        assert timeout is not None, "every network call must carry a timeout"
+        self.calls.append({"method": "DELETE", "url": url})
         return self.pages.pop(0)
 
 
@@ -221,6 +226,94 @@ class StateTests(unittest.TestCase):
     def test_human_add_does_not_set_bot_label_time(self):
         st = inspect(issue(histories=[label_change("u1", "", AI[0])]), AI, "bot")
         self.assertIsNone(st.bot_first_labeled_at)
+
+
+class WorkflowInvariantTests(unittest.TestCase):
+    """The file that decides whether a run writes to public tickets.
+
+    It had no coverage at all. An edit here cannot be caught by any other test:
+    nothing else determines when --live is passed, whether the suite gates the
+    sweep, or whether a dispatch input reaches a shell.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import yaml
+
+        path = Path(__file__).resolve().parent.parent / ".github/workflows/triage.yml"
+        cls.text = path.read_text()
+        cls.doc = yaml.safe_load(cls.text)
+        cls.job = cls.doc["jobs"]["triage"]
+        cls.steps = cls.job["steps"]
+        cls.sweep = next(s for s in cls.steps if "triage.run" in str(s.get("run", "")))
+
+    def test_the_token_is_read_only(self):
+        # The bot authenticates to Jira with its own secret; the workflow token
+        # needs nothing but checkout.
+        self.assertEqual(self.doc["permissions"], {"contents": "read"})
+
+    def test_dispatch_input_never_reaches_a_shell(self):
+        # A workflow_dispatch input is arbitrary text. Interpolating it into a
+        # run: line executes it; it must arrive as an environment variable.
+        self.assertNotIn("${{ inputs.", self.sweep["run"],
+                         "a dispatch input is interpolated into the shell line")
+        self.assertIn("$LIMIT", self.sweep["run"])
+        self.assertIn("LIMIT", self.sweep["env"])
+
+    def test_live_is_only_reachable_deliberately(self):
+        # --live must appear exactly once, guarded by the schedule or an explicit
+        # mode choice. Anything else risks unintended writes to public tickets.
+        run_line = self.sweep["run"]
+        self.assertEqual(run_line.count("--live"), 1)
+        guard = run_line.split("--live")[0]
+        self.assertIn("github.event_name == 'schedule'", guard)
+        self.assertIn("inputs.mode == 'live'", guard)
+
+    def test_a_scheduled_run_is_live_if_the_schedule_is_ever_enabled(self):
+        # The schedule block is commented out until the eval gate passes; when it
+        # is enabled, scheduled runs must already be the live path.
+        if "schedule" in (self.doc.get(True) or self.doc.get("on") or {}):
+            self.assertIn("github.event_name == 'schedule'", self.sweep["run"])
+        self.assertIn("cron", self.text, "the schedule block should remain documented")
+
+    def test_the_suite_gates_the_sweep(self):
+        # If the tests ran after the sweep, or not at all, every guard in this
+        # file would be advisory.
+        indexes = {"tests": None, "sweep": None}
+        for i, step in enumerate(self.steps):
+            run_line = str(step.get("run", ""))
+            if "unittest" in run_line:
+                indexes["tests"] = i
+            if "triage.run" in run_line:
+                indexes["sweep"] = i
+        self.assertIsNotNone(indexes["tests"], "no step runs the test suite")
+        self.assertLess(indexes["tests"], indexes["sweep"],
+                        "the suite must run before the sweep")
+
+    def test_artifacts_survive_a_failed_run(self):
+        # A failed sweep is exactly when the journal is needed, and the run now
+        # exits non-zero whenever any ticket errored.
+        upload = next(s for s in self.steps if "upload-artifact" in str(s.get("uses", "")))
+        self.assertEqual(upload.get("if"), "always()")
+        self.assertIn("out/", str(upload["with"]["path"]))
+
+    def test_sweeps_cannot_overlap(self):
+        # Two concurrent sweeps could both read a ticket before either labelled
+        # it, and each would post a comment to every watcher.
+        self.assertIn("group", self.doc["concurrency"])
+        self.assertIs(self.doc["concurrency"].get("cancel-in-progress"), False)
+
+    def test_no_secret_is_interpolated_into_a_shell_line(self):
+        for step in self.steps:
+            self.assertNotIn("secrets.", str(step.get("run", "")),
+                             f"secret interpolated into a run: line: {step}")
+
+    def test_every_credential_the_pipeline_reads_is_supplied(self):
+        # A missing secret degrades silently: the sweep would run anonymously and
+        # skip every ticket, or fail every ticket, on a schedule.
+        for name in ("JIRA_EMAIL", "JIRA_API_TOKEN", "TRIAGE_BOT_ACCOUNT_ID",
+                     "ANTHROPIC_API_KEY"):
+            self.assertIn(name, self.sweep["env"], f"{name} is not passed to the sweep")
 
 
 class PreflightTests(unittest.TestCase):
@@ -628,6 +721,48 @@ class PropertyTests(unittest.TestCase):
         # Swallowing this would silently reclassify every ticket on every run.
         with self.assertRaises(JiraError):
             stub_client([StubResponse({}, 500)]).get_property("O3-1", "ai-triage")
+
+
+class CleanupCallTests(unittest.TestCase):
+    """The two delete methods preflight uses to tidy up after its probes.
+
+    Only ever exercised through a stub before, so nothing checked that they hit
+    the right verb, path or timeout - and a preflight probe that cannot clean up
+    leaves state on a real ticket.
+    """
+
+    def test_delete_comment_targets_the_comment_endpoint(self):
+        client = stub_client([StubResponse({}, 204)])
+        client.delete_comment("O3-1", "10001")
+        call = client.session.calls[0]
+        self.assertEqual(call["method"], "DELETE")
+        self.assertTrue(call["url"].endswith("/rest/api/2/issue/O3-1/comment/10001"), call)
+
+    def test_delete_property_targets_the_property_endpoint(self):
+        client = stub_client([StubResponse({}, 204)])
+        client.delete_property("O3-1", "ai-triage-preflight")
+        call = client.session.calls[0]
+        self.assertEqual(call["method"], "DELETE")
+        self.assertTrue(
+            call["url"].endswith("/rest/api/2/issue/O3-1/properties/ai-triage-preflight"),
+            call)
+
+    def test_an_empty_204_body_is_not_a_parse_error(self):
+        # A successful DELETE returns no body; treating that as JSON would turn
+        # a clean cleanup into a spurious failure.
+        for client, call in (
+            (stub_client([StubResponse(None, 204)]), lambda c: c.delete_comment("O3-1", "1")),
+            (stub_client([StubResponse(None, 204)]), lambda c: c.delete_property("O3-1", "p")),
+        ):
+            client.session.pages[0].text = ""
+            call(client)
+
+    def test_a_refused_delete_raises(self):
+        for method in (lambda c: c.delete_comment("O3-1", "1"),
+                       lambda c: c.delete_property("O3-1", "p")):
+            client = stub_client([StubResponse({}, 403)])
+            with self.assertRaises(JiraError):
+                method(client)
 
 
 class BotIdentityTests(unittest.TestCase):
