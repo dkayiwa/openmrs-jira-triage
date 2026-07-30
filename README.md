@@ -345,21 +345,36 @@ phase, every human label-removal gets added here as a new case.
 .venv/bin/python -m triage.preflight                  # the go-live gate, read-only
 ```
 
-Both are offline except preflight, and CI runs both before any sweep. Two more
-cost real API calls and are deliberately not in the suite:
+Both are offline except preflight, and CI runs both before any sweep. One more
+is offline but slow enough to keep out of the suite, and two cost real API
+calls:
 
 ```bash
+.venv/bin/python -m evals.fuzz_sanitisers             # offline; after touching wiki_safe
 .venv/bin/python -m evals.run_evals                   # the graded gate (needs cases)
 .venv/bin/python -m evals.injection_eval              # run before a prompt change
 ```
 
 **What is already verified, so you neither redo it nor assume it is missing.**
-Every module is mutation-tested; branch coverage is 96% and what remains is
-inert (`sys.exit(main())`, one-line delegations). The sanitisers are fuzzed
-against their stated invariants, the HTML report is checked by parsing it
-rather than by reading it for escapes, the opt-out guarantee is exercised
-across sweeps rather than against a fixture, and `injection_eval.py` tests the
-threat model `triage/classifier.py` asserts in its docstring.
+Every module is mutation-tested and branch coverage is 96%. The sanitisers are
+fuzzed against their stated invariants by the script above, the HTML report is
+checked by parsing it rather than by reading it for escapes, the opt-out
+guarantee is exercised across sweeps rather than against a fixture, and
+`injection_eval.py` tests the threat model `triage/classifier.py` asserts in
+its docstring.
+
+What the remaining 3% is, exactly: `sys.exit(main())`; one-line delegations to
+`_check(_get(...))`; a session auth assignment; `continue`/`pass` inside
+exception handlers; one `WARN` print. The rest is `preflight.py`'s `--scratch`
+write probes, which cannot run without bot Jira credentials - the same blocker
+as the go-live checklist's step 4, and the only genuinely untested behaviour
+left in the pipeline.
+
+This sentence was wrong when first written. It called the remainder inert
+while `sys.exit(mismatch)` sat inside it - the line that aborts a live run
+when `TRIAGE_BOT_ACCOUNT_ID` does not match the credentials, which is the
+guard against the entire cohort reading as opted out, and it had never
+executed. Check a claim like this against `coverage report -m`, not memory.
 
 **Reaching for a tool, cheapest and most mechanical first.** Coverage before
 mutation: coverage grades what no test *reaches*, mutation only grades the

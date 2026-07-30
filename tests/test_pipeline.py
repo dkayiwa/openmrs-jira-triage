@@ -2415,6 +2415,35 @@ class DecisionRuleTests(unittest.TestCase):
         self.assertTrue(sla_met(created, "2026-08-11T08:00:00.000+0000", self.LAUNCH))
         self.assertFalse(sla_met(created, "2026-08-12T09:00:00.000+0000", self.LAUNCH))
 
+    def test_an_unlabelled_cohort_says_so_instead_of_reporting_zeroes(self):
+        # The pilot's state right now: nothing has ever been labelled. This is
+        # the first thing metrics.py will do on the first weekly run, and it
+        # had never executed - a metrics run that printed 0% and STOP against
+        # an untouched cohort would read as the kill metric firing.
+        cfg = load_config()
+        cfg["metrics"] = dict(cfg["metrics"], pilot_launch="2026-08-01")
+        jira = MetricsJira({"O3-1": issue()}, (), {})
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(metrics, "load_config", lambda: cfg), \
+             mock.patch.object(metrics, "jira_from_env", lambda c: jira), \
+             contextlib.redirect_stdout(io.StringIO()) as out, \
+             self.assertRaises(SystemExit) as caught:
+            metrics.main()
+        self.assertIn("no bot-labeled tickets", str(caught.exception))
+        self.assertNotIn("DECISION", out.getvalue(), "no verdict from an empty cohort")
+
+    def test_metrics_refuses_to_run_without_a_bot_id_to_attribute_with(self):
+        # Without it every label change is unattributable, so the removal rate
+        # and the violation list would both be guesses presented as measurements.
+        cfg = load_config()
+        cfg["metrics"] = dict(cfg["metrics"], pilot_launch="2026-08-01")
+        with mock.patch.dict(os.environ, {}, clear=True), \
+             mock.patch.object(metrics, "load_config", lambda: cfg), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             self.assertRaises(SystemExit) as caught:
+            metrics.main()
+        self.assertIn("TRIAGE_BOT_ACCOUNT_ID", str(caught.exception))
+
     def test_exactly_24h_counts_as_within_24h(self):
         # "within 24h" is pre-registered, and pre-registration is worth only as
         # much as the fixity of the definition behind it. Nothing pinned which
@@ -3794,6 +3823,59 @@ class LiveRunTests(unittest.TestCase):
                                 "skip-opted-out"},
                          f"the enumeration missed an outcome; reached {sorted(seen)}")
 
+    def test_a_bot_id_that_is_not_these_credentials_aborts_a_live_run(self):
+        # The guard against the failure a whole cycle was spent reasoning
+        # about: a wrong TRIAGE_BOT_ACCOUNT_ID makes the bot's own label flips
+        # read as maintainer opt-outs, permanently excluding the cohort while
+        # the removal metric reports a kill. bot_identity_error computes the
+        # mismatch and is well tested; the line that ACTS on it had never run.
+        class OtherAccount(RecordingJira):
+            def myself(self):
+                return {"accountId": "someone-else", "displayName": "Not The Bot"}
+
+        jira = OtherAccount({"O3-1": issue()})
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: StubClassifier(c)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit) as caught:
+                run.main(["--live", "--keys", "O3-1"], out=Path(d))
+        self.assertIn("someone-else", str(caught.exception))
+        self.assertEqual(jira.writes, [], "it must abort before writing anything")
+
+    def test_a_mismatch_only_warns_when_the_run_cannot_write(self):
+        # A dry run cannot mislabel anything, so the same mismatch must not be
+        # fatal there - otherwise a wrong id blocks the gather step that needs
+        # no bot identity at all.
+        class OtherAccount(RecordingJira):
+            def myself(self):
+                return {"accountId": "someone-else", "displayName": "Not The Bot"}
+
+        with tempfile.TemporaryDirectory() as d:
+            err = io.StringIO()
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env",
+                                   lambda cfg: OtherAccount({"O3-1": issue()})), \
+                 mock.patch.object(run, "Classifier", lambda *a: StubClassifier(None)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(err):
+                rc = run.main(["--no-classify", "--keys", "O3-1"], out=Path(d))
+        self.assertEqual(rc, 0)
+        self.assertIn("someone-else", err.getvalue())
+
+    def test_a_manual_label_add_is_recorded_on_the_ticket_row(self):
+        # The convention violation reaches the weekly digest through this
+        # journal field, and nothing had ever written it.
+        hist = [label_change("u2", "", AI[0], display="A Maintainer")]
+        jira = RecordingJira({"O3-1": issue(histories=hist)})
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        with tempfile.TemporaryDirectory() as d:
+            _, rows = self._sweep(jira, c, ["--live", "--keys", "O3-1"], Path(d))
+        self.assertEqual(rows[-1]["convention_violation_adds"], ["A Maintainer"])
+
     def test_live_without_credentials_refuses_to_start(self):
         # The guard against a --live run that would sweep anonymously: it cannot
         # write, so every ticket fails, but it would fail them five at a time on
@@ -4885,6 +4967,36 @@ class ValidateClassificationTests(unittest.TestCase):
     def test_unexpected_field_is_reported(self):
         self.assertTrue(any("unexpected field" in e for e in
                             validate_classification(dict(GOOD, sneaky="x"))))
+
+    def test_a_classifications_entry_that_is_not_an_object_is_refused(self):
+        # Reached before validate_classification, which would otherwise be
+        # handed a string and raise something opaque while the file is being
+        # read to decide what to write to public tickets.
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            path.write_text(json.dumps({"prompt_version": PROMPT_VERSION,
+                                        "classifications": {"O3-1": "just a string"}}))
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, PROMPT_VERSION)
+        self.assertIn("must be an object", str(caught.exception))
+
+    def test_a_non_string_where_a_string_belongs_is_reported(self):
+        # The file path's type check. Uncovered until now, which mattered
+        # because clamp_classification deliberately leaves types alone - it
+        # bounds magnitudes - so this branch is the only thing standing
+        # between a number in the rationale field and a public comment.
+        self.assertIn("rationale must be a string",
+                      validate_classification(dict(GOOD, rationale=7)))
+        self.assertIn("label must be a string",
+                      validate_classification(dict(GOOD, label=None)))
+
+    def test_a_blank_rationale_is_reported_on_the_file_path(self):
+        # The API path substitutes a marker rather than rejecting, for cost
+        # reasons; the file path rejects, because its author can fix it. Only
+        # the substitution had a test.
+        self.assertIn("rationale is empty",
+                      validate_classification(dict(GOOD, rationale="   \t ")))
 
     def test_confidence_outside_zero_to_one_is_reported(self):
         # The prompt asks for an honest 0-1 estimate; nothing in the schema can
