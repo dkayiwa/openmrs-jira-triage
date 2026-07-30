@@ -245,16 +245,26 @@ phase, every human label-removal gets added here as a new case.
    warning (needs a property only a write can create) and the failed-read
    NO DECISION path. Both parse data this pipeline writes itself rather than
    anything Jira's shape can surprise us with.
-8. **Process note for maintainers:** removing an `ai-triage-*` label opts the
-   ticket out permanently - including after promoting a ticket to `intro`.
-   Leave the ai-triage label in place; the intro metric counts tickets holding
-   both labels.
+8. **Tell the maintainers first**, using `docs/maintainer-announcement.md`
+   (fill in the bracketed placeholders). Three asks, and none of them are
+   optional: removing an `ai-triage-*` label opts the ticket out permanently, so
+   it must not be done as housekeeping - including after promoting a ticket to
+   `intro`, since the intro metric counts tickets holding both labels. Keys go in
+   PR titles, or the open-PR backstop cannot see the PR. And `intro`/`not-intro`
+   have to be applied to triaged tickets, or the third pre-registered threshold
+   stays at zero and ADOPT is unreachable however good the triage is.
+
+   Post it **after** the charset test in step 4: the announcement names the
+   labels, and a rename after posting means the community is watching for a label
+   that never arrives. The label names in it are pinned to `config.toml` by the
+   test suite, so a rename breaks the build rather than the announcement.
 
 ## Layout
 
 ```
 config.toml           pre-registered pilot config (cohort, labels, thresholds)
 prompt/system.md      the rubric prompt (versioned)
+docs/                 maintainer announcement (label names pinned by the tests)
 triage/run.py         sweep -> skip checks -> assemble -> classify -> write/propose
 triage/context.py     visible-information assembly + content hash
 triage/github.py      open-PR backstop for the Jira dev panel (scope)

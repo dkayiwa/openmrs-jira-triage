@@ -16,6 +16,7 @@ import io
 import itertools
 import json
 import os
+import re
 import sys
 import tempfile
 import time
@@ -374,6 +375,51 @@ class WorkflowInvariantTests(unittest.TestCase):
         # would spend minutes throttling and risk failing tickets on the limit.
         # github.token needs no new repo secret and no extra permission.
         self.assertIn("github.token", self.sweep["env"]["GITHUB_TOKEN"])
+
+
+class AnnouncementTests(unittest.TestCase):
+    """The maintainer announcement, pinned to the config it describes.
+
+    It tells maintainers which labels to expect and that removing one is a
+    permanent opt-out. Renaming a label in config.toml without updating it would
+    leave the community watching for a label the bot never applies - and the
+    label names are still resting on an untested assumption about whether Jira
+    accepts '/', so this is a rename waiting to happen.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        path = Path(__file__).resolve().parent.parent / "docs/maintainer-announcement.md"
+        cls.text = path.read_text()
+        cls.cfg = load_config()
+
+    def test_every_configured_label_is_explained(self):
+        for key in LABEL_KEYS:
+            label = self.cfg["labels"][key]
+            self.assertIn(label, self.text, f"{label} is applied but never explained")
+
+    def test_no_label_is_named_that_the_pipeline_would_not_apply(self):
+        # The `ai-triage-*` glob in prose is not a label and is skipped by this
+        # pattern; anything else is a concrete name that must be real.
+        named = set(re.findall(r"ai-triage-[a-z-]+", self.text))
+        configured = {self.cfg["labels"][k] for k in LABEL_KEYS}
+        self.assertEqual(named - configured, set(),
+                         "the announcement names labels the pipeline never applies")
+
+    def test_the_intro_outcome_labels_match_the_metric(self):
+        # Ask 3 is the only route to one of the three pre-registered thresholds,
+        # so the labels it asks for have to be the ones the metric counts.
+        for key in ("intro_label", "intro_rejected_label"):
+            label = self.cfg["metrics"][key]
+            self.assertIn(f"`{label}`", self.text,
+                          f"{label} is counted by the intro metric but never asked for")
+
+    def test_the_opt_out_convention_is_stated(self):
+        # The kill metric only means something if maintainers know that removing
+        # a label opts the ticket out rather than merely tidying it.
+        lowered = self.text.lower()
+        self.assertIn("opt-out", lowered)
+        self.assertIn("permanent", lowered)
 
 
 class PreflightTests(unittest.TestCase):
