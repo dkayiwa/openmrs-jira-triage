@@ -592,6 +592,26 @@ class DocumentedSurfaceTests(unittest.TestCase):
             self.assertTrue((self.ROOT / path).exists(),
                             f"README tells you to run {target}, which does not exist")
 
+    def test_the_model_comparison_names_the_prompt_it_was_measured_under(self):
+        # run_evals.py enforces this in code - "a result that records only one
+        # of them cannot be reproduced later" - and the checklist paragraph
+        # that guides the pinned-model decision broke it: measured under v2,
+        # committed at 16:43, and prompt v3 landed at 18:15 the same day. The
+        # v3 rewrite moved 7 of 31 tickets and rewrote the needs_judgment
+        # definition, which is the exact label the Haiku finding turns on. A
+        # reader taking those counts as current would pin a model on evidence
+        # for a rubric that no longer exists.
+        section = self.readme[self.readme.index("Haiku is unsuitable") - 1200:]
+        section = section[:2000]
+        self.assertRegex(section, r"measured under prompt v\d",
+                         "the comparison numbers do not say which prompt produced them")
+        current = load_config()["prompt"]["version"]
+        stated = re.search(r"measured under prompt (v\d)", section).group(1)
+        if stated != current:
+            self.assertIn("Re-run", section,
+                          f"numbers are from {stated}, config pins {current}, and "
+                          "nothing tells the reader to re-derive them")
+
     def test_every_config_key_the_code_reads_is_present(self):
         # Direction that matters: a key the code reads but the file lacks is a
         # KeyError mid-sweep. The reverse (an unused key) is only clutter, and

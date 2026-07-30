@@ -270,8 +270,20 @@ phase, every human label-removal gets added here as a new case.
    through the real classifier; that comparison is labelled as not the gate and
    cannot change what the pinned model authorises.
 
-   What a pre-grading comparison found here, so the next person need not
-   re-derive it: **Haiku is unsuitable.** It agreed with Opus on 24/32, and all 8
+   **These numbers were measured under prompt v2, and the pinned prompt is now
+   v3.** Read them as a lead, not as a settled result — the paragraph below
+   originally said the next person need not re-derive it, and that was wrong
+   the moment the rubric changed. `evals/run_evals.py` states the rule this
+   broke, in the code: a result recording a model without its prompt "cannot be
+   reproduced later". The v3 rewrite moved 7 of 31 tickets and specifically
+   rewrote the `needs_judgment` definition — which is the exact label the Haiku
+   finding turns on — so the direction below is plausible under v3 but the
+   counts are not. Re-run `--model` against the graded set once cases exist,
+   and replace this paragraph with the v3 figures and this sentence with the
+   version they came from.
+
+   What that v2 comparison found: **Haiku is unsuitable.** It agreed with Opus
+   on 24/32, and all 8
    of its disagreements moved *toward* `automation_candidate` — six from
    `needs_judgment`, collapsing that label from 7 to 1. That is the harmful
    direction: it tells a contributor a ticket blocked on a clinical or product
