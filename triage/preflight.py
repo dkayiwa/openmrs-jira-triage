@@ -13,6 +13,7 @@ import os
 import sys
 
 from . import context as ctx
+from .github import GitHubClient
 from .jira import JiraError
 from .run import bot_identity_error, jira_from_env, load_config
 from .state import PROPERTY_KEY
@@ -104,6 +105,30 @@ def main(argv=None) -> int:
         if got:
             print(f"       without the clause: {len(fallback)} ticket(s) - the dev-panel "
                   "JQL may need auth or the GitHub-for-Jira app")
+
+    # The dev-panel backstop. Probed with a single search rather than the whole
+    # cohort: unauthenticated search allows 10/min, so sweeping every in-scope
+    # key here would take minutes and teach nothing the sweep will not report.
+    gh_cfg = cfg.get("github") or {}
+    if not gh_cfg.get("check_open_prs", False):
+        print("       open-PR backstop: disabled in config.toml; scope rests on Jira's "
+              "dev panel alone")
+    else:
+        gh = GitHubClient(gh_cfg.get("org", "openmrs"), os.environ.get("GITHUB_TOKEN"))
+        gh_label = "github open-PR backstop"
+        # A key the sweep will actually ask about, so a probe that passes proves
+        # the query the pipeline runs - not a simpler one.
+        probe_key = keys[0] if got and keys else cfg["jira"]["project"] + "-1"
+        probed, urls = attempt(gh_label, lambda: gh.open_pr_urls(probe_key))
+        if probed:
+            auth = "GITHUB_TOKEN" if gh.authenticated else \
+                f"unauthenticated: {gh.min_interval:.0f}s/search, set GITHUB_TOKEN to cut it"
+            ok &= check(gh_label, True, f"org {gh.org}, searched {probe_key} "
+                                        f"({len(urls)} open PR(s)); {auth}")
+        else:
+            ok = False
+            print("       the sweep fails a ticket rather than classifying it when this "
+                  "search fails; pass --no-pr-check to sweep without the backstop")
 
     if args.scratch and jira.authenticated:
         slash_label = "ai-triage/charset-test"

@@ -17,6 +17,7 @@ import json
 import os
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -24,6 +25,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from triage import context as ctx  # noqa: E402
+from triage import github as gh  # noqa: E402
 from triage import metrics, preflight, run  # noqa: E402
 from triage.classifier import (  # noqa: E402
     LABEL_KEYS,
@@ -46,6 +48,57 @@ from triage.run import (  # noqa: E402
 from triage.state import TicketState, inspect  # noqa: E402
 
 AI = ["ai-triage-automation-candidate", "ai-triage-needs-judgment", "ai-triage-needs-more-info"]
+
+
+class StubGitHub:
+    """Offline stand-in for GitHubClient, installed over every entry point.
+
+    The open-PR backstop is enabled in config.toml, so without this every test
+    that calls run.main() or preflight.main() would issue real searches - and
+    the unauthenticated throttle is 6s each, which turned the suite from half a
+    second into hours. State is class-level because the client is constructed
+    inside main(), out of the test's reach.
+    """
+
+    answers: dict = {}
+    searched: list = []
+    error: Exception | None = None
+    built: int = 0
+
+    @classmethod
+    def reset(cls, answers=None, error=None):
+        cls.answers = dict(answers or {})
+        cls.searched = []
+        cls.error = error
+        cls.built = 0
+
+    def __init__(self, org, token=None, **kwargs):
+        self.org = org
+        self.authenticated = bool(token)
+        self.min_interval = 0.0
+        type(self).built += 1
+
+    def open_pr_urls(self, key):
+        type(self).searched.append(key)
+        if type(self).error:
+            raise type(self).error
+        return list(type(self).answers.get(key, []))
+
+
+_GITHUB_PATCHES = []
+
+
+def setUpModule():
+    StubGitHub.reset()
+    for module in (run, preflight):
+        patch = mock.patch.object(module, "GitHubClient", StubGitHub)
+        patch.start()
+        _GITHUB_PATCHES.append(patch)
+
+
+def tearDownModule():
+    while _GITHUB_PATCHES:
+        _GITHUB_PATCHES.pop().stop()
 
 
 def issue(labels=(), histories=(), comments=(), **fields):
@@ -312,8 +365,14 @@ class WorkflowInvariantTests(unittest.TestCase):
         # A missing secret degrades silently: the sweep would run anonymously and
         # skip every ticket, or fail every ticket, on a schedule.
         for name in ("JIRA_EMAIL", "JIRA_API_TOKEN", "TRIAGE_BOT_ACCOUNT_ID",
-                     "ANTHROPIC_API_KEY"):
+                     "ANTHROPIC_API_KEY", "GITHUB_TOKEN"):
             self.assertIn(name, self.sweep["env"], f"{name} is not passed to the sweep")
+
+    def test_the_open_pr_backstop_is_not_left_unauthenticated_on_a_schedule(self):
+        # Unauthenticated search allows 10/min, so a scheduled full-cohort sweep
+        # would spend minutes throttling and risk failing tickets on the limit.
+        # github.token needs no new repo secret and no extra permission.
+        self.assertIn("github.token", self.sweep["env"]["GITHUB_TOKEN"])
 
 
 class PreflightTests(unittest.TestCase):
@@ -391,10 +450,36 @@ class PreflightTests(unittest.TestCase):
             rc = preflight.main(list(argv))
         return rc, out.getvalue()
 
+    def setUp(self):
+        StubGitHub.reset()
+        self.addCleanup(StubGitHub.reset)
+
     def test_a_healthy_instance_passes(self):
         rc, report = self._run(self.Stub())
         self.assertEqual(rc, 0, report)
         self.assertNotIn("[FAIL]", report)
+
+    def test_the_open_pr_backstop_is_probed_with_a_key_the_sweep_will_ask_about(self):
+        # A probe that passes has to prove the query the pipeline actually runs,
+        # so it uses a real in-scope key rather than a simpler synthetic one.
+        rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 0, report)
+        self.assertIn("github open-PR backstop", report)
+        self.assertEqual(StubGitHub.searched, ["O3-1"])
+
+    def test_an_unreachable_github_fails_the_gate_and_names_the_way_out(self):
+        # Going live with a broken backstop means every ticket errors, so this is
+        # a launch blocker, not a warning.
+        StubGitHub.reset(error=gh.GitHubError("search unavailable"))
+        rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] github open-PR backstop", report)
+        self.assertIn("--no-pr-check", report)
+
+    def test_an_unauthenticated_backstop_still_passes_but_says_so(self):
+        rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 0, report)
+        self.assertIn("GITHUB_TOKEN", report)
 
     def test_one_failing_probe_does_not_hide_the_others(self):
         # A diagnostic tool that aborts on the first fault is worse than useless:
@@ -836,6 +921,309 @@ class PlanTicketTests(unittest.TestCase):
         st = TicketState(opted_out=True)
         self.assertEqual(plan_ticket(st, False, False, True, out_of_scope=True),
                          "skip-opted-out")
+
+    def test_ticket_with_an_open_pr_is_skipped(self):
+        self.assertEqual(plan_ticket(TicketState(), False, False, True, has_open_pr=True),
+                         "skip-open-pr")
+
+    def test_force_does_not_override_an_open_pr(self):
+        self.assertEqual(plan_ticket(TicketState(), False, True, True, has_open_pr=True),
+                         "skip-open-pr")
+
+    def test_opt_out_is_reported_ahead_of_an_open_pr(self):
+        st = TicketState(opted_out=True)
+        self.assertEqual(plan_ticket(st, False, False, True, has_open_pr=True),
+                         "skip-opted-out")
+
+    def test_an_open_pr_outranks_already_triaged(self):
+        # Both leave an unchanged ticket alone, but only skip-open-pr keeps it out
+        # of the manifest, so a ticket that gained a PR after being labelled stops
+        # being offered for re-classification on the next prompt bump.
+        st = TicketState(ai_labels_present=[AI[0]])
+        self.assertEqual(plan_ticket(st, True, False, True, has_open_pr=True),
+                         "skip-open-pr")
+
+    def test_an_open_pr_stops_a_context_only_gather(self):
+        # The gather step builds the grading sheet's input, so an in-review ticket
+        # has to drop out there too, not only where writes happen.
+        self.assertEqual(plan_ticket(TicketState(), True, False, False, has_open_pr=True),
+                         "skip-open-pr")
+
+
+class GitHubSession:
+    """Replays queued GitHub search responses and records the queries asked."""
+
+    def __init__(self, pages):
+        self.headers: dict = {}
+        self.pages = list(pages)
+        self.queries: list[str] = []
+
+    def get(self, url, params=None, timeout=None):
+        assert timeout is not None, "every network call must carry a timeout"
+        self.queries.append((params or {}).get("q", ""))
+        return self.pages.pop(0)
+
+
+def gh_response(items, status_code=200, headers=None):
+    resp = StubResponse({"items": list(items)}, status_code)
+    resp.headers = dict(headers or {})
+    resp.text = json.dumps({"items": list(items)})
+    return resp
+
+
+def pr(number=1, title="", body="", url=None):
+    return {"number": number, "title": title, "body": body,
+            "html_url": url or f"https://github.com/openmrs/repo/pull/{number}"}
+
+
+class KeyCitationTests(unittest.TestCase):
+    """Which mentions count as a PR claiming a ticket."""
+
+    def test_a_plain_mention_counts(self):
+        self.assertTrue(gh.names_key("(fix) O3-5816: stop the crash", "O3-5816"))
+
+    def test_case_is_ignored(self):
+        # Jira accepts and normalises a lowercase key, so a title may carry either.
+        self.assertTrue(gh.names_key("fixes o3-5816 finally", "O3-5816"))
+
+    def test_a_longer_key_is_not_a_match(self):
+        # The bug this prevents: searching O3-581 excluding a ticket because some
+        # PR mentions O3-5816.
+        self.assertFalse(gh.names_key("(fix) O3-5816: stop the crash", "O3-581"))
+
+    def test_a_key_with_a_trailing_digit_is_not_a_match(self):
+        self.assertFalse(gh.names_key("about O3-58161 really", "O3-5816"))
+
+    def test_a_key_glued_to_a_word_is_not_a_match(self):
+        self.assertFalse(gh.names_key("branchO3-5816", "O3-5816"))
+
+    def test_punctuation_around_the_key_is_fine(self):
+        for text in ("[O3-5816]", "(O3-5816)", "O3-5816.", "see O3-5816, then"):
+            self.assertTrue(gh.names_key(text, "O3-5816"), text)
+
+    def test_empty_text_is_not_a_match(self):
+        self.assertFalse(gh.names_key("", "O3-5816"))
+        self.assertFalse(gh.names_key(None, "O3-5816"))
+
+
+class GitHubClientTests(unittest.TestCase):
+    """The dev-panel backstop's client, offline."""
+
+    def _client(self, pages, token=None):
+        client = gh.GitHubClient("openmrs", token, sleep=lambda s: self.slept.append(s),
+                                 now=lambda: self.clock)
+        client.session = GitHubSession(pages)
+        return client
+
+    def setUp(self):
+        self.slept: list[float] = []
+        self.clock = 1000.0
+
+    def test_the_query_asks_only_for_open_prs_in_the_org(self):
+        client = self._client([gh_response([])])
+        client.open_pr_urls("O3-5816")
+        self.assertEqual(client.session.queries,
+                         ["org:openmrs is:pr is:open O3-5816"])
+
+    def test_a_pr_naming_the_key_in_its_title_is_returned(self):
+        client = self._client([gh_response([
+            pr(1818, title="(fix) O3-5816: stop the crash",
+               url="https://github.com/openmrs/openmrs-esm-core/pull/1818")])])
+        self.assertEqual(client.open_pr_urls("O3-5816"),
+                         ["https://github.com/openmrs/openmrs-esm-core/pull/1818"])
+
+    def test_a_pr_naming_the_key_only_in_its_body_is_returned(self):
+        client = self._client([gh_response([pr(2, title="Fix login", body="Closes O3-5816")])])
+        self.assertEqual(len(client.open_pr_urls("O3-5816")), 1)
+
+    def test_a_full_text_hit_that_does_not_name_the_key_is_dropped(self):
+        # Search also matches PR *comments*, which is wider than the dev panel's
+        # notion of a link: "unrelated to O3-5816" in a review would otherwise
+        # exclude a ticket nobody is working on.
+        client = self._client([gh_response([pr(3, title="Refactor", body="No keys here")])])
+        self.assertEqual(client.open_pr_urls("O3-5816"), [])
+
+    def test_a_missing_html_url_still_identifies_the_pr(self):
+        client = self._client([gh_response([{"number": 7, "title": "O3-5816 fix"}])])
+        self.assertEqual(client.open_pr_urls("O3-5816"), ["openmrs#7"])
+
+    def test_searches_are_throttled_to_the_unauthenticated_rate(self):
+        client = self._client([gh_response([]), gh_response([])])
+        self.assertEqual(client.min_interval, 6.0)
+        client.open_pr_urls("O3-1")
+        client.open_pr_urls("O3-2")
+        # The clock did not advance between them, so the whole interval is waited.
+        self.assertEqual(self.slept, [6.0])
+
+    def test_a_token_raises_the_rate(self):
+        client = self._client([gh_response([]), gh_response([])], token="t")
+        self.assertEqual(client.min_interval, 2.0)
+        self.assertTrue(client.authenticated)
+
+    def test_a_token_is_sent_as_a_bearer_header(self):
+        # Built without the stub session, which would discard the real headers.
+        client = gh.GitHubClient("openmrs", "t")
+        self.assertEqual(client.session.headers["Authorization"], "Bearer t")
+        self.assertNotIn("Authorization", gh.GitHubClient("openmrs").session.headers)
+
+    def test_time_already_spent_elsewhere_is_not_waited_again(self):
+        client = self._client([gh_response([]), gh_response([])])
+        client.open_pr_urls("O3-1")
+        self.clock += 10.0  # a Jira fetch and a classification happened meanwhile
+        client.open_pr_urls("O3-2")
+        self.assertEqual(self.slept, [])
+
+    def test_a_short_rate_limit_window_is_waited_out_once(self):
+        limited = gh_response([], 403, {"x-ratelimit-remaining": "0",
+                                        "retry-after": "20"})
+        client = self._client([limited, gh_response([pr(1, title="O3-1 fix")])])
+        self.assertEqual(len(client.open_pr_urls("O3-1")), 1)
+        self.assertIn(20.0, self.slept)
+
+    def test_a_long_rate_limit_window_fails_loudly_with_the_way_out(self):
+        # Sleeping through it would silently stall a sweep the pilot expects to
+        # finish inside its 24h SLA.
+        limited = gh_response([], 403, {"x-ratelimit-remaining": "0",
+                                        "retry-after": "900"})
+        client = self._client([limited])
+        with self.assertRaises(gh.GitHubError) as caught:
+            client.open_pr_urls("O3-1")
+        self.assertIn("GITHUB_TOKEN", str(caught.exception))
+        self.assertIn("--no-pr-check", str(caught.exception))
+
+    def test_a_403_that_is_not_a_rate_limit_is_not_waited_out(self):
+        # A bad token must fail now, not after a pointless sleep.
+        denied = gh_response([], 403, {"x-ratelimit-remaining": "42"})
+        client = self._client([denied])
+        with self.assertRaises(gh.GitHubError):
+            client.open_pr_urls("O3-1")
+        self.assertEqual(self.slept, [])
+
+    def test_a_reset_timestamp_is_honoured_when_there_is_no_retry_after(self):
+        limited = gh_response([], 429, {"x-ratelimit-remaining": "0",
+                                        "x-ratelimit-reset": str(int(time.time()) + 30)})
+        client = self._client([limited, gh_response([])])
+        client.open_pr_urls("O3-1")
+        self.assertTrue(any(25 <= s <= 31 for s in self.slept), self.slept)
+
+    def test_a_server_error_is_reported_not_swallowed(self):
+        # Returning "no open PR" on a 500 would re-open the leak silently, on the
+        # tickets most likely to be in review.
+        client = self._client([gh_response([], 500)])
+        with self.assertRaises(gh.GitHubError):
+            client.open_pr_urls("O3-1")
+
+
+class OpenPrBackstopWiringTests(unittest.TestCase):
+    """The backstop inside a real run: what it excludes, and what it costs."""
+
+    def setUp(self):
+        StubGitHub.reset()
+        self.addCleanup(StubGitHub.reset)
+
+    def _run(self, jira, extra_args=(), live=False, out=None):
+        classification = Classification("automation_candidate", "Because.", [], ["check it"],
+                                        0.9, "m")
+        argv = (["--live"] if live else []) + ["--keys", "O3-1", *extra_args]
+        with tempfile.TemporaryDirectory() as d:
+            d = str(out) if out else d
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: StubClassifier(classification)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                rc = run.main(argv, out=Path(d))
+            journal = (Path(d) / "journal.jsonl").read_text().splitlines()
+        return rc, json.loads(journal[-1])
+
+    def test_the_config_enables_the_backstop(self):
+        # The whole fix is inert if this is off, and every test below would pass
+        # for the wrong reason.
+        self.assertTrue(load_config()["github"]["check_open_prs"])
+
+    def test_a_ticket_with_an_open_pr_is_not_classified(self):
+        StubGitHub.reset({"O3-1": ["https://github.com/openmrs/repo/pull/9"]})
+        jira = RecordingJira({"O3-1": issue()})
+        rc, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "skip-open-pr")
+        self.assertEqual(jira.writes, [], "labelled a ticket that is already in review")
+        self.assertEqual(rc, 0, "an in-review ticket is a routine skip, not a fault")
+
+    def test_the_excluded_ticket_records_the_evidence(self):
+        # This is the one skip whose evidence lives outside Jira, so the journal
+        # has to carry it or the exclusion is unauditable.
+        StubGitHub.reset({"O3-1": ["https://github.com/openmrs/repo/pull/9"]})
+        _, row = self._run(RecordingJira({"O3-1": issue()}))
+        self.assertEqual(row["open_prs"], ["https://github.com/openmrs/repo/pull/9"])
+
+    def test_an_excluded_ticket_stays_out_of_the_manifest(self):
+        StubGitHub.reset({"O3-1": ["https://github.com/openmrs/repo/pull/9"]})
+        jira = RecordingJira({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            self._run(jira, extra_args=["--no-classify"], out=Path(d))
+            manifest = Path(d) / "manifest.json"
+            # No manifest at all is also a pass: the gather found nothing to
+            # classify, which is the point.
+            tickets = json.loads(manifest.read_text())["tickets"] if manifest.exists() else {}
+        self.assertNotIn("O3-1", tickets)
+
+    def test_a_ticket_with_no_open_pr_is_classified_as_before(self):
+        StubGitHub.reset({})
+        jira = RecordingJira({"O3-1": issue()})
+        _, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "labeled")
+        self.assertEqual(StubGitHub.searched, ["O3-1"])
+
+    def test_no_pr_check_skips_the_lookup_entirely(self):
+        StubGitHub.reset({"O3-1": ["https://github.com/openmrs/repo/pull/9"]})
+        jira = RecordingJira({"O3-1": issue()})
+        _, row = self._run(jira, extra_args=["--no-pr-check"])
+        self.assertEqual(StubGitHub.searched, [], "searched despite --no-pr-check")
+        self.assertEqual(StubGitHub.built, 0, "built a client despite --no-pr-check")
+        self.assertEqual(row["action"], "proposed")
+
+    def test_a_github_failure_fails_the_ticket_rather_than_labelling_it(self):
+        # Fail-open would re-open the leak exactly when GitHub is unreachable,
+        # and a wrong label costs a permanent opt-out. The errored ticket writes
+        # no property, so the next sweep retries it.
+        StubGitHub.reset(error=gh.GitHubError("rate limited"))
+        jira = RecordingJira({"O3-1": issue()})
+        rc, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "error")
+        self.assertIn("rate limited", row["error"])
+        self.assertEqual(jira.writes, [])
+        self.assertEqual(rc, 1, "a sweep that classified nothing must exit non-zero")
+
+    def test_an_opted_out_ticket_costs_no_search(self):
+        # The searches are rate-limited, and no answer could change the outcome.
+        StubGitHub.reset({"O3-1": ["https://github.com/openmrs/repo/pull/9"]})
+        jira = RecordingJira({"O3-1": issue(histories=[label_change("u1", AI[2], "")])})
+        _, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "skip-opted-out")
+        self.assertEqual(StubGitHub.searched, [])
+
+    def test_an_out_of_scope_ticket_costs_no_search(self):
+        StubGitHub.reset({"O3-1": ["https://github.com/openmrs/repo/pull/9"]})
+        jira = RecordingJira({"O3-1": issue(status={"name": "In Progress"})})
+        _, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "skip-out-of-scope")
+        self.assertEqual(StubGitHub.searched, [])
+
+    def test_the_run_says_whether_the_backstop_was_on(self):
+        # A sweep whose scope is wider than the pilot documented must say so in
+        # its own log, not only in whatever flags the operator remembered.
+        for args, expected in ((), "open-PR backstop: on"), (("--no-pr-check",), "backstop: OFF"):
+            StubGitHub.reset()
+            buf = io.StringIO()
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env",
+                                   lambda cfg: RecordingJira({"O3-1": issue()})), \
+                 mock.patch.object(run, "Classifier", lambda *a: StubClassifier(
+                     Classification("needs_judgment", "x", [], [], 0.5, "m"))), \
+                 tempfile.TemporaryDirectory() as d, \
+                 contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                run.main(["--keys", "O3-1", *args], out=Path(d))
+            self.assertIn(expected, buf.getvalue())
 
 
 class DecisionRuleTests(unittest.TestCase):
@@ -2009,6 +2397,12 @@ class DecisionChainInvariantTests(unittest.TestCase):
                          r"!https://attacker.example/b.png! <img src=x> \\ \\ done")
     HOSTILE_ITEM = r"ping \[~accountid:712020:def] <b>now</b>"
 
+    def setUp(self):
+        # Every case sets its own open-PR answer; starting from a clean slate
+        # keeps a leaked one from silently turning a case into a skip.
+        StubGitHub.reset()
+        self.addCleanup(StubGitHub.reset)
+
     def _issue(self, labels, status, opted_out):
         histories = [label_change("u1", AI[2], "")] if opted_out else []
         iss = issue(labels=list(labels), histories=histories, status={"name": status})
@@ -2048,14 +2442,19 @@ class DecisionChainInvariantTests(unittest.TestCase):
         cfg = load_config()
         scope_status = cfg["jira"]["scope_status"]
         checked = 0
+        self.addCleanup(StubGitHub.reset)
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
-            for labels, prop_kind, status, opted_out, force, decided_label in itertools.product(
+            for (labels, prop_kind, status, opted_out, force, decided_label,
+                 open_pr) in itertools.product(
                     self.LABELS, self.PROPERTIES, self.STATUSES, (False, True),
-                    (False, True), ("needs_more_info", "automation_candidate")):
+                    (False, True), ("needs_more_info", "automation_candidate"),
+                    (False, True)):
                 decided = Classification(decided_label, self.HOSTILE_RATIONALE,
                                          [self.HOSTILE_ITEM], [], 0.9, "m")
                 label_name = cfg["labels"][decided_label]
+                StubGitHub.reset({"O3-1": ["https://github.com/openmrs/r/pull/1"]}
+                                 if open_pr else {})
                 jira = RecordingJira({"O3-1": self._issue(labels, status, opted_out)})
                 text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
                 stored = self._property_for(prop_kind, ctx.content_hash(text), label_name)
@@ -2064,7 +2463,8 @@ class DecisionChainInvariantTests(unittest.TestCase):
                 rc = self._run_once(jira, out, decided, live=True, force=force)
                 writes = jira.writes
                 state = (f"labels={labels} prop={prop_kind} status={status} "
-                         f"opted_out={opted_out} force={force} decided={decided_label}")
+                         f"opted_out={opted_out} force={force} decided={decided_label} "
+                         f"open_pr={open_pr}")
                 checked += 1
 
                 # 1. An opt-out is permanent and unconditional.
@@ -2074,6 +2474,11 @@ class DecisionChainInvariantTests(unittest.TestCase):
                 # 2. A ticket outside scope is never written to in live mode.
                 if status != scope_status:
                     self.assertEqual(writes, [], f"wrote out of scope: {state}")
+                    continue
+                # 2b. Nor is one that is already in review. Labelling it invites
+                #     the removal the pilot counts as a permanent opt-out.
+                if open_pr:
+                    self.assertEqual(writes, [], f"wrote to a ticket with an open PR: {state}")
                     continue
                 # 3. At most one comment per run, and a comment only ever
                 #    accompanies a label that is new to the ticket.

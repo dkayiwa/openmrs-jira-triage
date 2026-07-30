@@ -31,6 +31,17 @@ cohort_jql = 'project = O3 AND issuetype != Epic AND created >= "{since}"'
 # Auto-discovered when empty; pin to e.g. "customfield_10816" to skip discovery.
 acceptance_criteria_field = ""
 
+[github]
+# The dev-panel backstop (see triage/github.py). scope_jql already excludes
+# tickets whose Jira dev panel lists a PR, but that panel only sees what the
+# GitHub-for-Jira app indexed: on the launch cohort O3-5816 reached the sweep
+# while openmrs-esm-core#1818 ("(fix) O3-5816: ...") was open. Labelling a
+# ticket that is already in review invites the removal that the pilot counts as
+# a permanent opt-out, so the sweep asks GitHub directly for an open PR naming
+# the key. Set check_open_prs = false to sweep on Jira's word alone.
+org = "openmrs"
+check_open_prs = true
+
 [labels]
 # NOTE: names differ from the design doc's ai-triage/* form because Jira Cloud
 # rejects '/' in labels (preflight has a charset test). One label per ticket.

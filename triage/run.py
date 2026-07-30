@@ -27,6 +27,7 @@ from .classifier import (
     Classifier,
     validate_classification,
 )
+from .github import GitHubClient
 from .jira import JiraClient
 from .state import PROPERTY_KEY, TicketState, inspect
 
@@ -244,17 +245,25 @@ def bot_identity_error(jira: JiraClient, bot_id: str | None) -> str | None:
 
 
 def plan_ticket(st: TicketState, unchanged: bool, force: bool, can_classify: bool,
-                out_of_scope: bool = False) -> str | None:
+                out_of_scope: bool = False, has_open_pr: bool = False) -> str | None:
     """The skip action for this ticket, or None to classify it.
 
-    Opt-out and out-of-scope are tested first and unconditionally: --force is
-    about reclassifying already-triaged tickets, never about re-labelling one a
-    human opted out of, or one that has left the pilot's scope.
+    Opt-out, out-of-scope and open-PR are tested first and unconditionally:
+    --force is about reclassifying already-triaged tickets, never about
+    re-labelling one a human opted out of, or one that is not the pilot's to
+    sort - because it has left scope, or because it is already in review.
+
+    An open PR outranks "already-triaged" on purpose. Both would leave an
+    unchanged ticket alone, but only this one keeps it out of the manifest, so a
+    ticket that gained a PR after being labelled stops being offered for
+    re-classification on the next prompt bump.
     """
     if st.opted_out:
         return "skip-opted-out"
     if out_of_scope:
         return "skip-out-of-scope"
+    if has_open_pr:
+        return "skip-open-pr"
     if st.ai_labels_present and unchanged and not force:
         return "skip-already-triaged"
     if not can_classify:
@@ -393,6 +402,9 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                          "(no Anthropic credential needed; see README)")
     ap.add_argument("--force", action="store_true",
                     help="reclassify already-triaged tickets (opt-outs are still respected)")
+    ap.add_argument("--no-pr-check", action="store_true",
+                    help="skip the GitHub open-PR backstop (offline runs; re-opens the "
+                         "dev-panel gap documented in triage/github.py)")
     args = ap.parse_args(argv)
 
     cfg = load_config()
@@ -430,6 +442,20 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
         print("WARN: TRIAGE_BOT_ACCOUNT_ID unset; the bot's own comments will not be "
               "filtered out of contexts and every ai-triage removal counts as an opt-out",
               file=sys.stderr)
+
+    # The dev-panel backstop. Off by config or by flag, and reported either way:
+    # a sweep whose scope is wider than the pilot documented must say so in its
+    # own log, not only in whatever the operator remembered to pass.
+    gh_cfg = cfg.get("github") or {}
+    github = None
+    if gh_cfg.get("check_open_prs", False) and not args.no_pr_check:
+        github = GitHubClient(gh_cfg.get("org", "openmrs"), os.environ.get("GITHUB_TOKEN"))
+        auth = ("GITHUB_TOKEN" if github.authenticated else
+                f"unauthenticated, {github.min_interval:.0f}s between searches")
+        print(f"open-PR backstop: on (org {github.org}, {auth})")
+    else:
+        print("open-PR backstop: OFF; tickets with an open PR that the Jira dev "
+              "panel missed will be classified")
 
     out = out or ROOT / "out"
     (out / "contexts").mkdir(parents=True, exist_ok=True)
@@ -517,15 +543,26 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             # ticket can still be inspected with --keys.
             status = (issue["fields"].get("status") or {}).get("name")
             out_of_scope = args.live and status != cfg["jira"]["scope_status"]
+            # plan_ticket stays the single authority on precedence; this only
+            # avoids paying for a rate-limited GitHub search whose answer cannot
+            # change the outcome. Unlike the status re-check above, the open-PR
+            # check applies to dry runs too: it decides what reaches the grading
+            # sheet, not just what gets written.
+            provisional = plan_ticket(st, unchanged, args.force, classifier is not None,
+                                      out_of_scope)
+            open_prs: list[str] = []
+            if github and provisional not in ("skip-opted-out", "skip-out-of-scope"):
+                open_prs = github.open_pr_urls(key)
             action = plan_ticket(st, unchanged, args.force, classifier is not None,
-                                 out_of_scope)
-            # Excluded only for the two reasons that are permanent: an opt-out
-            # the pilot promised to honour, and a ticket that has left scope.
+                                 out_of_scope, bool(open_prs))
+            # Excluded only for the three reasons that are permanent: an opt-out
+            # the pilot promised to honour, a ticket that has left scope, and one
+            # that is already in review.
             # "already-triaged" is NOT permanent - a live run re-classifies it
             # after a prompt bump or an edit - and the gather step is a dry run
             # where `unchanged` is unconditionally True, so gating on it dropped
             # every labelled ticket and left the re-triage backlog unclassified.
-            if action not in ("skip-opted-out", "skip-out-of-scope"):
+            if action not in ("skip-opted-out", "skip-out-of-scope", "skip-open-pr"):
                 manifest[key] = {
                     "content_hash": chash,
                     "summary": issue["fields"].get("summary", ""),
@@ -537,6 +574,10 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                     row["by"] = st.opted_out_by
                 elif action == "skip-out-of-scope":
                     row["status"] = status
+                elif action == "skip-open-pr":
+                    # Journalled so the exclusion is auditable: this is the one
+                    # skip whose evidence lives outside Jira entirely.
+                    row["open_prs"] = open_prs
                 elif action == "skip-already-triaged":
                     row["labels"] = st.ai_labels_present
             else:

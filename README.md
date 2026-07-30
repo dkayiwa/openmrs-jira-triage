@@ -28,6 +28,46 @@ construction:
 > `ai-triage/automation-candidate` is configured as
 > `ai-triage-automation-candidate` etc. Confirm with the preflight charset test.
 
+## Scope: tickets already in review
+
+`scope_jql` excludes tickets whose Jira dev panel lists a pull request, but that
+panel only sees what the GitHub-for-Jira app indexed. On the launch cohort two
+of the 34 tickets it returned were already in review:
+
+| Ticket | Open PR the dev panel missed |
+|---|---|
+| O3-5796 | `openmrs-esm-smart-notifications-app#1` "(feat) O3-5796: Add Bell Notification Icon" |
+| O3-5816 | `openmrs-esm-core#1818` "(fix) O3-5816: Stop LocationPicker crashing…" |
+
+The JQL clause is not broken and does evaluate anonymously (2377 O3 tickets
+match `.all > 0`) — the gap is the index, so no JQL edit closes it. Labelling a
+ticket that is already in review invites the removal this pilot treats as a
+**permanent opt-out**, and that removal counts against the kill metric. So the
+sweep asks GitHub for the same evidence the dev panel is supposed to carry: an
+**open PR naming the ticket key**, journalled as `skip-open-pr` with the PR URL.
+
+Deliberate limits, both erring towards leaving a ticket in scope:
+
+- **A key only in a PR *comment* does not count.** Search matches comments too,
+  so "unrelated to O3-5816" in a review would otherwise exclude a ticket nobody
+  is working on. Only the PR title and body are treated as a claim.
+- **A PR that never names the ticket is invisible here.** O3-5843's description
+  links `openmrs-esm-audit-log-app#1`, but that PR cites no key, so neither Jira
+  nor GitHub can tie the two. The fix is the convention the other PRs already
+  follow — put the key in the PR title. Prose-scanning the ticket instead would
+  misfire: the same URL appears in O3-5842 as the place a styleguide bug was
+  *observed*, and in O3-5828 as a dependency.
+- **A closed PR does not count.** O3-5716's `bedmanagement#114` was closed
+  unmerged on 2026-07-08, so that ticket genuinely is the pilot's to sort.
+
+`GITHUB_TOKEN` is optional and read-only; it raises the search limit from 10 to
+30/min (`GITHUB_TOKEN=$(gh auth token)` locally). The scheduled workflow uses
+the automatic `github.token`, so no new repo secret is needed. A failed search
+**fails that ticket** rather than classifying it — fail-open would silently
+re-open this gap on exactly the tickets most likely to be in review. Use
+`--no-pr-check` (or `[github].check_open_prs = false`) to sweep on Jira's word
+alone; either way the run says which mode it is in.
+
 ## Quickstart (dry-run, no Jira credentials needed)
 
 ```sh
@@ -43,7 +83,8 @@ Useful flags: `--keys O3-4522,O3-5823` (specific tickets), `--no-classify`
 (context assembly only), `--force` (reclassify already-labeled tickets; in
 `--live` this re-spends on classification and comments again on any label
 flip, but opt-outs are still respected), `--live` (real writes; needs
-`JIRA_EMAIL`, `JIRA_API_TOKEN`, `TRIAGE_BOT_ACCOUNT_ID`).
+`JIRA_EMAIL`, `JIRA_API_TOKEN`, `TRIAGE_BOT_ACCOUNT_ID`), `--no-pr-check`
+(sweep without the open-PR backstop below).
 
 ## Running without an Anthropic API key
 
@@ -157,6 +198,8 @@ phase, every human label-removal gets added here as a new case.
 5. **Dry-run the whole cohort, grade, iterate** until the eval gate passes.
 6. **Enable writes:** add the four repo secrets, uncomment the `schedule` block
    in `.github/workflows/triage.yml`, or run `python -m triage.run --live`.
+   (`GITHUB_TOKEN` is not a fifth secret — the workflow passes the automatic
+   `github.token`, which `permissions: contents: read` already covers.)
 7. **Weekly:** `python -m triage.metrics` prints the three pilot metrics, any
    non-bot `ai-triage-*` label adds (convention violations), and a draft
    ADOPT / EXTEND / STOP against the pre-registered thresholds, computed purely
@@ -178,6 +221,7 @@ config.toml           pre-registered pilot config (cohort, labels, thresholds)
 prompt/system.md      the rubric prompt (versioned)
 triage/run.py         sweep -> skip checks -> assemble -> classify -> write/propose
 triage/context.py     visible-information assembly + content hash
+triage/github.py      open-PR backstop for the Jira dev panel (scope)
 triage/state.py       changelog-derived opt-out / already-triaged / violations
 triage/classifier.py  one Claude call, JSON-schema output, refusal fallbacks
 triage/preflight.py   pre-launch checks incl. label charset test

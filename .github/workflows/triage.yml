@@ -46,6 +46,10 @@ jobs:
           JIRA_API_TOKEN: ${{ secrets.JIRA_API_TOKEN }}
           TRIAGE_BOT_ACCOUNT_ID: ${{ secrets.TRIAGE_BOT_ACCOUNT_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          # The automatic job token, not a new repo secret: the open-PR backstop
+          # only reads public search results, and this raises its rate limit
+          # from 10 to 30 searches/min. `permissions: contents: read` is enough.
+          GITHUB_TOKEN: ${{ github.token }}
       - uses: actions/upload-artifact@v4
         if: always()
         with:
