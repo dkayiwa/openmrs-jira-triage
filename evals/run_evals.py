@@ -32,6 +32,8 @@ EVALS = ROOT / "evals"
 GRADED = EVALS / "graded.csv"
 CONTEXTS = EVALS / "contexts"
 
+GRADED_COLUMNS = ["key", "expected_label", "content_hash", "notes"]
+
 
 def import_proposals(path: str, contexts_dir: str) -> None:
     rows: dict[str, dict] = {}
@@ -86,20 +88,64 @@ def import_proposals(path: str, contexts_dir: str) -> None:
                 continue
             CONTEXTS.mkdir(exist_ok=True)
             shutil.copy(src, CONTEXTS / src.name)
+            # The hash is recorded, not merely checked here: freezing is the
+            # whole point of evals/contexts/, and without a stored hash a later
+            # edit to a frozen file silently changes what the gate measures.
             rows[r["key"]] = {"key": r["key"], "expected_label": expected,
+                              "content_hash": content_hash(src.read_text()),
                               "notes": r.get("grader_notes", "")}
             added += 1
     with open(GRADED, "w", newline="") as fh:
-        w = csv.DictWriter(fh, fieldnames=["key", "expected_label", "notes"])
+        w = csv.DictWriter(fh, fieldnames=GRADED_COLUMNS, extrasaction="ignore")
         w.writeheader()
         for row in sorted(rows.values(), key=lambda x: x["key"]):
             w.writerow(row)
     print(f"imported {added} graded case(s); eval set now has {len(rows)}")
 
 
-def run(min_agreement: float) -> int:
+def load_cases() -> list[dict]:
+    """Graded cases whose frozen context still matches what was graded.
+
+    A case that cannot be trusted is refused rather than scored: this set gates
+    go-live, so silently measuring the prompt against an edited context or a
+    corrupted label would move the gate without anyone seeing it.
+    """
+    if not GRADED.exists():
+        sys.exit(f"{GRADED} does not exist - --import-proposals a graded sheet first")
     with open(GRADED) as fh:
-        cases = list(csv.DictReader(fh))
+        rows = list(csv.DictReader(fh))
+    cases, rejected = [], []
+    for row in rows:
+        key = (row.get("key") or "").strip()
+        expected = (row.get("expected_label") or "").strip()
+        if not re.fullmatch(r"[A-Z][A-Z0-9]*-\d+", key):
+            rejected.append(f"{key!r}: not a Jira issue key")
+            continue
+        if expected not in LABEL_KEYS:
+            rejected.append(f"{key}: expected_label {expected!r} is not one of {LABEL_KEYS}")
+            continue
+        frozen = CONTEXTS / f"{key}.txt"
+        if not frozen.is_file():
+            rejected.append(f"{key}: frozen context {frozen} is missing")
+            continue
+        graded_hash = (row.get("content_hash") or "").strip()
+        if not graded_hash:
+            print(f"WARN {key}: no content_hash recorded, so the frozen context "
+                  "cannot be verified against what was graded")
+        elif content_hash(frozen.read_text()) != graded_hash:
+            rejected.append(f"{key}: frozen context has been edited since grading")
+            continue
+        cases.append({"key": key, "expected_label": expected, "context": frozen})
+    for reason in rejected:
+        print(f"REJECT {reason}")
+    if rejected:
+        sys.exit(f"{len(rejected)} graded case(s) are unusable; the gate is not "
+                 "meaningful until they are fixed or removed")
+    return cases
+
+
+def run(min_agreement: float) -> int:
+    cases = load_cases()
     if not cases:
         sys.exit("no graded cases yet - fill in a proposals CSV and --import-proposals it first")
     cfg = load_config()
@@ -111,7 +157,7 @@ def run(min_agreement: float) -> int:
         # Per-case isolation: one API hiccup must not discard the paid
         # classifications already made; an errored case counts as a miss.
         try:
-            got_label = clf.classify((CONTEXTS / (case["key"] + ".txt")).read_text()).label
+            got_label = clf.classify(case["context"].read_text()).label
         except Exception as e:
             got_label = f"ERROR ({type(e).__name__}: {str(e)[:120]})"
         if got_label == case["expected_label"]:
@@ -122,8 +168,12 @@ def run(min_agreement: float) -> int:
             print("  " + case["key"] + ": MISS expected " + case["expected_label"]
                   + " got " + got_label)
     agreement = hits / len(cases)
-    print(f"\nagreement: {hits}/{len(cases)} = {agreement:.0%} "
-          f"(prompt {cfg['prompt']['version']}, gate {min_agreement:.0%})")
+    # The model is named alongside the prompt: this gate is pre-registered
+    # against a specific pair, and a result that records only one of them cannot
+    # be reproduced later.
+    print(f"\nagreement: {hits}/{len(cases)} = {agreement:.1%} "
+          f"(model {cfg['claude']['model']}, prompt {cfg['prompt']['version']}, "
+          f"gate {min_agreement:.0%})")
     for key, want, got_label in misses:
         print(f"  confusion: {key} {want} -> {got_label}")
     return 0 if agreement >= min_agreement else 1

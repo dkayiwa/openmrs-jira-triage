@@ -158,6 +158,16 @@ class JiraClient:
         return self._check(self.session.post(self._url(f"/rest/api/2/issue/{key}/comment"),
                                              json={"body": body}, timeout=self.timeout))
 
+    def delete_comment(self, key: str, comment_id: str) -> None:
+        # Only preflight uses this, to clean up its permission probe. The pilot
+        # itself never deletes anything.
+        self._check(self.session.delete(
+            self._url(f"/rest/api/2/issue/{key}/comment/{comment_id}"), timeout=self.timeout))
+
+    def delete_property(self, key: str, prop: str) -> None:
+        self._check(self.session.delete(
+            self._url(f"/rest/api/2/issue/{key}/properties/{prop}"), timeout=self.timeout))
+
     def get_property(self, key: str, prop: str) -> dict | None:
         # 404 means "never triaged" (the normal first-run case); anything else
         # must fail loudly - swallowing a 401/500 here would silently reclassify

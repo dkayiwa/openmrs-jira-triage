@@ -15,11 +15,27 @@ import sys
 from . import context as ctx
 from .jira import JiraError
 from .run import bot_identity_error, jira_from_env, load_config
+from .state import PROPERTY_KEY
 
 
 def check(label: str, ok: bool, detail: str = "") -> bool:
     print(f"[{'PASS' if ok else 'FAIL'}] {label}" + (f" - {detail}" if detail else ""))
     return ok
+
+
+def attempt(label: str, fn):
+    """Run one probe; return (ok, value). A raised exception becomes a FAIL line.
+
+    Preflight's whole job is to report which checks pass, so letting one of them
+    abort the run hides every check after it - precisely when the operator most
+    needs the full picture. A 404 on project statuses used to mean you never
+    learned about the Acceptance Criteria field, the scope JQL or the bot id.
+    """
+    try:
+        return True, fn()
+    except Exception as e:
+        check(label, False, f"{type(e).__name__}: {e}"[:200])
+        return False, None
 
 
 def main(argv=None) -> int:
@@ -51,33 +67,43 @@ def main(argv=None) -> int:
         mismatch = bot_identity_error(jira, bot_id)
         ok &= check("TRIAGE_BOT_ACCOUNT_ID matches credentials", not mismatch, mismatch or bot_id)
 
-    statuses: set[str] = set()
-    for itype in jira.project_statuses(cfg["jira"]["project"]):
-        statuses.update(s["name"] for s in itype["statuses"])
     # Reads the configured status rather than a literal, so renaming the pilot's
     # in-scope status cannot leave preflight validating one the pipeline no
     # longer uses while every live ticket is skipped as out of scope.
     scope_status = cfg["jira"]["scope_status"]
-    ok &= check(f'"{scope_status}" status exists', scope_status in statuses,
-                f"project statuses: {sorted(statuses)}")
+    status_label = f'"{scope_status}" status exists'
+    got, itypes = attempt(status_label,
+                          lambda: jira.project_statuses(cfg["jira"]["project"]))
+    if got:
+        statuses = {s["name"] for itype in itypes for s in itype["statuses"]}
+        ok &= check(status_label, scope_status in statuses,
+                    f"project statuses: {sorted(statuses)}")
+    else:
+        ok = False
 
-    ac = ctx.discover_ac_field(jira, cfg["jira"].get("acceptance_criteria_field", ""))
-    ok &= check("Acceptance Criteria field", bool(ac), ac or "not found")
+    # Deliberately not `ok = ok and got and check(...)`: `and` short-circuits, so
+    # once an earlier probe has failed the check would never run and its line
+    # would vanish from the report - the very fault this restructuring fixes.
+    got, ac = attempt("Acceptance Criteria field", lambda: ctx.discover_ac_field(
+        jira, cfg["jira"].get("acceptance_criteria_field", "")))
+    if got:
+        ok &= check("Acceptance Criteria field", bool(ac), ac or "not found")
+    else:
+        ok = False
 
     jql = cfg["jira"]["scope_jql"].format(since=cfg["jira"]["cohort_created_since"])
     dev_clause = cfg["jira"]["dev_panel_clause"]
-    try:
-        n = len(jira.search_keys(jql))
-        ok &= check("scope JQL (with development[] clause)", True, f"{n} ticket(s); doc estimates ~35")
-    except JiraError as e:
-        check("scope JQL (with development[] clause)", False, str(e)[:200])
+    scope_label = "scope JQL (with development[] clause)"
+    got, keys = attempt(scope_label, lambda: jira.search_keys(jql))
+    if got:
+        ok &= check(scope_label, True, f"{len(keys)} ticket(s); doc estimates ~35")
+    else:
         ok = False
-        try:
-            n = len(jira.search_keys(jql.replace(dev_clause, "")))
-            print(f"       without the clause: {n} ticket(s) - the dev-panel JQL may need auth "
-                  "or the GitHub-for-Jira app")
-        except JiraError as e2:
-            print(f"       fallback sweep also failed: {str(e2)[:200]}")
+        got, fallback = attempt("scope JQL without the development[] clause",
+                                lambda: jira.search_keys(jql.replace(dev_clause, "")))
+        if got:
+            print(f"       without the clause: {len(fallback)} ticket(s) - the dev-panel "
+                  "JQL may need auth or the GitHub-for-Jira app")
 
     if args.scratch and jira.authenticated:
         slash_label = "ai-triage/charset-test"
@@ -96,6 +122,45 @@ def main(argv=None) -> int:
                 jira.update_labels(args.scratch, [], [slash_label])
             except JiraError:
                 print(f"       WARN: could not remove {slash_label} from {args.scratch}")
+        # Add Comments is probed explicitly because its absence produces the one
+        # failure the pipeline cannot recover from: labels are written before
+        # comments, so a missing permission leaves the ticket labelled with no
+        # explanation, and no later run will add one (the label's presence
+        # suppresses the comment).
+        posted = None
+        try:
+            posted = jira.add_comment(args.scratch, "triage pilot preflight - "
+                                      "verifying Add Comments; this will be deleted")
+            ok &= check("bot can add comments", True, f"comment {posted.get('id')}")
+        except JiraError as e:
+            ok &= check("bot can add comments", False, str(e)[:200])
+        finally:
+            if posted and posted.get("id"):
+                try:
+                    jira.delete_comment(args.scratch, posted["id"])
+                except JiraError:
+                    print(f"       WARN: could not delete preflight comment "
+                          f"{posted['id']} from {args.scratch}; remove manually")
+
+        # Entity properties are how the pipeline remembers what it has triaged.
+        # Without this permission every ticket looks untriaged on every sweep and
+        # is re-classified - and re-charged - every four hours, silently.
+        try:
+            jira.set_property(args.scratch, PROPERTY_KEY + "-preflight",
+                              {"probe": "triage pilot preflight"})
+            stored = jira.get_property(args.scratch, PROPERTY_KEY + "-preflight")
+            ok &= check("bot can read and write entity properties",
+                        (stored or {}).get("probe") == "triage pilot preflight",
+                        "idempotency depends on this")
+        except JiraError as e:
+            ok &= check("bot can read and write entity properties", False, str(e)[:200])
+        finally:
+            try:
+                jira.delete_property(args.scratch, PROPERTY_KEY + "-preflight")
+            except JiraError:
+                print(f"       WARN: could not delete the preflight property from "
+                      f"{args.scratch}; remove manually")
+
         hyphen_label = "ai-triage-charset-test"
         try:
             jira.update_labels(args.scratch, [hyphen_label], [])

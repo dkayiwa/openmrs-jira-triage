@@ -141,36 +141,52 @@ def main() -> int:
         f"{cohort} AND labels in ({intro_quoted}) AND labels in ({ai_quoted})"
     ))
 
+    # Each line carries its own verdict, at enough precision to show a
+    # near-boundary value. Rounding to "95%" against a ">= 95%" target read as a
+    # pass while the rule failed it, so the report contradicted its own decision.
     print(f"tickets labeled    : {labeled}")
-    print(f"sorted within 24h  : {pct24:.0f}%  (target >= {m['sorted_within_24h_pct']}%)")
-    print(f"label removal rate : {removal_rate:.2f}  (target <= {m['max_label_removal_rate']})")
-    print(f"intro outcomes     : {intro}  (target >= {m['min_intro_outcomes']})")
+    for text, ok, target in (
+        (f"sorted within 24h  : {pct24:.1f}%", pct24 >= m["sorted_within_24h_pct"],
+         f">= {m['sorted_within_24h_pct']}%"),
+        (f"label removal rate : {removal_rate:.3f}",
+         removal_rate <= m["max_label_removal_rate"],
+         f"<= {m['max_label_removal_rate']}"),
+        (f"intro outcomes     : {intro}", intro >= m["min_intro_outcomes"],
+         f">= {m['min_intro_outcomes']}"),
+    ):
+        print(f"{text}  [{'PASS' if ok else 'FAIL'}]  (target {target})")
     print(f"convention adds    : {len(violations)}  (non-bot ai-triage label adds)")
     for v in violations:
         print(f"  {v}")
 
+    # Both blockers are reported before returning, so an operator resolving them
+    # does not discover the second only after fixing the first.
     if failed:
         print(f"\n{len(failed)} of {len(cohort_keys)} cohort ticket(s) could not be read:")
         for f in failed:
             print(f"  {f}")
-        print("\nNO DECISION: the cohort is incomplete, so these numbers are a "
-              "lower bound. Re-run once the failures above are resolved.")
-        return 1
     if replayed:
         print(f"\n{len(replayed)} of {labeled} labelled ticket(s) were not labelled by "
               "the pinned model:")
         for r in replayed:
             print(f"  {r}")
-        print("\nNO DECISION: the pre-registered thresholds assume one pinned model and "
-              "prompt per label, so this cohort mixes two systems.")
-        print("A plain live sweep re-classifies these (the source mismatch alone makes "
-              "them stale - --force is not needed and would re-charge the whole cohort). "
-              "Tickets that have since been opted out or left "
-              f"\"{cfg['jira']['scope_status']}\" cannot be re-classified at all: those "
-              "need an explicit recorded decision from the pilot owners.")
-        print("Note also that the 24h SLA is measured from the FIRST bot label add, so "
-              "re-classifying does not undo a replay run's latency - the timestamp does "
-              "not move when the label is unchanged.")
+
+    if failed or replayed:
+        print("\nNO DECISION.")
+        if failed:
+            print("- The cohort is incomplete, so the numbers above are a lower bound. "
+                  "Re-run once the read failures are resolved.")
+        if replayed:
+            print("- The pre-registered thresholds assume one pinned model and prompt "
+                  "per label, and this cohort mixes two systems. A plain live sweep "
+                  "re-classifies the tickets above (the source mismatch alone makes them "
+                  "stale; --force is not needed and would re-charge the whole cohort). "
+                  "Tickets that have since been opted out or left "
+                  f"\"{cfg['jira']['scope_status']}\" cannot be re-classified at all and "
+                  "need an explicit recorded decision from the pilot owners.")
+            print("- Note the 24h SLA is measured from the FIRST bot label add, so "
+                  "re-classifying does not undo a replay run's latency: the timestamp "
+                  "does not move when the label is unchanged.")
         return 1
     print(f"\nDECISION: {decide(pct24, removal_rate, intro, m)}")
     return 0

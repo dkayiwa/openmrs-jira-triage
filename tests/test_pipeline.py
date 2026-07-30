@@ -24,7 +24,7 @@ from unittest import mock
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from triage import context as ctx  # noqa: E402
-from triage import metrics, run  # noqa: E402
+from triage import metrics, preflight, run  # noqa: E402
 from triage.classifier import (  # noqa: E402
     LABEL_KEYS,
     SCHEMA,
@@ -223,6 +223,165 @@ class StateTests(unittest.TestCase):
         self.assertIsNone(st.bot_first_labeled_at)
 
 
+class PreflightTests(unittest.TestCase):
+    """The go-live gate. It had no tests at all."""
+
+    class Stub:
+        """A Jira that answers every preflight probe, configurably."""
+
+        def __init__(self, **overrides):
+            self.authenticated = overrides.pop("authenticated", True)
+            self.raises = overrides.pop("raises", set())
+            self.statuses = overrides.pop("statuses", ["To Do", "Done"])
+            self.calls: list[str] = []
+            self.comments_posted: list[str] = []
+            self.props: dict = {}
+            self.labels: list[str] = []
+            self.reject_slash = overrides.pop("reject_slash", True)
+
+        def _guard(self, name):
+            self.calls.append(name)
+            if name in self.raises:
+                raise JiraError(f"{name} refused")
+
+        def server_info(self):
+            self._guard("server_info")
+            return {"baseUrl": "https://example.invalid", "deploymentType": "Cloud"}
+
+        def myself(self):
+            self._guard("myself")
+            return {"accountId": "bot", "displayName": "Triage Bot"}
+
+        def project_statuses(self, project):
+            self._guard("project_statuses")
+            return [{"statuses": [{"name": s} for s in self.statuses]}]
+
+        def fields(self):
+            self._guard("fields")
+            return [{"id": "customfield_1", "name": "Acceptance Criteria"}]
+
+        def search_keys(self, jql):
+            self._guard("search_keys")
+            return ["O3-1"]
+
+        def update_labels(self, key, add, remove):
+            self._guard("update_labels")
+            if any("/" in l for l in add) and self.reject_slash:
+                raise JiraError("labels may not contain '/'")
+            self.labels = [l for l in self.labels if l not in remove] + list(add)
+
+        def add_comment(self, key, body):
+            self._guard("add_comment")
+            self.comments_posted.append(body)
+            return {"id": "10001"}
+
+        def delete_comment(self, key, comment_id):
+            self._guard("delete_comment")
+            self.comments_posted.pop()
+
+        def set_property(self, key, prop, value):
+            self._guard("set_property")
+            self.props[prop] = value
+
+        def get_property(self, key, prop):
+            self._guard("get_property")
+            return self.props.get(prop)
+
+        def delete_property(self, key, prop):
+            self._guard("delete_property")
+            self.props.pop(prop, None)
+
+    def _run(self, jira, argv=()):
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(preflight, "jira_from_env", lambda cfg: jira), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = preflight.main(list(argv))
+        return rc, out.getvalue()
+
+    def test_a_healthy_instance_passes(self):
+        rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 0, report)
+        self.assertNotIn("[FAIL]", report)
+
+    def test_one_failing_probe_does_not_hide_the_others(self):
+        # A diagnostic tool that aborts on the first fault is worse than useless:
+        # the operator loses every check after it, which is the whole report.
+        rc, report = self._run(self.Stub(raises={"project_statuses"}))
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL]", report)
+        for later in ("Acceptance Criteria field", "scope JQL"):
+            self.assertIn(later, report, f"lost the {later} check\n{report}")
+
+    def test_every_probe_can_fail_without_aborting_the_report(self):
+        for probe in ("project_statuses", "fields", "search_keys"):
+            rc, report = self._run(self.Stub(raises={probe}))
+            self.assertEqual(rc, 1, f"{probe}\n{report}")
+            self.assertIn("Anthropic credentials", report,
+                          f"{probe} aborted the run\n{report}")
+
+    def test_a_missing_scope_status_fails(self):
+        rc, report = self._run(self.Stub(statuses=["Done", "In Progress"]))
+        self.assertEqual(rc, 1)
+        self.assertIn('[FAIL] "To Do" status exists', report)
+
+    def test_a_wrong_bot_account_id_fails(self):
+        class Wrong(self.Stub):
+            def myself(self):
+                self._guard("myself")
+                return {"accountId": "someone-else", "displayName": "Someone Else"}
+
+        rc, report = self._run(Wrong())
+        self.assertEqual(rc, 1)
+        self.assertIn("TRIAGE_BOT_ACCOUNT_ID", report)
+
+    def test_the_scratch_probes_verify_both_write_permissions(self):
+        # Add Comments guards the one unrecoverable failure (labelled with no
+        # comment); entity properties guard the runaway re-classification loop.
+        jira = self.Stub()
+        rc, report = self._run(jira, ["--scratch", "O3-1"])
+        self.assertEqual(rc, 0, report)
+        self.assertIn("[PASS] bot can add comments", report)
+        self.assertIn("[PASS] bot can read and write entity properties", report)
+        self.assertIn("delete_comment", jira.calls, "the probe comment must be removed")
+        self.assertIn("delete_property", jira.calls, "the probe property must be removed")
+        self.assertEqual(jira.comments_posted, [], "no probe comment may be left behind")
+        self.assertEqual(jira.props, {}, "no probe property may be left behind")
+        self.assertEqual(jira.labels, [], "no probe label may be left behind")
+
+    def test_missing_add_comments_permission_fails_the_gate(self):
+        rc, report = self._run(self.Stub(raises={"add_comment"}), ["--scratch", "O3-1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] bot can add comments", report)
+
+    def test_missing_property_permission_fails_the_gate(self):
+        rc, report = self._run(self.Stub(raises={"set_property"}), ["--scratch", "O3-1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] bot can read and write entity properties", report)
+
+    def test_a_silently_discarded_property_write_fails_the_gate(self):
+        # The dangerous shape is not a 403 but a write that reports success and
+        # stores nothing: idempotency would then be broken with no error anywhere,
+        # so the probe must read the value back rather than trust the write.
+        class Amnesiac(self.Stub):
+            def set_property(self, key, prop, value):
+                self._guard("set_property")  # accepted, then discarded
+
+        rc, report = self._run(Amnesiac(), ["--scratch", "O3-1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] bot can read and write entity properties", report)
+
+    def test_a_jira_that_accepts_slashes_fails_the_gate(self):
+        # The whole reason config.toml deviates from the design doc's names.
+        rc, report = self._run(self.Stub(reject_slash=False), ["--scratch", "O3-1"])
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] slash rejected in labels", report)
+
+    def test_an_unreachable_jira_stops_immediately(self):
+        rc, report = self._run(self.Stub(raises={"server_info"}))
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] jira reachable", report)
+
+
 class ContextTests(unittest.TestCase):
     def test_app_and_blocked_comments_excluded(self):
         comments = [
@@ -249,6 +408,52 @@ class ContextTests(unittest.TestCase):
                   "outwardIssue": {"key": "O3-9", "fields": {"summary": "Other"}}}]
         text = ctx.assemble(StubJira(), issue(issuelinks=links), None, [])
         self.assertIn("- blocks O3-9: Other", text)
+
+    def test_labels_and_status_never_enter_the_context(self):
+        """The hash must not move when the bot labels a ticket.
+
+        Every idempotency guarantee rests on this: if the ai-triage label or the
+        status reached the assembled text, the bot's own write would change the
+        hash, so the next sweep would see "content changed", re-classify, and
+        re-charge - forever, on a four-hourly schedule.
+        """
+        for labels in ([], [AI[0]], AI, ["intro"]):
+            for status in ("To Do", "In Progress", "Done"):
+                text = ctx.assemble(
+                    StubJira(), issue(labels=labels, status={"name": status}), None, [])
+                for label in labels:
+                    self.assertNotIn(label, text, f"{labels} {status}")
+                self.assertNotIn(status, text, f"{labels} {status}")
+
+    def test_the_hash_is_blind_to_everything_but_visible_information(self):
+        # Same visible content, wildly different surrounding fields.
+        plain = issue()
+        decorated = issue(labels=AI, status={"name": "Done"},
+                          created="2020-01-01T00:00:00.000+0000")
+        decorated["fields"]["assignee"] = {"displayName": "Someone"}
+        self.assertEqual(ctx.content_hash(ctx.assemble(StubJira(), plain, None, [])),
+                         ctx.content_hash(ctx.assemble(StubJira(), decorated, None, [])))
+
+    def test_bot_content_never_reaches_the_context(self):
+        # The visible-information promise, over every author shape Jira produces.
+        authors = [
+            {"accountType": "app", "displayName": "GitHub", "accountId": "app-1"},
+            {"accountType": "atlassian", "accountId": "bot", "displayName": "Bot"},
+            {"accountType": "atlassian", "accountId": "blocked", "displayName": "Other bot"},
+        ]
+        comments = [{"author": a, "body": f"SECRET-{i}"} for i, a in enumerate(authors)]
+        comments.append({"author": {"accountType": "atlassian", "accountId": "u1",
+                                    "displayName": "Human"}, "body": "VISIBLE"})
+        text = ctx.assemble(StubJira(), issue(comments=comments), None, ["bot", "blocked"])
+        self.assertIn("VISIBLE", text)
+        for i in range(len(authors)):
+            self.assertNotIn(f"SECRET-{i}", text)
+
+    def test_a_comment_with_no_author_is_kept(self):
+        # Safe direction: an unattributable comment is human-visible content, and
+        # dropping it would silently narrow what the classifier is judged on.
+        text = ctx.assemble(StubJira(), issue(comments=[{"body": "orphaned note"}]), None, [])
+        self.assertIn("orphaned note", text)
 
     def test_hash_stable_across_assemblies(self):
         a = ctx.assemble(StubJira(), issue(), None, [])
@@ -592,6 +797,157 @@ class ProposalSheetTests(unittest.TestCase):
         self.assertIn("Grade in the matching CSV", dry_md)
 
 
+class EvalGateTests(unittest.TestCase):
+    """The >= 90% gate that authorises go-live, and what it refuses to score."""
+
+    def _harness(self, tmp, cases, labels_returned):
+        """A module whose GRADED/CONTEXTS point at tmp, with a stub classifier."""
+        module = load_evals_module()
+        d = Path(tmp)
+        (d / "frozen").mkdir()
+        module.GRADED = d / "graded.csv"
+        module.CONTEXTS = d / "frozen"
+        with open(module.GRADED, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=module.GRADED_COLUMNS)
+            w.writeheader()
+            for row in cases:
+                text = row.pop("_context", f"TICKET: {row['key']}\n")
+                if text is not None:
+                    (d / "frozen" / f"{row['key']}.txt").write_text(text)
+                if row.get("content_hash") == "AUTO":
+                    row["content_hash"] = ctx.content_hash(text) if text else ""
+                w.writerow(row)
+        labels = list(labels_returned)
+        module.Classifier = lambda *a: StubClassifier(None)
+
+        class Sequenced:
+            def classify(self, text):
+                return Classification(labels.pop(0), "r", [], [], 0.9, "m")
+
+        module.Classifier = lambda *a: Sequenced()
+        return module
+
+    def _run(self, tmp, cases, labels_returned, gate=0.9):
+        module = self._harness(tmp, cases, labels_returned)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                rc = module.run(gate)
+            except SystemExit as e:
+                return 1, out.getvalue() + str(e)
+        return rc, out.getvalue()
+
+    def _case(self, key, expected="needs_more_info", **kw):
+        row = {"key": key, "expected_label": expected, "content_hash": "AUTO", "notes": ""}
+        row.update(kw)
+        return row
+
+    def test_the_gate_matches_the_agreement_it_reports(self):
+        # Exhaustive over small case sets AND over the gate itself, so the
+        # boundary is actually reached: with the default 0.9 and fewer than ten
+        # cases no ratio ever equals the threshold, and >= vs > is untested.
+        for total in range(1, 6):
+            for hits in range(total + 1):
+                for gate in (0.0, hits / total, 0.9, 1.0):
+                    with tempfile.TemporaryDirectory() as tmp:
+                        cases = [self._case(f"O3-{i}") for i in range(total)]
+                        labels = (["needs_more_info"] * hits
+                                  + ["needs_judgment"] * (total - hits))
+                        rc, report = self._run(tmp, cases, labels, gate=gate)
+                    state = f"{hits}/{total} gate={gate}"
+                    self.assertEqual(rc == 0, (hits / total) >= gate, f"{state}\n{report}")
+                    self.assertIn(f"agreement: {hits}/{total}", report)
+
+    def test_the_threshold_is_inclusive(self):
+        # 9/10 against a 0.9 gate is the real-world boundary this pilot uses.
+        with tempfile.TemporaryDirectory() as tmp:
+            cases = [self._case(f"O3-{i}") for i in range(10)]
+            labels = ["needs_more_info"] * 9 + ["needs_judgment"]
+            rc, report = self._run(tmp, cases, labels, gate=0.9)
+        self.assertEqual(rc, 0, f"exactly 90% must pass the >= 90% gate\n{report}")
+
+    def test_one_unusable_case_blocks_the_whole_run(self):
+        # A rejected case must not simply be dropped, leaving the rest scored:
+        # the gate would then be computed over a silently smaller set.
+        with tempfile.TemporaryDirectory() as tmp:
+            good = self._case("O3-1")
+            bad = self._case("O3-2", expected="looks_fine")
+            rc, report = self._run(tmp, [good, bad], ["needs_more_info"] * 2)
+        self.assertEqual(rc, 1)
+        self.assertIn("unusable", report)
+        self.assertNotIn("agreement:", report)
+
+    def test_an_edited_frozen_context_is_refused_not_scored(self):
+        # Freezing is the whole point of evals/contexts/; a silent edit would
+        # move the gate with nobody seeing it.
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._case("O3-1")
+            case["content_hash"] = ctx.content_hash("TICKET: O3-1\n")
+            case["_context"] = "TICKET: O3-1 (edited since grading)\n"
+            rc, report = self._run(tmp, [case], ["needs_more_info"])
+        self.assertEqual(rc, 1)
+        self.assertIn("edited since grading", report)
+        self.assertNotIn("agreement:", report)
+
+    def test_a_corrupted_label_is_refused_not_scored(self):
+        # Otherwise every case misses and the gate looks like a prompt failure.
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, report = self._run(tmp, [self._case("O3-1", expected="looks_fine")],
+                                   ["needs_more_info"])
+        self.assertEqual(rc, 1)
+        self.assertIn("is not one of", report)
+        self.assertNotIn("agreement:", report)
+
+    def test_a_missing_frozen_context_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._case("O3-1")
+            case["_context"] = None
+            rc, report = self._run(tmp, [case], [])
+        self.assertEqual(rc, 1)
+        self.assertIn("missing", report)
+
+    def test_an_unverifiable_case_warns_but_still_scores(self):
+        # A hand-added row with no hash cannot be checked; it is surfaced rather
+        # than silently trusted or silently dropped.
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._case("O3-1")
+            case["content_hash"] = ""
+            rc, report = self._run(tmp, [case], ["needs_more_info"])
+        self.assertEqual(rc, 0)
+        self.assertIn("no content_hash recorded", report)
+        self.assertIn("agreement: 1/1", report)
+
+    def test_the_result_names_the_model_and_prompt_it_gated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self._run(tmp, [self._case("O3-1")], ["needs_more_info"])
+        cfg = load_config()
+        self.assertIn(cfg["claude"]["model"], report)
+        self.assertIn(f"prompt {cfg['prompt']['version']}", report)
+
+    def test_a_classifier_error_counts_as_a_miss_not_a_crash(self):
+        module = None
+        with tempfile.TemporaryDirectory() as tmp:
+            module = self._harness(tmp, [self._case("O3-1"), self._case("O3-2")],
+                                   ["needs_more_info"])
+
+            class Exploding:
+                def __init__(self):
+                    self.calls = 0
+
+                def classify(self, text):
+                    self.calls += 1
+                    if self.calls == 1:
+                        raise RuntimeError("529 overloaded")
+                    return Classification("needs_more_info", "r", [], [], 0.9, "m")
+
+            module.Classifier = lambda *a: Exploding()
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                rc = module.run(0.9)
+            report = out.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn("ERROR", report)
+        self.assertIn("agreement: 1/2", report)
+
+
 class EvalImportTests(unittest.TestCase):
     """A grade must stay pinned to the context it was actually made against."""
 
@@ -660,6 +1016,9 @@ class EvalImportTests(unittest.TestCase):
         rows, _ = self._import(text, ctx.content_hash(text))
         self.assertEqual([r["key"] for r in rows], ["O3-1"])
         self.assertEqual(rows[0]["expected_label"], "needs_more_info")
+        # The hash is recorded, not just checked: without it a later edit to the
+        # frozen context cannot be detected at run time.
+        self.assertEqual(rows[0]["content_hash"], ctx.content_hash(text))
 
     def test_context_overwritten_since_grading_is_skipped(self):
         rows, log = self._import("TICKET: O3-1 (edited)\n",
@@ -749,13 +1108,13 @@ class MetricsWiringTests(unittest.TestCase):
     def test_prompt_labeling_reports_full_sla_and_adopts(self):
         report = self._report(self._labeled("2026-08-10T09:00:00.000+0000",
                                             "2026-08-10T11:00:00.000+0000"))
-        self.assertIn("sorted within 24h  : 100%", report)
+        self.assertIn("sorted within 24h  : 100.0%  [PASS]", report)
         self.assertIn("DECISION: ADOPT", report)
 
     def test_late_labeling_is_not_silently_credited(self):
         report = self._report(self._labeled("2026-08-10T09:00:00.000+0000",
                                             "2026-08-12T09:00:00.000+0000"))
-        self.assertIn("sorted within 24h  : 0%", report)
+        self.assertIn("sorted within 24h  : 0.0%  [FAIL]", report)
         self.assertNotIn("ADOPT", report)
 
     def test_a_replayed_label_suppresses_the_decision(self):
@@ -794,10 +1153,164 @@ class MetricsWiringTests(unittest.TestCase):
                 label_change("u1", AI[2], AI[0], display="Maintainer",
                              created="2026-08-11T09:00:00.000+0000"),
             ]))
-        self.assertIn("label removal rate : 1.00", report)
+        self.assertIn("label removal rate : 1.000  [FAIL]", report)
         self.assertIn("convention adds    : 1", report)
         self.assertIn("Maintainer", report)
         self.assertIn("DECISION: STOP", report)
+
+
+class DecisionRuleInvariantTests(unittest.TestCase):
+    """The pre-registered rule, over its whole input space.
+
+    This rule is committed before launch and decides the pilot. It is a pure
+    function of three numbers, so it can be checked exhaustively rather than at
+    the handful of points a reviewer happens to pick.
+    """
+
+    M = {"sorted_within_24h_pct": 95, "max_label_removal_rate": 0.10,
+         "min_intro_outcomes": 5}
+    RANK = {"STOP": 0, "EXTEND (two weeks)": 1, "ADOPT": 2}
+    PCTS = (0, 50, 90, 94.9, 95, 95.1, 99.9, 100)
+    RATES = (0.0, 0.05, 0.099, 0.10, 0.101, 0.15, 0.20, 0.201, 0.5, 1.0)
+    INTROS = (0, 1, 4, 5, 6, 50)
+
+    def _grid(self):
+        return itertools.product(self.PCTS, self.RATES, self.INTROS)
+
+    def test_every_verdict_is_one_of_the_three(self):
+        for pct, rate, intro in self._grid():
+            self.assertIn(decide(pct, rate, intro, self.M), self.RANK)
+
+    def test_adopt_exactly_when_all_three_targets_are_met(self):
+        for pct, rate, intro in self._grid():
+            all_pass = (pct >= 95 and rate <= 0.10 and intro >= 5)
+            self.assertEqual(decide(pct, rate, intro, self.M) == "ADOPT", all_pass,
+                             f"{pct=} {rate=} {intro=}")
+
+    def test_the_kill_metric_dominates(self):
+        # Past double the removal threshold, no amount of throughput or intro
+        # output may earn an extension.
+        for pct, rate, intro in self._grid():
+            if rate > 2 * self.M["max_label_removal_rate"]:
+                self.assertEqual(decide(pct, rate, intro, self.M), "STOP",
+                                 f"{pct=} {rate=} {intro=}")
+
+    def test_extend_requires_two_passes_and_a_tolerable_removal_rate(self):
+        for pct, rate, intro in self._grid():
+            if decide(pct, rate, intro, self.M) == "EXTEND (two weeks)":
+                passes = sum((pct >= 95, rate <= 0.10, intro >= 5))
+                self.assertEqual(passes, 2, f"{pct=} {rate=} {intro=}")
+                self.assertLessEqual(rate, 0.20)
+
+    def test_improving_any_metric_never_worsens_the_verdict(self):
+        # A rule where doing better scores worse would be a defect no single
+        # example is likely to reveal.
+        for pct, rate, intro in self._grid():
+            base = self.RANK[decide(pct, rate, intro, self.M)]
+            for better in (p for p in self.PCTS if p > pct):
+                self.assertGreaterEqual(self.RANK[decide(better, rate, intro, self.M)],
+                                        base, f"pct {pct}->{better} at {rate=} {intro=}")
+            for better in (r for r in self.RATES if r < rate):
+                self.assertGreaterEqual(self.RANK[decide(pct, better, intro, self.M)],
+                                        base, f"rate {rate}->{better} at {pct=} {intro=}")
+            for better in (i for i in self.INTROS if i > intro):
+                self.assertGreaterEqual(self.RANK[decide(pct, rate, better, self.M)],
+                                        base, f"intro {intro}->{better} at {pct=} {rate=}")
+
+
+class MetricsReportInvariantTests(unittest.TestCase):
+    """The report must never contradict its own verdict."""
+
+    LAUNCH = "2026-08-01"
+
+    def _report(self, tickets, properties=None, intro_keys=("O3-1",) * 5):
+        cfg = load_config()
+        cfg["metrics"] = dict(cfg["metrics"], pilot_launch=self.LAUNCH)
+        jira = MetricsJira(tickets, intro_keys, properties)
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(metrics, "load_config", lambda: cfg), \
+             mock.patch.object(metrics, "jira_from_env", lambda c: jira), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            try:
+                rc = metrics.main()
+            except SystemExit as e:
+                return 1, out.getvalue() + str(e)
+        return rc, out.getvalue()
+
+    def _ticket(self, key, created, labeled_at, opted_out=False, human_add=False):
+        histories = [label_change("bot", "", AI[2], created=labeled_at)]
+        if opted_out:
+            histories.append(label_change("u1", AI[2], "", created=labeled_at))
+        if human_add:
+            histories.append(label_change("u2", "", AI[0], display="Maintainer",
+                                          created=labeled_at))
+        iss = issue(labels=[AI[2]], created=created, histories=histories)
+        iss["key"] = key
+        return iss
+
+    def test_the_verdict_always_agrees_with_the_printed_pass_flags(self):
+        # The rounding that made "94.6%" print as "95%" against a ">= 95%" target
+        # is why each line now carries its own PASS/FAIL.
+        prompt = "2026-08-10T09:00:00.000+0000", "2026-08-10T11:00:00.000+0000"
+        late = "2026-08-10T09:00:00.000+0000", "2026-08-20T09:00:00.000+0000"
+        for n_prompt, n_late, opted, intro_n in itertools.product(
+                range(0, 4), range(0, 4), (0, 1), (0, 5)):
+            if n_prompt + n_late == 0:
+                continue
+            tickets = {}
+            for i in range(n_prompt):
+                tickets[f"O3-P{i}"] = self._ticket(f"O3-P{i}", *prompt)
+            for i in range(n_late):
+                tickets[f"O3-L{i}"] = self._ticket(f"O3-L{i}", *late,
+                                                   opted_out=bool(opted and i == 0))
+            rc, report = self._report(tickets, intro_keys=("x",) * intro_n)
+            state = f"{n_prompt=} {n_late=} {opted=} {intro_n=}"
+            if "DECISION:" not in report:
+                continue
+            verdict = report.split("DECISION:")[1].strip().splitlines()[0].strip()
+            passes = report.count("[PASS]")
+            # ADOPT iff all three lines said PASS; STOP never with all three.
+            self.assertEqual(verdict == "ADOPT", passes == 3, f"{state}\n{report}")
+            if verdict == "EXTEND (two weeks)":
+                self.assertEqual(passes, 2, f"{state}\n{report}")
+            self.assertEqual(rc, 0, state)
+
+    def test_a_blocked_cohort_never_prints_a_decision(self):
+        prompt = "2026-08-10T09:00:00.000+0000", "2026-08-10T11:00:00.000+0000"
+        tickets = {"O3-1": self._ticket("O3-1", *prompt)}
+        for properties in ({"O3-1": {"source": "file", "classifier": "agent"}}, "raise"):
+            rc, report = self._report(tickets, properties=properties)
+            self.assertEqual(rc, 1, report)
+            self.assertNotIn("DECISION: ADOPT", report)
+            self.assertNotIn("DECISION: EXTEND", report)
+            self.assertNotIn("DECISION: STOP", report)
+
+    def test_both_blockers_are_reported_in_one_pass(self):
+        # Otherwise an operator fixes the read failures, re-runs, and only then
+        # discovers the cohort was also contaminated.
+        prompt = "2026-08-10T09:00:00.000+0000", "2026-08-10T11:00:00.000+0000"
+        tickets = {"O3-1": self._ticket("O3-1", *prompt),
+                   "O3-2": self._ticket("O3-2", *prompt)}
+
+        class Partial(MetricsJira):
+            def get_property(self, key, prop):
+                if key == "O3-2":
+                    raise JiraError("429 Too Many Requests")
+                return {"source": "file", "classifier": "agent"}
+
+        cfg = load_config()
+        cfg["metrics"] = dict(cfg["metrics"], pilot_launch=self.LAUNCH)
+        jira = Partial(tickets, ("x",) * 5)
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(metrics, "load_config", lambda: cfg), \
+             mock.patch.object(metrics, "jira_from_env", lambda c: jira), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = metrics.main()
+        report = out.getvalue()
+        self.assertEqual(rc, 1)
+        self.assertIn("could not be read", report)
+        self.assertIn("not labelled by the pinned model", report)
+        self.assertIn("NO DECISION", report)
 
 
 class LiveRunTests(unittest.TestCase):
