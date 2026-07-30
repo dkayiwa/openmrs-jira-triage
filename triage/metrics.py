@@ -118,11 +118,18 @@ def main() -> int:
         # raised is public and unattributed - and would have been counted as
         # pinned-model evidence. evals/run_evals.py already fails closed on an
         # absent source column; this now matches it.
-        source = "absent" if prop is None else (prop or {}).get("source", "api")
+        # An empty property is as unattributed as a missing one, and a property
+        # that is not a dict at all (hand-set, or written by something else) must
+        # be recorded rather than raising AttributeError and killing the whole
+        # run - per-ticket isolation is the point of `failed`.
+        if not prop:
+            source, classifier = "absent", None
+        elif isinstance(prop, dict):
+            source, classifier = prop.get("source", "api"), prop.get("classifier")
+        else:
+            source, classifier = f"malformed ({type(prop).__name__})", None
         if source != "api":
-            replayed.append(f"{key}: source={source} "
-                            f"classifier={(prop or {}).get('classifier')}")
-        prop = prop or {}
+            replayed.append(f"{key}: source={source} classifier={classifier}")
         if sla_met(issue["fields"]["created"], st.bot_first_labeled_at, launch):
             within += 1
         if st.opted_out:

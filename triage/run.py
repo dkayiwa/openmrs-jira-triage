@@ -609,7 +609,8 @@ def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime
                          f'{esc(row["summary"])} &mdash; {links}</li>')
         parts.append("</ul>")
 
-    parts.append(f"<h2>The comments</h2>")
+    if rows:
+        parts.append("<h2>The comments</h2>")
     for r in rows:
         issue, c = r["issue"], r["c"]
         key = issue["key"]

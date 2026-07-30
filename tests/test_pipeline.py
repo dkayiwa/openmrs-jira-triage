@@ -600,6 +600,22 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("[FAIL] bot can read and write entity properties", report)
 
+    def test_scratch_without_credentials_fails_rather_than_skipping(self):
+        # README step 4 is `preflight --scratch O3-XXXX`. Run it without bot
+        # credentials and every write probe is skipped - but preflight used to
+        # exit 0 anyway, printing advice the operator had already followed. The
+        # go-live gate would report PASS having verified no write permission at
+        # all: the same false PASS as the slash probe, one level up.
+        rc, report = self._run(self.Stub(authenticated=False),
+                               argv=["--scratch", "O3-9999"])
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] write probes requested but not run", report)
+
+    def test_no_scratch_flag_is_still_a_clean_skip(self):
+        rc, report = self._run(self.Stub(authenticated=False))
+        self.assertEqual(rc, 0, report)
+        self.assertNotIn("write probes requested", report)
+
     def test_a_broken_scratch_ticket_cannot_masquerade_as_slash_rejection(self):
         # The whole probe is "Jira refused the slash". Before the hyphen add
         # gated it, ANY failure counted: a mistyped --scratch key (404), a
@@ -2074,6 +2090,24 @@ class MetricsWiringTests(unittest.TestCase):
         self.assertIn("NO DECISION", report)
         self.assertIn("source=absent", report)
         self.assertNotIn("DECISION: ADOPT", report)
+
+    def test_a_malformed_property_is_recorded_not_raised(self):
+        # get_property returns whatever the value field holds. A property that is
+        # a string or list - hand-set, or written by something else - used to
+        # raise AttributeError out of the loop and kill the whole metrics run,
+        # discarding every ticket already walked. Per-ticket isolation is the
+        # point of the failed list.
+        report = self._report(self._labeled("2026-08-01T09:00:00.000+0000",
+                                            "2026-08-01T10:00:00.000+0000"),
+                              properties={"O3-1": "not-a-dict"})
+        self.assertIn("NO DECISION", report)
+        self.assertIn("malformed", report)
+
+    def test_an_empty_property_is_unattributed_too(self):
+        report = self._report(self._labeled("2026-08-01T09:00:00.000+0000",
+                                            "2026-08-01T10:00:00.000+0000"),
+                              properties={"O3-1": {}})
+        self.assertIn("source=absent", report)
 
     def test_a_property_without_source_counts_as_api(self):
         # Properties written before `source` existed must not read as replayed.

@@ -144,12 +144,16 @@ def main(argv=None) -> int:
             ok &= check("hyphenated label accepted", True, hyphen_label)
         except JiraError as e:
             ok &= check("hyphenated label accepted", False, str(e)[:200])
-        finally:
+        # Only clean up what actually landed, and catch broadly: a transport
+        # error is not a JiraError, and letting one escape would abort
+        # preflight before the comment and property probes while leaving the
+        # label behind.
+        if hyphen_ok:
             try:
                 jira.update_labels(args.scratch, [], [hyphen_label])
-            except JiraError:
+            except Exception as e:
                 print(f"       WARN: could not remove {hyphen_label} from "
-                      f"{args.scratch}; remove manually")
+                      f"{args.scratch} ({type(e).__name__}); remove manually")
 
         slash_label = "ai-triage/charset-test"
         # Only the *add* may count as evidence: wrapping the cleanup removal in
@@ -171,8 +175,9 @@ def main(argv=None) -> int:
             ok = False
             try:
                 jira.update_labels(args.scratch, [], [slash_label])
-            except JiraError:
-                print(f"       WARN: could not remove {slash_label} from {args.scratch}")
+            except Exception as e:
+                print(f"       WARN: could not remove {slash_label} from "
+                      f"{args.scratch} ({type(e).__name__})")
         # Add Comments is probed explicitly because its absence produces the one
         # failure the pipeline cannot recover from: labels are written before
         # comments, so a missing permission leaves the ticket labelled with no
@@ -189,9 +194,10 @@ def main(argv=None) -> int:
             if posted and posted.get("id"):
                 try:
                     jira.delete_comment(args.scratch, posted["id"])
-                except JiraError:
+                except Exception as e:
                     print(f"       WARN: could not delete preflight comment "
-                          f"{posted['id']} from {args.scratch}; remove manually")
+                          f"{posted['id']} from {args.scratch} "
+                          f"({type(e).__name__}); remove manually")
 
         # Entity properties are how the pipeline remembers what it has triaged.
         # Without this permission every ticket looks untriaged on every sweep and
@@ -208,10 +214,17 @@ def main(argv=None) -> int:
         finally:
             try:
                 jira.delete_property(args.scratch, PROPERTY_KEY + "-preflight")
-            except JiraError:
+            except Exception as e:
                 print(f"       WARN: could not delete the preflight property from "
-                      f"{args.scratch}; remove manually")
+                      f"{args.scratch} ({type(e).__name__}); remove manually")
 
+    elif args.scratch:
+        # Asked for the write probes and could not run them. Skipping quietly
+        # here let the go-live gate exit 0 having tested nothing - the same
+        # false PASS the slash probe used to give, one level up.
+        ok &= check("write probes requested but not run", False,
+                    "--scratch needs JIRA_EMAIL and JIRA_API_TOKEN; none are set, "
+                    "so no write permission was verified")
     else:
         print("       (label-charset write test skipped: pass --scratch O3-XXXX with bot credentials)")
 
