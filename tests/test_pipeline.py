@@ -1013,6 +1013,31 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("[FAIL] github open-PR backstop", report)
         self.assertIn("--no-pr-check", report)
 
+    def test_a_misconfigured_github_org_fails_the_gate(self):
+        """The backstop's own configuration, which nothing pinned.
+
+        Verified live before writing this: GitHub returns an error for an org
+        that does not exist, and preflight already exits 1 - so the realistic
+        typo is caught. That is worth a test rather than a note, because the
+        behaviour depends on `_search` failing closed on a non-200, and a
+        future change there would silently turn this FAIL into a PASS.
+
+        It would be a bad one to lose. A backstop pointed at the wrong org
+        returns no PRs for every key, so tickets already in review get labelled
+        and commented; the maintainer removes the label, which is a permanent
+        opt-out and counts against the kill metric. The gate would show the
+        same "0 open PR(s)" it shows on a healthy run, because zero is the
+        expected answer for most keys.
+        """
+        StubGitHub.error = gh.GitHubError(
+            "GET https://api.github.com/search/issues?q=org:openmrs-typo -> 422")
+        self.addCleanup(StubGitHub.reset)
+        rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 1, "the gate passed with an unusable backstop")
+        self.assertIn("[FAIL] github open-PR backstop", report)
+        self.assertIn("pass --no-pr-check", report,
+                      "the operator needs the way forward, not just the failure")
+
     def test_an_unauthenticated_backstop_still_passes_but_says_so(self):
         rc, report = self._run(self.Stub())
         self.assertEqual(rc, 0, report)
