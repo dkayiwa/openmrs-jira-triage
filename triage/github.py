@@ -128,13 +128,23 @@ class GitHubClient:
             raise GitHubError(f"GitHub reported incomplete_results for {query}: the "
                               "search timed out, so an empty result is not evidence "
                               "that no open PR names this key")
-        items = data.get("items", [])
+        # Require the shape before trusting the content. Defaulting these with
+        # .get() is how the guard below gets disarmed: `total_count` defaulting
+        # to len(items) makes the comparison len(items) > len(items), always
+        # false, so any well-formed JSON object that is not a search payload - a
+        # proxy envelope, an error body, a future API shape - would sail through
+        # all three checks and return an unearned empty.
+        if "items" not in data or "total_count" not in data:
+            raise GitHubError(f"GET {SEARCH_URL}?q={query} -> 200 whose body is not a "
+                              f"search result (keys: {sorted(data)[:6]}); that is no "
+                              "answer, not 'no open PR'")
+        items = data["items"]
         # We do not paginate - one key should never match more than a page of
         # PRs. If it somehow does, the unseen pages could hold the match, and
         # silently answering from the first page would be a false negative.
-        total = data.get("total_count", len(items))
-        if total > len(items):
-            raise GitHubError(f"GitHub reported {total} matches for {query} but "
+        if data["total_count"] > len(items):
+            raise GitHubError(f"GitHub reported {data['total_count']} matches for "
+                              f"{query} but "
                               f"returned {len(items)}; this client does not paginate, "
                               "so the remainder cannot be ruled out")
         return data

@@ -1221,9 +1221,18 @@ class GitHubSession:
 
 
 def gh_response(items, status_code=200, headers=None):
-    resp = StubResponse({"items": list(items)}, status_code)
+    """A stub shaped like a real GitHub search response.
+
+    total_count and incomplete_results are included because the client requires
+    them: a helper that omitted total_count would model a body GitHub never
+    sends, and every test built on it would be exercising a shape the guard is
+    specifically there to reject.
+    """
+    items = list(items)
+    payload = {"items": items, "total_count": len(items), "incomplete_results": False}
+    resp = StubResponse(payload, status_code)
     resp.headers = dict(headers or {})
-    resp.text = json.dumps({"items": list(items)})
+    resp.text = json.dumps(payload)
     return resp
 
 
@@ -1274,6 +1283,13 @@ class GitHubClientTests(unittest.TestCase):
     def setUp(self):
         self.slept: list[float] = []
         self.clock = 1000.0
+
+    def test_a_well_formed_empty_result_is_still_a_valid_negative(self):
+        payload = {"items": [], "total_count": 0, "incomplete_results": False}
+        resp = gh_response([])
+        resp.text = json.dumps(payload)
+        resp._payload = payload
+        self.assertEqual(self._client([resp]).open_pr_urls("O3-1"), [])
 
     def test_the_query_asks_only_for_open_prs_in_the_org(self):
         client = self._client([gh_response([])])
@@ -1427,12 +1443,30 @@ class GitHubClientTests(unittest.TestCase):
     def test_a_timed_out_search_is_not_read_as_no_open_pr(self):
         # GitHub sets incomplete_results when its own search times out, so an
         # empty result means "we did not finish looking".
+        # total_count present and consistent on purpose: without it the shape
+        # guard fires first and this test passes without ever reaching the one
+        # it names. Mutation testing caught exactly that.
+        payload = {"items": [], "total_count": 0, "incomplete_results": True}
         resp = gh_response([])
-        resp.text = json.dumps({"items": [], "incomplete_results": True})
-        resp._payload = {"items": [], "incomplete_results": True}
+        resp.text = json.dumps(payload)
+        resp._payload = payload
         client = self._client([resp])
-        with self.assertRaises(gh.GitHubError):
+        with self.assertRaises(gh.GitHubError) as caught:
             client.open_pr_urls("O3-1")
+        self.assertIn("timed out", str(caught.exception))
+
+    def test_a_json_body_that_is_not_a_search_result_is_refused(self):
+        # The guard this covers was itself an instance of the class it was added
+        # to remove: total_count defaulted to len(items), making the comparison
+        # len(items) > len(items) and always false, so a proxy envelope or an
+        # error body passed every check and returned an unearned empty.
+        for body in ({}, {"message": "Bad gateway"}, {"items": []}):
+            resp = gh_response([])
+            resp.text = json.dumps(body)
+            resp._payload = body
+            client = self._client([resp])
+            with self.assertRaises(gh.GitHubError, msg=str(body)):
+                client.open_pr_urls("O3-1")
 
     def test_a_truncated_result_set_is_refused(self):
         # This client does not paginate; if GitHub says there are more matches
