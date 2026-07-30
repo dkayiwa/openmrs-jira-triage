@@ -933,6 +933,103 @@ class BotIdentityTests(unittest.TestCase):
         self.assertIsNone(bot_identity_error(self._Jira("bot"), None))
 
 
+class ScheduleGuardTests(unittest.TestCase):
+    """Refuses a local --live run that could race the scheduled sweep.
+
+    The failure it prevents is the only one in this pipeline that cannot be
+    undone: two sweeps that both read a ticket before either labels it each post
+    a comment, and Jira Cloud has no way to un-send those.
+    """
+
+    ACTIVE = ("name: triage\non:\n  workflow_dispatch:\n"
+              '  schedule:\n    - cron: "17 */4 * * *"\n')
+    COMMENTED = ("name: triage\non:\n  workflow_dispatch:\n"
+                 '  # schedule:\n  #   - cron: "17 */4 * * *"\n')
+
+    def _root(self, tmp, text=None):
+        root = Path(tmp)
+        if text is not None:
+            (root / ".github" / "workflows").mkdir(parents=True)
+            (root / run.WORKFLOW).write_text(text)
+        return root
+
+    def test_a_commented_out_schedule_is_no_conflict(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(run.schedule_conflict(
+                self._root(tmp, self.COMMENTED), in_ci=False))
+
+    def test_an_active_schedule_blocks_a_local_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            msg = run.schedule_conflict(self._root(tmp, self.ACTIVE), in_ci=False)
+        self.assertIsNotNone(msg)
+        self.assertIn(run.SCHEDULE_OVERRIDE, msg, "the refusal must name the way out")
+
+    def test_a_quoted_on_key_is_still_detected(self):
+        # YAML reads a bare `on:` as the boolean True; a quoted "on:" lands under
+        # the string key. Reading only one of them would miss a live schedule.
+        quoted = self.ACTIVE.replace("on:", '"on":')
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNotNone(run.schedule_conflict(
+                self._root(tmp, quoted), in_ci=False))
+
+    def test_inside_actions_the_concurrency_group_is_trusted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(run.schedule_conflict(
+                self._root(tmp, self.ACTIVE), in_ci=True))
+
+    def test_no_workflow_file_means_no_cron_to_race(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            self.assertIsNone(run.schedule_conflict(self._root(tmp), in_ci=False))
+
+    def test_an_unreadable_workflow_fails_closed(self):
+        # "Probably no cron" is not worth duplicate comments on public tickets.
+        with tempfile.TemporaryDirectory() as tmp:
+            msg = run.schedule_conflict(
+                self._root(tmp, "on:\n  schedule:\n   - cron: [unclosed\n"),
+                in_ci=False)
+        self.assertIsNotNone(msg)
+        self.assertIn(run.SCHEDULE_OVERRIDE, msg)
+
+    def test_this_repos_own_workflow_is_readable(self):
+        # Whatever the schedule's state, the guard must not fail closed on our own
+        # file - that would block every local live run for the wrong reason.
+        msg = run.schedule_conflict(Path(run.__file__).resolve().parent.parent,
+                                    in_ci=False)
+        self.assertNotIn("cannot tell", msg or "")
+
+    def _live(self, argv, conflict):
+        jira = RecordingJira({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot",
+                                          "JIRA_EMAIL": "b@x", "JIRA_API_TOKEN": "t"}), \
+             mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+             mock.patch.object(run, "schedule_conflict", lambda *a: conflict), \
+             mock.patch.object(run, "Classifier", lambda *a: StubClassifier(
+                 Classification("needs_judgment", "x", [], [], 0.5, "m"))), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = run.main(argv, out=Path(d))
+            except SystemExit as e:
+                return str(e.code), jira.writes
+        return rc, jira.writes
+
+    def test_a_conflict_stops_the_run_before_anything_is_written(self):
+        StubGitHub.reset()
+        self.addCleanup(StubGitHub.reset)
+        code, writes = self._live(["--live", "--keys", "O3-1"], "a sweep may fire")
+        self.assertIn("a sweep may fire", code)
+        self.assertEqual(writes, [], "wrote to Jira despite a schedule conflict")
+
+    def test_the_override_lets_a_deliberate_run_through(self):
+        StubGitHub.reset()
+        self.addCleanup(StubGitHub.reset)
+        code, writes = self._live(
+            ["--live", run.SCHEDULE_OVERRIDE, "--keys", "O3-1"], "a sweep may fire")
+        self.assertEqual(code, 0)
+        self.assertTrue(writes, "the override did not let the run proceed")
+
+
 class PlanTicketTests(unittest.TestCase):
     def test_opt_out_beats_force(self):
         st = TicketState(ai_labels_present=[AI[0]], opted_out=True)

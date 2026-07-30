@@ -245,6 +245,53 @@ def bot_identity_error(jira: JiraClient, bot_id: str | None) -> str | None:
     return None
 
 
+WORKFLOW = ".github/workflows/triage.yml"
+SCHEDULE_OVERRIDE = "--i-paused-the-schedule"
+
+
+def schedule_conflict(root: pathlib.Path, in_ci: bool) -> str | None:
+    """Why a local --live run is unsafe right now, or None if it is not.
+
+    The workflow's `concurrency` group only serialises runs inside Actions, so it
+    cannot see a run started from a laptop. Two sweeps that both read a ticket
+    before either labels it will each post a comment to every watcher, and Jira
+    Cloud has no way to un-send those - which is why this is a refusal rather
+    than the README warning it used to be.
+
+    Only local runs are gated; inside Actions the concurrency group already does
+    the job. Fails CLOSED when the workflow cannot be read, because "probably no
+    cron" is not worth duplicate comments on up to 32 public tickets. A missing
+    file is not ambiguous, though: no workflow means no cron to race.
+    """
+    if in_ci:
+        return None
+    path = root / WORKFLOW
+    if not path.exists():
+        return None
+    try:
+        # Imported here, not at module scope: only a live run needs it, and a
+        # dry-run on a machine without PyYAML should still work.
+        import yaml
+
+        doc = yaml.safe_load(path.read_text()) or {}
+        # YAML reads a bare `on:` as the boolean True, so the triggers live under
+        # either key depending on whether the file quotes it.
+        triggers = doc.get(True) or doc.get("on") or {}
+        active = "schedule" in triggers
+    except Exception as e:
+        return (f"cannot tell whether a scheduled sweep is enabled: reading "
+                f"{WORKFLOW} raised {type(e).__name__}: {e}. Confirm none is "
+                f"running and pass {SCHEDULE_OVERRIDE}")
+    if not active:
+        return None
+    return (f"{WORKFLOW} has an active schedule, so a sweep may fire while this "
+            "one runs. The workflow's concurrency group only serialises runs "
+            "inside Actions - it cannot see this one, and two sweeps that both "
+            "read a ticket before either labels it will each comment to every "
+            "watcher, which Jira cannot un-send. Comment the schedule out (or "
+            f"wait out the window), then pass {SCHEDULE_OVERRIDE}")
+
+
 def plan_ticket(st: TicketState, unchanged: bool, force: bool, can_classify: bool,
                 out_of_scope: bool = False, has_open_pr: bool = False) -> str | None:
     """The skip action for this ticket, or None to classify it.
@@ -549,6 +596,9 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                          "(no Anthropic credential needed; see README)")
     ap.add_argument("--force", action="store_true",
                     help="reclassify already-triaged tickets (opt-outs are still respected)")
+    ap.add_argument("--i-paused-the-schedule", action="store_true",
+                    help="for a local --live run while the workflow schedule is "
+                         "enabled: asserts no scheduled sweep can fire concurrently")
     ap.add_argument("--no-pr-check", action="store_true",
                     help="skip the GitHub open-PR backstop (offline runs; re-opens the "
                          "dev-panel gap documented in triage/github.py)")
@@ -577,6 +627,12 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     bot_id = os.environ.get("TRIAGE_BOT_ACCOUNT_ID")
     if args.live and not (jira.authenticated and bot_id):
         sys.exit("--live needs JIRA_EMAIL, JIRA_API_TOKEN and TRIAGE_BOT_ACCOUNT_ID")
+    # Checked before bot_identity_error's request: this is a purely local fault,
+    # and the operator should learn about it without waiting on the network.
+    if args.live and not args.i_paused_the_schedule:
+        clash = schedule_conflict(ROOT, os.environ.get("GITHUB_ACTIONS") == "true")
+        if clash:
+            sys.exit(clash)
     mismatch = bot_identity_error(jira, bot_id)
     if mismatch and args.live:
         sys.exit(mismatch)

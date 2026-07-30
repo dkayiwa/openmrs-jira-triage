@@ -106,6 +106,15 @@ Code session using your own account:
 .venv/bin/python -m triage.run --classifications out/classifications.json --live
 ```
 
+This is the path to use when the Anthropic credit runs out: step 3 constructs no
+Anthropic client at all, so a live run needs only the bot's Jira credentials. Two
+things to know before relying on it. A local `--live` run is refused while the
+workflow `schedule` block is active (see the go-live checklist) — comment it out
+and pass `--i-paused-the-schedule`. And because each ticket records
+`source=file`, `triage.metrics` will print NO DECISION and list those tickets
+until a pinned-model sweep re-classifies them: the replay keeps the pilot moving,
+but it does not produce measurable weeks.
+
 The apply sweep may be wider than the file: a ticket with no entry is journalled
 `skip-unclassified` and left alone, so a file covering part of the cohort is a
 normal way to work through it in batches. Only the gather step writes the
@@ -260,10 +269,13 @@ phase, every human label-removal gets added here as a new case.
    ADOPT / EXTEND / STOP against the pre-registered thresholds, computed purely
    from Jira changelogs (set `pilot_launch` in config first). Pair with a native
    Jira filter subscription for the dashboard digest.
-   Never run `--live` locally while the scheduled sweep may be running: the
-   workflow's `concurrency` group only serialises runs inside Actions, and two
-   sweeps that both read a ticket before either labels it will each post a
-   comment to every watcher.
+   A local `--live` run while the scheduled sweep may fire is **refused**, not
+   merely discouraged: the workflow's `concurrency` group only serialises runs
+   inside Actions, and two sweeps that both read a ticket before either labels it
+   will each post a comment to every watcher — which Jira Cloud cannot un-send.
+   Comment the `schedule` block out, then pass `--i-paused-the-schedule`. The
+   check is skipped inside Actions (where the concurrency group already does the
+   job) and fails closed if the workflow file cannot be read.
 
    **Rehearse this before launch.** Most of `metrics.py` sits behind
    `if not st.bot_first_labeled_at: continue`, so until the bot has labelled
