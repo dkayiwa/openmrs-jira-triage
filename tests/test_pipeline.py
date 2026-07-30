@@ -1413,6 +1413,39 @@ class GitHubClientTests(unittest.TestCase):
         client.open_pr_urls("O3-1")
         self.assertTrue(any(25 <= s <= 31 for s in self.slept), self.slept)
 
+    def test_an_empty_body_is_not_read_as_no_open_pr(self):
+        # A 200 with no body (proxy, dropped response) used to become {} and then
+        # an empty result list - fabricating the absence proof this module exists
+        # to supply. In --live that labels and comments on a ticket already in
+        # review, publicly and unsendably.
+        blank = gh_response([])
+        blank.text = ""
+        client = self._client([blank])
+        with self.assertRaises(gh.GitHubError):
+            client.open_pr_urls("O3-1")
+
+    def test_a_timed_out_search_is_not_read_as_no_open_pr(self):
+        # GitHub sets incomplete_results when its own search times out, so an
+        # empty result means "we did not finish looking".
+        resp = gh_response([])
+        resp.text = json.dumps({"items": [], "incomplete_results": True})
+        resp._payload = {"items": [], "incomplete_results": True}
+        client = self._client([resp])
+        with self.assertRaises(gh.GitHubError):
+            client.open_pr_urls("O3-1")
+
+    def test_a_truncated_result_set_is_refused(self):
+        # This client does not paginate; if GitHub says there are more matches
+        # than it returned, the unseen ones could hold the key.
+        payload = {"items": [pr(1, title="unrelated")], "total_count": 250}
+        resp = gh_response([])
+        resp.text = json.dumps(payload)
+        resp._payload = payload
+        client = self._client([resp])
+        with self.assertRaises(gh.GitHubError) as caught:
+            client.open_pr_urls("O3-1")
+        self.assertIn("does not paginate", str(caught.exception))
+
     def test_a_server_error_is_reported_not_swallowed(self):
         # Returning "no open PR" on a 500 would re-open the leak silently, on the
         # tickets most likely to be in review.

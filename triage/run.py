@@ -285,6 +285,11 @@ def schedule_conflict(root: pathlib.Path, in_ci: bool) -> str | None:
     file is not ambiguous, though: no workflow means no cron to race.
     """
     if in_ci:
+        # Safe on the strength of the workflow's `concurrency` group, which this
+        # function never reads. That is sound only because the group is pinned by
+        # test_sweeps_cannot_overlap and the workflow runs the suite before the
+        # sweep (test_the_suite_gates_the_sweep) - remove the group and CI fails
+        # before it can write anything. Both tests are load-bearing here.
         return None
     path = root / WORKFLOW
     if not path.exists():

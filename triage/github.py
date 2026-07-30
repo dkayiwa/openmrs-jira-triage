@@ -112,7 +112,32 @@ class GitHubClient:
         if resp.status_code >= 400:
             raise GitHubError(f"GET {SEARCH_URL}?q={query} -> {resp.status_code}: "
                               f"{resp.text[:300]}")
-        return resp.json() if resp.text else {}
+        # Everything below fails CLOSED, for one reason: this module's job is to
+        # prove ABSENCE. A benign-looking empty result is indistinguishable from
+        # a real negative, and the consequence of getting it wrong is labelling
+        # and commenting on a ticket that is already in review - publicly, and
+        # with no way to un-send. A raised error costs one ticket, which the
+        # caller journals and the breaker caps.
+        if not resp.text:
+            raise GitHubError(f"GET {SEARCH_URL}?q={query} -> 200 with an empty body; "
+                              "that is no answer, not 'no open PR'")
+        data = resp.json()
+        # GitHub sets this when its own search timed out. The result set is then
+        # not authoritative, so an empty one means "we did not finish looking".
+        if data.get("incomplete_results"):
+            raise GitHubError(f"GitHub reported incomplete_results for {query}: the "
+                              "search timed out, so an empty result is not evidence "
+                              "that no open PR names this key")
+        items = data.get("items", [])
+        # We do not paginate - one key should never match more than a page of
+        # PRs. If it somehow does, the unseen pages could hold the match, and
+        # silently answering from the first page would be a false negative.
+        total = data.get("total_count", len(items))
+        if total > len(items):
+            raise GitHubError(f"GitHub reported {total} matches for {query} but "
+                              f"returned {len(items)}; this client does not paginate, "
+                              "so the remainder cannot be ruled out")
+        return data
 
     def _retry_after_rate_limit(self, resp, query: str):
         """Wait out a short rate-limit window once, else fail with the reset.
