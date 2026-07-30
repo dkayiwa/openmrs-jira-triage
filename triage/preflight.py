@@ -13,6 +13,8 @@ import argparse
 import os
 import sys
 
+from anthropic import Anthropic
+
 from . import context as ctx
 from .run import bot_identity_error, github_from_env, jira_from_env, load_config
 from .state import PROPERTY_KEY
@@ -258,10 +260,49 @@ def main(argv=None) -> int:
     else:
         print("       (label-charset write test skipped: pass --scratch O3-XXXX with bot credentials)")
 
-    key_state = "ANTHROPIC_API_KEY set" if os.environ.get("ANTHROPIC_API_KEY") \
-        else "no env key (SDK will use an `ant auth login` profile if present)"
-    print(f"       Anthropic credentials: {key_state}")
+    ok &= check_anthropic(cfg)
     return 0 if ok else 1
+
+
+def check_anthropic(cfg: dict) -> bool:
+    """Does the Anthropic credential actually work, and is the pinned model there?
+
+    This line used to report whether an environment variable existed, which is
+    not the same claim: a rotated or revoked key sets it just as well as a
+    working one. The gate would pass, the sweep would then fail every ticket
+    until the breaker aborted it, and the whole reason preflight became a
+    workflow step was to spend one runner-minute here instead.
+
+    GET /v1/models is not a generation call, so this bills nothing - measured
+    at under a second - and a bad key comes back as a clean 401 rather than as
+    31 failed tickets.
+
+    The pinned model is checked against the same response because config.toml
+    naming a model this account cannot reach fails identically and just as
+    late. Absent credentials stay informational rather than fatal: a dry run
+    and a gather need none, and only --live does.
+    """
+    label = "Anthropic credential works"
+    has_env_key = bool(os.environ.get("ANTHROPIC_API_KEY"))
+    pinned = cfg["claude"]["model"]
+    try:
+        available = [m.id for m in Anthropic().models.list(limit=100).data]
+    except Exception as e:
+        if not has_env_key and "authentication" in f"{type(e).__name__}{e}".lower():
+            print("       Anthropic credentials: none configured - fine for a dry run "
+                  "or --no-classify; --live needs ANTHROPIC_API_KEY or `ant auth login`")
+            return True
+        return check(label, False, f"{type(e).__name__}: {e}"[:200])
+    source = "ANTHROPIC_API_KEY" if has_env_key else "`ant auth login` profile"
+    ok = check(label, True, f"authenticated via {source}")
+    # Listed models are paged; only conclude "missing" from a page that could
+    # have held it, or a long account listing would fail a model that is there.
+    if pinned not in available and len(available) < 100:
+        ok &= check(f"pinned model {pinned} is available", False,
+                    f"config.toml pins it but this account lists {sorted(available)[:6]}")
+    else:
+        ok &= check(f"pinned model {pinned} is available", True, "")
+    return ok
 
 
 if __name__ == "__main__":

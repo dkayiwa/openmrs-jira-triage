@@ -20,6 +20,7 @@ import os
 import re
 import sys
 import tempfile
+import types
 import time
 import unittest
 from pathlib import Path
@@ -95,11 +96,43 @@ class StubGitHub:
 _GITHUB_PATCHES = []
 
 
+class StubAnthropicModels:
+    """Stands in for the credential probe so no test reaches the API.
+
+    Same lesson as StubGitHub above, relearned: adding a live probe to
+    preflight without a suite-wide stub sent every preflight test to the real
+    endpoint. The suite went from 2.8s to 17.2s, which is the only reason it
+    was noticed - a slower probe would just have been an unexplained cost on
+    every CI run, and a flaky one an unexplained failure.
+    """
+
+    available = [load_config()["claude"]["model"], "claude-haiku-4-5"]
+    error: Exception | None = None
+
+    def __init__(self, *a, **k):
+        self.models = self
+
+    def list(self, limit=100):
+        if type(self).error:
+            raise type(self).error
+        return types.SimpleNamespace(
+            data=[types.SimpleNamespace(id=m) for m in type(self).available])
+
+    @classmethod
+    def reset(cls):
+        cls.available = [load_config()["claude"]["model"], "claude-haiku-4-5"]
+        cls.error = None
+
+
 def setUpModule():
     # One patch point: preflight builds its client through run.github_from_env,
     # so both entry points resolve GitHubClient in run's namespace.
     StubGitHub.reset()
     patch = mock.patch.object(run, "GitHubClient", StubGitHub)
+    patch.start()
+    _GITHUB_PATCHES.append(patch)
+    StubAnthropicModels.reset()
+    patch = mock.patch.object(preflight, "Anthropic", StubAnthropicModels)
     patch.start()
     _GITHUB_PATCHES.append(patch)
 
@@ -922,7 +955,7 @@ class PreflightTests(unittest.TestCase):
         for probe in ("project_statuses", "fields", "search_keys"):
             rc, report = self._run(self.Stub(raises={probe}))
             self.assertEqual(rc, 1, f"{probe}\n{report}")
-            self.assertIn("Anthropic credentials", report,
+            self.assertIn("Anthropic credential", report,
                           f"{probe} aborted the run\n{report}")
 
     def test_a_missing_scope_status_fails(self):
@@ -975,6 +1008,53 @@ class PreflightTests(unittest.TestCase):
         rc, report = self._run(Amnesiac(), ["--scratch", "O3-1"])
         self.assertEqual(rc, 1)
         self.assertIn("[FAIL] bot can read and write entity properties", report)
+
+    def test_a_rejected_anthropic_key_fails_the_gate(self):
+        # The line this replaces reported whether an environment variable
+        # existed, which a rotated or revoked key satisfies just as well as a
+        # working one. The gate passed, and the sweep then failed all 31
+        # tickets until the breaker aborted - after paying for the Jira reads.
+        # Adding preflight to the workflow was justified as spending one
+        # runner-minute here instead, and this is the credential most likely
+        # to be rotated.
+        self.addCleanup(StubAnthropicModels.reset)
+        StubAnthropicModels.error = RuntimeError("AuthenticationError: 401 invalid x-api-key")
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-ant-revoked"}):
+            rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] Anthropic credential works", report)
+
+    def test_no_anthropic_credential_is_reported_but_not_fatal(self):
+        # A dry run and a gather need no credential; only --live does. Failing
+        # here would make the gate unusable for the two modes that have carried
+        # this whole pilot so far.
+        self.addCleanup(StubAnthropicModels.reset)
+        StubAnthropicModels.error = RuntimeError("AuthenticationError: no api key")
+        with mock.patch.dict(os.environ, {}, clear=True):
+            rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 0, report)
+        self.assertIn("none configured", report)
+
+    def test_a_pinned_model_this_account_cannot_reach_fails_the_gate(self):
+        # config.toml naming a model the account cannot use fails exactly like
+        # a bad key and exactly as late, so it is worth the same free lookup.
+        self.addCleanup(StubAnthropicModels.reset)
+        StubAnthropicModels.available = ["claude-haiku-4-5"]
+        rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 1)
+        self.assertIn(f"[FAIL] pinned model {load_config()['claude']['model']} "
+                      "is available", report)
+
+    def test_a_full_page_of_models_does_not_condemn_the_pinned_one(self):
+        # The listing is paged. Concluding "missing" from a page that was
+        # simply full would fail the gate on a large account for a model that
+        # is there - a false FAIL on the go-live gate is as costly as a false
+        # PASS, because it teaches an operator to override it.
+        self.addCleanup(StubAnthropicModels.reset)
+        StubAnthropicModels.available = [f"model-{i}" for i in range(100)]
+        rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 0, report)
+        self.assertIn("[PASS] pinned model", report)
 
     def test_a_missing_acceptance_criteria_field_fails_the_gate(self):
         # The rubric turns on acceptance criteria being visible - "features need
