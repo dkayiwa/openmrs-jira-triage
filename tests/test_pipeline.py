@@ -1013,6 +1013,24 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("[FAIL] github open-PR backstop", report)
         self.assertIn("--no-pr-check", report)
 
+    def test_the_synthetic_probe_key_cannot_match_a_page_of_prs(self):
+        # GitHub search is full text, so a short key is a loose token. Measured
+        # against the real org: "O3-1" matches 85 open PRs and "O3-0" matches
+        # 139, while _search refuses anything it cannot fit in one page. The
+        # old "-1" fallback was fifteen merged PRs from failing the go-live
+        # gate for a reason unrelated to the backstop - and it is used only
+        # when the cohort is empty, which is when someone is already debugging.
+        class NoTickets(self.Stub):
+            def search_keys(self, jql):
+                self._guard("search_keys")
+                return []
+
+        self._run(NoTickets())
+        probe = StubGitHub.searched[-1] if StubGitHub.searched else ""
+        self.assertTrue(probe.endswith("-999999"),
+                        f"the fallback probe key is {probe!r}, which GitHub's full-text "
+                        "search may match against a whole page of PRs")
+
     def test_a_misconfigured_github_org_fails_the_gate(self):
         """The backstop's own configuration, which nothing pinned.
 

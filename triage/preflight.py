@@ -155,7 +155,17 @@ def main(argv=None) -> int:
         # A key the sweep will actually ask about, so a probe that passes proves
         # the query the pipeline runs - not a simpler one.
         real_key = bool(scope_ok and keys)
-        probe_key = keys[0] if real_key else cfg["jira"]["project"] + "-1"
+        # The synthetic fallback is deliberately a high, implausible number.
+        # GitHub's search is full text, so a short key is a loose token: "O3-1"
+        # matches 85 open PRs in this org today and "O3-0" matches 139 -
+        # measured - and _search refuses any result it cannot fit in one page,
+        # because it does not paginate and an unseen page could hold the match.
+        # So the old "-1" probe sat fifteen merged PRs away from failing the
+        # go-live gate for a reason with nothing to do with the backstop's
+        # health, and it fires only when the cohort is empty, which is exactly
+        # when someone is already debugging something else. "-999999" matches
+        # nothing while exercising the identical query.
+        probe_key = keys[0] if real_key else cfg["jira"]["project"] + "-999999"
         probed, urls = attempt(gh_label, lambda: gh.open_pr_urls(probe_key))
         if probed:
             auth = "GITHUB_TOKEN" if gh.authenticated else \
