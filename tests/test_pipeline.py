@@ -1828,6 +1828,96 @@ class EvalGateTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("missing", report)
 
+    def test_a_duplicate_key_is_refused_rather_than_double_weighted(self):
+        # graded.csv is checked in and hand-edited. A repeated key would count
+        # one human judgement twice in the gate's denominator, and silently -
+        # the agreement percentage would still look ordinary.
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, report = self._run(tmp, [self._case("O3-1"), self._case("O3-1")],
+                                   ["needs_more_info"] * 2)
+        self.assertEqual(rc, 1)
+        self.assertIn("appears more than once", report)
+
+    def test_a_sweep_landing_mid_import_cannot_corrupt_the_answer_key(self):
+        # The race the read-once freeze exists for: out/contexts/<KEY>.txt is
+        # rewritten by every dry-run, and the import used to read it three times
+        # - to verify, to copy, and to hash for storage. A sweep between those
+        # reads froze text nobody graded, beside a hash that agreed with it, and
+        # reported "imported 1". Simulating the rewrite is what makes this bite:
+        # without it, reading once and reading three times are indistinguishable.
+        module = load_evals_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "out").mkdir()
+            module.GRADED, module.CONTEXTS = d / "graded.csv", d / "frozen"
+            graded_text = "TICKET: O3-1\nthe text a human graded\n"
+            src = d / "out" / "O3-1.txt"
+            src.write_text(graded_text)
+            sheet = d / "proposals.csv"
+            with open(sheet, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=run.PROPOSAL_COLUMNS)
+                w.writeheader()
+                w.writerow({"key": "O3-1", "proposed_label": "needs_more_info",
+                            "content_hash": ctx.content_hash(graded_text),
+                            "source": "api", "grade(ok/wrong)": "ok"})
+
+            real_read = Path.read_text
+
+            def sweep_lands_after_the_first_read(self, *a, **kw):
+                out = real_read(self, *a, **kw)
+                if self == src:
+                    src.write_text("TICKET: O3-1\nrewritten by a later sweep\n")
+                return out
+
+            with mock.patch.object(Path, "read_text", sweep_lands_after_the_first_read), \
+                 contextlib.redirect_stdout(io.StringIO()):
+                module.import_proposals(str(sheet), str(d / "out"))
+            row = next(csv.DictReader(open(module.GRADED)))
+            frozen = (module.CONTEXTS / "O3-1.txt").read_text()
+        self.assertEqual(frozen, graded_text, "froze text that was never graded")
+        self.assertEqual(row["content_hash"], ctx.content_hash(graded_text))
+
+    def test_the_frozen_context_matches_the_hash_recorded_beside_it(self):
+        # The invariant the import exists to establish. It used to read the
+        # source three times - check, copy, hash - and out/contexts is rewritten
+        # by every dry-run, so a sweep landing between those reads froze a file
+        # and a hash that agreed with each other and with nothing anyone graded.
+        module = load_evals_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "out").mkdir()
+            module.GRADED, module.CONTEXTS = d / "graded.csv", d / "frozen"
+            text = "TICKET: O3-1\nbody\n"
+            (d / "out" / "O3-1.txt").write_text(text)
+            sheet = d / "proposals.csv"
+            with open(sheet, "w", newline="") as fh:
+                w = csv.DictWriter(fh, fieldnames=run.PROPOSAL_COLUMNS)
+                w.writeheader()
+                w.writerow({"key": "O3-1", "proposed_label": "needs_more_info",
+                            "content_hash": ctx.content_hash(text), "source": "api",
+                            "grade(ok/wrong)": "ok"})
+            with contextlib.redirect_stdout(io.StringIO()):
+                module.import_proposals(str(sheet), str(d / "out"))
+            row = next(csv.DictReader(open(module.GRADED)))
+            frozen = (module.CONTEXTS / "O3-1.txt").read_text()
+        self.assertEqual(row["content_hash"], ctx.content_hash(frozen))
+        self.assertEqual(frozen, text)
+
+    def test_a_non_jira_key_in_the_graded_set_is_refused(self):
+        # graded.csv is checked in and hand-edited, and `key` becomes
+        # CONTEXTS / f"{key}.txt" - a traversal key reads outside the frozen
+        # contexts directory. import_proposals guards this; load_cases did too,
+        # but nothing tested it: removing the guard left the whole suite green.
+        # Asserting the specific message is what makes this test bite - without
+        # the guard the row is still rejected, but for missing its context file.
+        with tempfile.TemporaryDirectory() as tmp:
+            case = self._case("O3-1")
+            case["key"] = "../../../../etc/passwd"
+            case["_context"] = None
+            rc, report = self._run(tmp, [case], ["needs_more_info"])
+        self.assertEqual(rc, 1)
+        self.assertIn("not a Jira issue key", report)
+
     def test_an_unverifiable_case_is_refused_not_scored(self):
         # Previously this warned and then scored the case into the >= 90% gate,
         # contradicting load_cases' own docstring ("refused rather than scored").

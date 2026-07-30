@@ -19,7 +19,6 @@ import argparse
 import csv
 import pathlib
 import re
-import shutil
 import sys
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -96,17 +95,22 @@ def import_proposals(path: str, contexts_dir: str) -> None:
                       "which text was graded; re-export the proposals CSV and "
                       "re-grade from it")
                 continue
-            if content_hash(src.read_text()) != graded_hash:
+            # Read ONCE, then verify and freeze that exact text. This used to
+            # read src three times - to check, to copy, and to hash for storage
+            # - and out/contexts/<KEY>.txt is overwritten by every dry-run. A
+            # sweep landing between those reads left a frozen file and a stored
+            # hash that agreed with each other and with nothing a human had
+            # graded, while "imported N" reported a verified freeze.
+            text = src.read_text()
+            if content_hash(text) != graded_hash:
                 print(f"skip {r['key']}: {src} changed since grading; re-run the "
                       "dry-run for this ticket and re-grade it")
                 continue
             CONTEXTS.mkdir(exist_ok=True)
-            shutil.copy(src, CONTEXTS / src.name)
-            # The hash is recorded, not merely checked here: freezing is the
-            # whole point of evals/contexts/, and without a stored hash a later
-            # edit to a frozen file silently changes what the gate measures.
+            (CONTEXTS / src.name).write_text(text)
+            # The stored hash is the one that was verified, not a fresh read.
             rows[r["key"]] = {"key": r["key"], "expected_label": expected,
-                              "content_hash": content_hash(src.read_text()),
+                              "content_hash": graded_hash,
                               "notes": r.get("grader_notes", "")}
             added += 1
     with open(GRADED, "w", newline="") as fh:
@@ -128,13 +132,21 @@ def load_cases() -> list[dict]:
         sys.exit(f"{GRADED} does not exist - --import-proposals a graded sheet first")
     with open(GRADED) as fh:
         rows = list(csv.DictReader(fh))
-    cases, rejected = [], []
+    cases, rejected, seen = [], [], set()
     for row in rows:
         key = (row.get("key") or "").strip()
         expected = (row.get("expected_label") or "").strip()
         if not KEY_RE.fullmatch(key):
             rejected.append(f"{key!r}: not a Jira issue key")
             continue
+        # graded.csv is checked in and hand-edited. A repeated key would
+        # weight one human judgement twice in the gate's denominator, and
+        # silently - the agreement percentage would still look ordinary.
+        if key in seen:
+            rejected.append(f"{key}: appears more than once, so one grade would "
+                            "count twice toward the gate")
+            continue
+        seen.add(key)
         if expected not in LABEL_KEYS:
             rejected.append(f"{key}: expected_label {expected!r} is not one of {LABEL_KEYS}")
             continue
@@ -222,17 +234,23 @@ def run(min_agreement: float, models: list[str] | None = None) -> int:
     for model in models:
         print(f"{model}:")
         hits, misses = score(model, max_tokens, prompt, cases)
-        results.append((model, hits, hits / len(cases)))
+        # Errors deflate agreement exactly like disagreement does, so a model
+        # that could not be reached reads as "0/12 below" - identical in the
+        # table to one that answered and was wrong every time.
+        errored = sum(1 for _, _, got in misses if got.startswith("ERROR"))
+        results.append((model, hits, hits / len(cases), errored))
         for key, want, got_label in misses:
             print(f"  confusion: {key} {want} -> {got_label}")
         print()
-    width = max(len(m) for m, _, _ in results)
+    width = max(len(m) for m, *_ in results)
     print(f"{'model'.ljust(width)}  agreement        vs {min_agreement:.0%}")
-    for model, hits, agreement in results:
+    for model, hits, agreement, errored in results:
         # Deliberately not PASS/FAIL: that vocabulary belongs to the gate, and a
         # comparison row reading PASS is exactly the misreading this guards.
         standing = "at or above" if agreement >= min_agreement else "below"
         note = "  (pinned)" if model == pinned else ""
+        if errored:
+            note += f"  [{errored} of {len(cases)} errored - not disagreement]"
         print(f"{model.ljust(width)}  {hits}/{len(cases)} {agreement:6.1%}  "
               f"{standing}{note}")
     if pinned not in models:
