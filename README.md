@@ -219,6 +219,32 @@ phase, every human label-removal gets added here as a new case.
    workflow's `concurrency` group only serialises runs inside Actions, and two
    sweeps that both read a ticket before either labels it will each post a
    comment to every watcher.
+
+   **Rehearse this before launch.** Most of `metrics.py` sits behind
+   `if not st.bot_first_labeled_at: continue`, so until the bot has labelled
+   something, a real run walks the whole cohort and exits without touching the
+   property read, the 24h SLA, the removal count or the decision rule. Those have
+   unit tests, but fixtures only prove what their author already believed.
+   `metrics.py` has no opinion about *which* labels it measures, so point
+   `[labels]` at a label already in use and `TRIAGE_BOT_ACCOUNT_ID` at whoever
+   has been adding it, patch both in memory rather than on disk, and the same
+   code walks the same shapes on real bytes. Read-only. The numbers are
+   meaningless as pilot metrics; the code producing them is what runs live.
+
+   Two shapes are worth arranging deliberately, because they are what the
+   guarantees rest on. A ticket the stand-in bot labelled and *someone else*
+   unlabelled must count as an opt-out; a ticket where the stand-in both added
+   and removed the label must **not** - that is the protection against the bot's
+   own label flips reading as a cohort-wide opt-out. Done once against O3-3121
+   (added by one person, removed by another) and O3-4115 (added and removed by
+   the same person 31 seconds apart): 1 of 4, not 2 of 4. The run also settled an
+   open question - anonymous entity-property reads 404 cleanly rather than 401,
+   so a missing property reads as "never triaged" as intended.
+
+   Out of reach this way, and left to their unit tests: the replayed-`source`
+   warning (needs a property only a write can create) and the failed-read
+   NO DECISION path. Both parse data this pipeline writes itself rather than
+   anything Jira's shape can surprise us with.
 8. **Process note for maintainers:** removing an `ai-triage-*` label opts the
    ticket out permanently - including after promoting a ticket to `intro`.
    Leave the ai-triage label in place; the intro metric counts tickets holding
