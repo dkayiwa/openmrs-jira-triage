@@ -23,6 +23,7 @@ import os
 import pathlib
 import sys
 import tomllib
+import unicodedata
 
 from . import context as ctx
 from .classifier import (
@@ -400,7 +401,29 @@ def wiki_safe(text: str) -> str:
     """
     # str() because a Jira field can be present-and-null, and this runs outside
     # the per-ticket try - a TypeError here would escape after the live writes.
-    flattened = " ".join(str(text or "").split()).replace("\\", "")
+    #
+    # Unicode format characters (category Cf) are dropped: bidi overrides
+    # (U+202E) reorder everything after them, and zero-width characters hide
+    # inside otherwise-innocent text. Both survive `.split()` because neither
+    # is whitespace - every whitespace variant, including U+2028 and U+00A0,
+    # is already collapsed by it. The footer telling maintainers that removing
+    # the label opts the ticket out sits directly after the rationale in the
+    # same comment, so an unterminated override lands on exactly the sentence
+    # the opt-out guarantee depends on.
+    #
+    # Found by fuzzing rather than by a live exploit, and worth being exact
+    # about: the one attempt to make the model carry U+202E from a ticket
+    # summary into its rationale did NOT reproduce it. This is the backstop
+    # whose stated premise is that model output is untrusted, so it should not
+    # depend on that attempt having been representative. It costs the emoji
+    # zero-width joiner, which triage prose has no use for.
+    #
+    # Backslashes are dropped BEFORE whitespace is collapsed: doing it after
+    # left a token that was only backslashes behind as a doubled space, which
+    # also made this function non-idempotent.
+    cleaned = "".join(c for c in str(text or "")
+                      if unicodedata.category(c) != "Cf").replace("\\", "")
+    flattened = " ".join(cleaned.split())
     for char in ("[", "!", "<"):
         flattened = flattened.replace(char, "\\" + char)
     return flattened
