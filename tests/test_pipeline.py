@@ -3122,6 +3122,62 @@ class MetricsReportInvariantTests(unittest.TestCase):
         iss["key"] = key
         return iss
 
+    def test_no_external_string_can_forge_a_line_in_the_decision_report(self):
+        """The report is the pilot's decision artifact, printed one item a line.
+
+        run.py already defends the write side: FileClassifier flattens the
+        classifier a classifications file declares, and its comment names this
+        exact attack - "a 'DECISION: ADOPT' line in the pilot's own decision
+        artifact". Nothing defended the read side. These values come back out
+        of a Jira entity property, which anyone with API access to the issue
+        can set, and demonstrating it took one property: the report grew a
+        DECISION: ADOPT line above its genuine NO DECISION.
+
+        The exit code stayed honest throughout, which is the trap - a reader
+        scanning weekly for the verdict line finds one.
+        """
+        forged = ("agent\nsorted within 24h  : 100.0%  [PASS]  (target >= 95%)\n"
+                  "DECISION: ADOPT")
+        good = self._ticket("O3-1", "2026-08-10T09:00:00.000+0000",
+                            "2026-08-10T10:00:00.000+0000")
+        rc, report = self._report({"O3-1": good},
+                                  {"O3-1": {"source": "file", "classifier": forged}})
+        lines = [l.strip() for l in report.splitlines()]
+        self.assertNotIn("DECISION: ADOPT", lines,
+                         "a Jira property forged the pilot's verdict line")
+        self.assertIn("classifier=agent sorted within 24h", report,
+                      "the value must still be reported, on one line")
+        self.assertEqual(rc, 1)
+
+    def test_an_exception_body_cannot_forge_a_line_either(self):
+        # The same read side, different source: this text quotes an API
+        # response body, so a Jira error page or a proxy is enough to reach it
+        # without touching the property store at all.
+        class Forging(MetricsJira):
+            def issue(self, key, fields, expand_changelog=False):
+                raise JiraError("500\nDECISION: ADOPT\nsorted within 24h  : 100.0%")
+
+        cfg = load_config()
+        cfg["metrics"] = dict(cfg["metrics"], pilot_launch=self.LAUNCH)
+        jira = Forging({"O3-1": issue()}, ("O3-1",) * 5, {})
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(metrics, "load_config", lambda: cfg), \
+             mock.patch.object(metrics, "jira_from_env", lambda c: jira), \
+             contextlib.redirect_stdout(io.StringIO()) as out:
+            with self.assertRaises(SystemExit):
+                metrics.main()
+        lines = [l.strip() for l in out.getvalue().splitlines()]
+        self.assertNotIn("DECISION: ADOPT", lines)
+
+    def test_a_huge_error_body_is_bounded_before_it_reaches_the_report(self):
+        # Flattening alone turns a 50KB Jira error page into one 50KB line,
+        # which is not an improvement on the report being unreadable. The
+        # bound came free with the [:200] this replaced, and nothing asserted
+        # it, so it could be dropped silently.
+        self.assertLessEqual(len(metrics.one_line("x" * 50000)), 200)
+        self.assertLessEqual(len(metrics.one_line("y" * 50000, 60)), 60)
+        self.assertEqual(metrics.one_line("a\n\tb  c"), "a b c")
+
     def test_one_unreadable_ticket_does_not_discard_the_cohort_walked_before_it(self):
         # Coverage found this handler at 0%. The walk is hundreds of requests
         # long, so a single 500 escaping the loop throws away every paid read

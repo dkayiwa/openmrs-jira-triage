@@ -38,6 +38,27 @@ def parse_launch(value: str | None) -> datetime.datetime:
     return datetime.datetime.combine(date, datetime.time(), datetime.timezone.utc)
 
 
+def one_line(value, limit: int = 200) -> str:
+    """Collapse an externally-sourced string to a single bounded line.
+
+    This report IS the pilot's decision artifact: it ends in a DECISION line
+    that Dennis and Veronica read weekly, and every list below is printed one
+    item per line. Any value that reaches it carrying a newline can forge a
+    line - including a convincing "DECISION: ADOPT" above the genuine verdict.
+
+    run.py already defends the other end of this pipe. FileClassifier flattens
+    the classifier name a classifications file declares, and says why in as
+    many words: "an unchecked newline could forge a per-ticket log line or a
+    'DECISION: ADOPT' line in the pilot's own decision artifact". That guard
+    only covers what this pipeline writes. These values are read back out of
+    Jira entity properties, out of Jira display names, and out of exception
+    text quoting an API response body - none of which this code wrote, and the
+    property store in particular is editable by anyone with API access to the
+    issue. Defending the write side alone was the gap.
+    """
+    return " ".join(str(value).split())[:limit]
+
+
 def sla_met(created: str, labeled_at: str, launch: datetime.datetime) -> bool:
     """Was the ticket sorted within 24h of entering scope?
 
@@ -89,13 +110,13 @@ def main() -> int:
             issue = jira.issue(key, ["created", "labels"], expand_changelog=True)
             st = inspect(issue, ai_labels, bot_id, jira.changelog(key, issue.get("changelog")))
         except Exception as e:
-            failed.append(f"{key}: {type(e).__name__}: {e}"[:200])
+            failed.append(one_line(f"{key}: {type(e).__name__}: {e}"))
             continue
         # Collected before the bot-labeled filter: a maintainer hand-applying an
         # ai-triage label to a ticket the bot never touched is the violation
         # most worth seeing.
         if st.human_adds:
-            violations.append(f"{key}: {', '.join(st.human_adds)}")
+            violations.append(one_line(f"{key}: {', '.join(st.human_adds)}"))
         if not st.bot_first_labeled_at:
             continue
         # The changelog cannot distinguish a replayed label from a pinned-model
@@ -108,7 +129,7 @@ def main() -> int:
         try:
             prop = jira.get_property(key, PROPERTY_KEY)
         except Exception as e:
-            failed.append(f"{key}: reading {PROPERTY_KEY}: {type(e).__name__}: {e}"[:200])
+            failed.append(one_line(f"{key}: reading {PROPERTY_KEY}: {type(e).__name__}: {e}"))
             continue
         # Computed before anything is counted. A missing `created`, or a
         # timestamp fromisoformat cannot parse from either the field or the
@@ -118,7 +139,7 @@ def main() -> int:
         try:
             met_sla = sla_met(issue["fields"]["created"], st.bot_first_labeled_at, launch)
         except Exception as e:
-            failed.append(f"{key}: computing the 24h SLA: {type(e).__name__}: {e}"[:200])
+            failed.append(one_line(f"{key}: computing the 24h SLA: {type(e).__name__}: {e}"))
             continue
         labeled += 1
         # A bot-labelled ticket with NO property is unknown provenance, not api
@@ -139,7 +160,7 @@ def main() -> int:
         else:
             source, classifier = f"malformed ({type(prop).__name__})", None
         if source != "api":
-            replayed.append(f"{key}: source={source} classifier={classifier}")
+            replayed.append(f"{key}: source={one_line(source, 60)} classifier={one_line(classifier, 120)}")
         if met_sla:
             within += 1
         if st.opted_out:
