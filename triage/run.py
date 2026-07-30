@@ -632,7 +632,21 @@ def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime
                   "for these, so <code>scope_jql</code> returned them; the open-PR "
                   "backstop caught them.</p>", "<ul>"]
         for row in excluded:
-            links = " ".join(f'<a href="{esc(u)}">{esc(u)}</a>' for u in row["open_prs"])
+            # Linked only when it is a link. github.py emits a plain-text
+            # stand-in ("openmrs PR #123 (no URL returned)") when the API
+            # returns neither html_url nor url, and says why in as many words:
+            # a synthesised reference "reaches the report as an href and
+            # renders as a link that goes nowhere, which is worse than plain
+            # text a reviewer can search for". Wrapping every entry in an
+            # anchor defeated that - the stand-in became
+            # <a href="openmrs PR #123 (no URL returned)">, a relative href
+            # that 404s - so the producer's care was undone by the consumer.
+            # This is the evidence list for tickets held out of scope, which is
+            # exactly where a reviewer follows the link to check the claim.
+            links = " ".join(
+                f'<a href="{esc(u)}">{esc(u)}</a>' if u.startswith(("http://", "https://"))
+                else f"<code>{esc(u)}</code>"
+                for u in row["open_prs"])
             parts.append(f'<li><a href="{url}{esc(row["key"])}">{esc(row["key"])}</a> '
                          f'{esc(row["summary"])} &mdash; {links}</li>')
         parts.append("</ul>")

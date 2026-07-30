@@ -687,6 +687,31 @@ class ReportMarkupTests(unittest.TestCase):
     def test_no_element_from_an_untrusted_field_reaches_the_document(self):
         self._assert_inert(self._report(), "Summary")
 
+    def test_a_pr_reference_without_a_url_is_not_rendered_as_a_link(self):
+        # github.py states this guarantee and cannot deliver it alone: it emits
+        # a plain-text stand-in when the API returns no URL, precisely so the
+        # report will not show "a link that goes nowhere". The report wrapped
+        # every entry in an anchor regardless, turning the stand-in into a
+        # relative href that 404s - a documented promise undone one module
+        # over, in the list a reviewer uses to check why a ticket was held out
+        # of scope.
+        cfg = load_config()
+        stamp = datetime.datetime(2026, 8, 1, tzinfo=datetime.timezone.utc)
+        excluded = [{"key": "O3-2", "summary": "s",
+                     "open_prs": ["openmrs PR #123 (no URL returned)",
+                                  "https://github.com/openmrs/x/pull/9"]}]
+        with tempfile.TemporaryDirectory() as d:
+            base = run.proposal_base(Path(d), stamp)
+            html = run.write_comment_report(cfg, base, stamp, [], False, "api",
+                                            excluded, swept=1, errors=0).read_text()
+        hrefs = re.findall(r'<a href="([^"]*)"', html)
+        self.assertIn("https://github.com/openmrs/x/pull/9", hrefs,
+                      "a real PR URL must still be a link")
+        for href in hrefs:
+            self.assertFalse(href.startswith("openmrs PR"),
+                             f"a non-URL was rendered as a link: {href!r}")
+        self.assertIn("no URL returned", html, "the reference must still be shown")
+
     def test_the_replay_banner_escapes_its_self_declared_classifier(self):
         # This banner only renders when source != "api", so the api-path test
         # above never reaches it - and dropping esc() there survived the whole
