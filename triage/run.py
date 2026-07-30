@@ -147,8 +147,20 @@ class FileClassifier:
         if doc.get("prompt_version") != prompt_version:
             sys.exit(f"{path}: classified against prompt {doc.get('prompt_version')!r} "
                      f"but config.toml pins {prompt_version!r}")
-        self.model = doc.get("classifier") or "unattributed"
+        # The one header field, and the only part of this document that
+        # validate_classification never sees. It reaches the run log, the entity
+        # property and the weekly metrics report verbatim, so an unchecked
+        # newline could forge a per-ticket log line or a "DECISION: ADOPT" line
+        # in the pilot's own decision artifact.
+        declared = doc.get("classifier") or "unattributed"
+        if not isinstance(declared, str):
+            sys.exit(f"{path}: classifier must be a string, got {type(declared).__name__}")
+        self.model = " ".join(declared.split())[:120] or "unattributed"
+
         entries = doc.get("classifications") or {}
+        if not isinstance(entries, dict):
+            sys.exit(f"{path}: classifications must be an object, "
+                     f"got {type(entries).__name__}")
         if not entries:
             sys.exit(f"{path}: no classifications in the file")
         self.by_hash: dict[str, Classification] = {}
@@ -196,7 +208,11 @@ class FileClassifier:
         # starts with "TICKET: <key>", so the entry's own key is checkable.
         declared = self.keys[chash]
         actual = context.splitlines()[0].removeprefix("TICKET:").strip()
-        if actual != declared:
+        # Case-insensitive: Jira accepts and normalises a lowercase key, so a
+        # gather run using --keys o3-50 writes the manifest under "o3-50" while
+        # the context says "O3-50". Rejecting that would refuse a file built
+        # faithfully from the manifest.
+        if actual.upper() != declared.upper():
             raise RuntimeError(
                 f"classification is filed under {declared} but this content is "
                 f"{actual}; the content_hash values are mispaired"
@@ -270,11 +286,12 @@ def csv_safe(text: str) -> str:
     =IMPORTXML(...) rationale would exfiltrate the row to a third party with no
     click at all. A leading apostrophe forces the cell to text.
     """
-    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r") else text
+    text = str(text or "")
+    return "'" + text if text[:1] in ("=", "+", "-", "@", "\t", "\r", "\n") else text
 
 
 def wiki_safe(text: str) -> str:
-    """Neutralise Jira wiki constructs in model output that act on third parties.
+    r"""Neutralise Jira wiki constructs in model output that act on third parties.
 
     Ticket text is untrusted and reaches the model, so the model's output is
     untrusted too. In a v2 comment body `[~accountid:...]` renders as a real
@@ -287,12 +304,23 @@ def wiki_safe(text: str) -> str:
     not depend on how Jira renders the escape: either way the construct no
     longer fires.
 
-    Whitespace is collapsed for a second reason: the comment's own structure is
-    line-based (a label line, then the rationale, then a footer), so multi-line
-    model text could forge a second `AI triage: {{...}}` line and a fake footer,
-    making the rendered comment state a label that was never applied.
+    Backslashes are removed FIRST, for two reasons. Escaping by prefix is not
+    idempotent: text supplying its own `\` turns our `\[` into `\\[`, and Jira
+    consumes `\\` as a forced line break, leaving the `[` live - so the mention
+    fired anyway (verified against rendered Jira output). And `\\` is itself a
+    line break, so it could forge a second `AI triage: {{...}}` line and a fake
+    footer, making the comment state a label that was never applied. Collapsing
+    literal newlines is not enough on its own.
+
+    `<` is escaped because this also renders into a Markdown sheet, where raw
+    HTML is live and `<img src>` is the beacon `!url!` would have been.
     """
-    return " ".join(text.split()).replace("[", "\\[").replace("!", "\\!")
+    # str() because a Jira field can be present-and-null, and this runs outside
+    # the per-ticket try - a TypeError here would escape after the live writes.
+    flattened = " ".join(str(text or "").split()).replace("\\", "")
+    for char in ("[", "!", "<"):
+        flattened = flattened.replace(char, "\\" + char)
+    return flattened
 
 
 def comment_body(cfg: dict, c) -> str:
@@ -468,15 +496,19 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             # it graded under two prompt versions. Re-classification is quiet
             # unless the label actually flips.
             prop = {} if not args.live else (jira.get_property(key, PROPERTY_KEY) or {})
-            # The label is a function of content, prompt AND which classifier
-            # produced it, so all three are compared. Without the last, one
-            # replay run would permanently pin those tickets: the pinned-model
-            # pipeline would report skip-already-triaged forever.
+            # Asymmetric on purpose. The pinned-model path must not skip a label
+            # a replay produced, or one replay run would pin those tickets for
+            # the rest of the pilot. The reverse must NOT hold: if a file run
+            # also re-did api-labelled tickets, the two paths would flip the
+            # label back and forth - and comment to every watcher - on every
+            # sweep, since the documented workflow has both touching the cohort.
+            stored_source = prop.get("source", "api")
+            superseded = source == "api" and stored_source != "api"
             unchanged = (
                 not args.live
                 or (prop.get("contentHash") == chash
                     and prop.get("prompt") == cfg["prompt"]["version"]
-                    and prop.get("source", "api") == source)
+                    and not superseded)
             )
             # Scope is re-checked only for live writes: a ticket can transition
             # out of "To Do" between the JQL sweep and this fetch, and labelling
@@ -487,13 +519,13 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             out_of_scope = args.live and status != cfg["jira"]["scope_status"]
             action = plan_ticket(st, unchanged, args.force, classifier is not None,
                                  out_of_scope)
-            # Listed when the ticket is eligible for classification - either it
-            # would be classified now, or the only thing stopping it is that this
-            # run has no classifier (--no-classify, the gather step). Tickets
-            # skipped for a state reason are excluded, so the manifest never
-            # invites an outside classifier to spend effort on a ticket the pilot
-            # has promised never to touch again.
-            if action in (None, "context-only"):
+            # Excluded only for the two reasons that are permanent: an opt-out
+            # the pilot promised to honour, and a ticket that has left scope.
+            # "already-triaged" is NOT permanent - a live run re-classifies it
+            # after a prompt bump or an edit - and the gather step is a dry run
+            # where `unchanged` is unconditionally True, so gating on it dropped
+            # every labelled ticket and left the re-triage backlog unclassified.
+            if action not in ("skip-opted-out", "skip-out-of-scope"):
                 manifest[key] = {
                     "content_hash": chash,
                     "summary": issue["fields"].get("summary", ""),
@@ -575,7 +607,10 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
         (out / "manifest.json").write_text(json.dumps({
             "at": stamp.isoformat(),
             "prompt_version": cfg["prompt"]["version"],
-            "complete": not consecutive >= CONSECUTIVE_ERROR_LIMIT,
+            # False if ANY ticket failed, not just the trailing run of them: an
+            # errored ticket is simply absent from tickets[], so a consumer
+            # trusting `complete` would never classify it.
+            "complete": errors == 0 and (not args.limit or len(keys) < args.limit),
             # The schema of a classifications-file ENTRY, not of the model's
             # response: an entry additionally requires content_hash, and the
             # magnitude caps cannot be expressed in a response schema. A

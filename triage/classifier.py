@@ -116,9 +116,19 @@ def clamp_classification(data: dict) -> list[str]:
         data["confidence"] = min(1.0, max(0.0, float(confidence)))
         notes.append(f"confidence {confidence} clamped to {data['confidence']}")
     rationale = data.get("rationale")
-    if isinstance(rationale, str) and len(rationale) > MAX_RATIONALE:
-        data["rationale"] = rationale[: MAX_RATIONALE - 1].rstrip() + "…"
-        notes.append(f"rationale truncated from {len(rationale)} chars")
+    if isinstance(rationale, str):
+        # Emptiness is tested before truncation, so whitespace-only text of any
+        # length lands here rather than being truncated to a bare ellipsis.
+        # Substituted rather than rejected for the reason in the docstring: a
+        # blank rationale is schema-valid (SCHEMA cannot express minLength), so
+        # rejecting it would re-charge this ticket on every sweep forever. The
+        # marker keeps the label and says plainly that no explanation came back.
+        if not rationale.strip():
+            data["rationale"] = "(the classifier returned no rationale for this label)"
+            notes.append("rationale was empty")
+        elif len(rationale) > MAX_RATIONALE:
+            data["rationale"] = rationale[: MAX_RATIONALE - 1].rstrip() + "…"
+            notes.append(f"rationale truncated from {len(rationale)} chars")
     for key in ("missing_info", "verification_steps"):
         items = data.get(key)
         if not isinstance(items, list):

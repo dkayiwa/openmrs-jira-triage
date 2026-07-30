@@ -12,6 +12,7 @@ import contextlib
 import csv
 import datetime
 import io
+import itertools
 import json
 import os
 import sys
@@ -629,19 +630,22 @@ class EvalImportTests(unittest.TestCase):
         self.assertEqual(graded[0]["expected_label"], "needs_more_info")
 
     def _import(self, context_text, graded_hash, label="needs_more_info",
-                source="api", grade="ok", correct_label=""):
+                source="api", grade="ok", correct_label="", key="O3-1", header=None):
         module = load_evals_module()
+        header = header or self.HEADER
         with tempfile.TemporaryDirectory() as tmp:
             d = Path(tmp)
             (d / "contexts").mkdir()
-            (d / "contexts" / "O3-1.txt").write_text(context_text)
+            if "/" not in key:  # a traversal key has no context to create
+                (d / "contexts" / f"{key}.txt").write_text(context_text)
             proposals = d / "proposals.csv"
+            row = {"key": key, "proposed_label": label, "confidence": "0.90",
+                   "content_hash": graded_hash, "source": source,
+                   "grade(ok/wrong)": grade, "correct_label": correct_label}
             with open(proposals, "w", newline="") as fh:
-                w = csv.DictWriter(fh, fieldnames=self.HEADER)
+                w = csv.DictWriter(fh, fieldnames=header, extrasaction="ignore")
                 w.writeheader()
-                w.writerow({"key": "O3-1", "proposed_label": label, "confidence": "0.90",
-                            "content_hash": graded_hash, "source": source,
-                            "grade(ok/wrong)": grade, "correct_label": correct_label})
+                w.writerow(row)
             # Redirected off the committed evals/ directory.
             module.GRADED = d / "graded.csv"
             module.CONTEXTS = d / "frozen"
@@ -671,6 +675,21 @@ class EvalImportTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertIn("source=file", log)
 
+    def test_absent_source_column_fails_closed(self):
+        # This gate authorises go-live, so unknown provenance must not read as
+        # proven-api provenance.
+        text = "TICKET: O3-1\n"
+        rows, log = self._import(text, ctx.content_hash(text),
+                                 header=[c for c in run.PROPOSAL_COLUMNS if c != "source"])
+        self.assertEqual(rows, [])
+        self.assertIn("no source column", log)
+
+    def test_a_key_that_is_not_a_jira_key_is_skipped(self):
+        # The key becomes a filesystem path and is stored for later reads.
+        rows, log = self._import("x", "", key="../../../../etc/passwd")
+        self.assertEqual(rows, [])
+        self.assertIn("not a Jira issue key", log)
+
     def test_wrong_graded_replay_is_admitted_because_the_label_is_human(self):
         rows, _ = self._import("TICKET: O3-1\n", ctx.content_hash("TICKET: O3-1\n"),
                                source="file", grade="wrong", correct_label="needs_judgment")
@@ -687,9 +706,11 @@ class MetricsJira:
     def __init__(self, issues, intro_keys, properties=None):
         self.issues = issues
         self.intro_keys = list(intro_keys)
-        self.properties = properties or {}
+        self.properties = properties if properties is not None else {}
 
     def get_property(self, key, prop):
+        if self.properties == "raise":
+            raise JiraError("429 Too Many Requests")
         return self.properties.get(key)
 
     def search_keys(self, jql):
@@ -747,6 +768,16 @@ class MetricsWiringTests(unittest.TestCase):
         self.assertIn("session-agent", report)
         self.assertIn("NO DECISION", report)
         self.assertNotIn("DECISION: ADOPT", report)
+
+    def test_every_property_read_failing_reports_the_failures(self):
+        # A rate-limit window hits every ticket at once. Reporting "the bot has
+        # labelled nothing" would be the opposite of the truth, and would discard
+        # the diagnostic list that explains it.
+        with self.assertRaises(SystemExit) as caught:
+            self._report(self._labeled("2026-08-10T09:00:00.000+0000",
+                                       "2026-08-10T11:00:00.000+0000"),
+                         properties="raise")
+        self.assertIn("resolve the failures above", str(caught.exception))
 
     def test_a_property_without_source_counts_as_api(self):
         # Properties written before `source` existed must not read as replayed.
@@ -992,6 +1023,37 @@ class LiveRunTests(unittest.TestCase):
         self.assertEqual(len(rows), len(keys), "the sweep must not abort early")
         self.assertEqual(sum(r["action"] == "skip-unclassified" for r in rows), 8)
 
+    def test_the_two_paths_do_not_flip_the_label_back_and_forth(self):
+        # The idempotency rule is asymmetric on purpose. If a file run also
+        # re-did api-labelled tickets, the documented batch workflow plus the
+        # 4-hourly sweep would swap the label and comment to every watcher
+        # forever, with nothing about the ticket having changed.
+        jira = RecordingJira({"O3-1": issue()})
+        text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
+        with tempfile.TemporaryDirectory() as d:
+            path = Path(d) / "c.json"
+            path.write_text(json.dumps({
+                "prompt_version": "v1", "classifier": "agent",
+                "classifications": {"O3-1": dict(GOOD, content_hash=ctx.content_hash(text),
+                                                 label="needs_judgment", missing_info=[])},
+            }))
+            self._run(jira)                      # api labels it needs_more_info
+            jira.writes.clear()
+            self._replay(jira, path, Path(d))    # file run must leave it alone
+            self.assertEqual(jira.writes, [], "a file run must not re-do an api label")
+            row = self._run(jira)                # api run must also leave it alone
+        self.assertEqual(row["action"], "skip-already-triaged")
+        self.assertEqual(jira.writes, [])
+
+    def _replay(self, jira, path, out):
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+             mock.patch.object(run, "Classifier", lambda *a: None), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            return run.main(["--live", "--keys", "O3-1", "--classifications", str(path)],
+                            out=out)
+
     def test_replayed_label_does_not_block_the_pinned_model(self):
         # Without comparing source, one replay run would pin those tickets for
         # the rest of the pilot: the API pipeline would skip them forever.
@@ -1098,6 +1160,16 @@ class ClampTests(unittest.TestCase):
         self.assertEqual(data["confidence"], 1.0)
         self.assertEqual(validate_classification(data), [])
 
+    def test_blank_rationale_is_substituted_not_rejected(self):
+        # Schema-valid (SCHEMA cannot express minLength), so rejecting it would
+        # re-charge this ticket on every sweep forever.
+        for blank in ("", "   ", "\n\t ", " " * 3000):
+            data = dict(GOOD, rationale=blank)
+            notes = clamp_classification(data)
+            self.assertEqual(validate_classification(data), [], repr(blank))
+            self.assertIn("no rationale", data["rationale"])
+            self.assertIn("rationale was empty", notes)
+
     def test_valid_data_is_left_alone(self):
         data = dict(GOOD)
         self.assertEqual(clamp_classification(data), [])
@@ -1130,6 +1202,54 @@ class SinkEscapingTests(unittest.TestCase):
         self.assertEqual([i for i, l in enumerate(lines) if l.startswith("_Applied by")],
                          [len(lines) - 1])
         self.assertIn("ai-triage-needs-more-info", lines[0])
+
+    def test_a_supplied_backslash_cannot_rearm_the_escape(self):
+        # Escaping by prefix is not idempotent: text supplying its own backslash
+        # turned our \[ into \\[, which Jira consumes as a line break, leaving
+        # the mention live. Verified against real Jira rendering.
+        body = comment_body(load_config(), Classification(
+            "needs_more_info", r"contact \[~accountid:712020:9f0d] for the spec",
+            [r"see \!https://attacker.example/beacon.png\!"], [], 0.5, "m"))
+        self.assertNotIn("\\\\", body, "no doubled backslash can survive")
+        self.assertNotIn("[~accountid", body.replace("\\[~accountid", ""))
+        self.assertNotIn("!https", body.replace("\\!https", ""))
+
+    def test_a_forced_line_break_cannot_forge_a_verdict(self):
+        # \\ renders as a line break in Jira, so collapsing literal newlines was
+        # not enough on its own to stop a forged second verdict block.
+        forged = (r"Not enough detail. \\ \\ AI triage: {{ai-triage-automation-candidate}}"
+                  r" \\ \\ _Applied by the triage pilot bot_")
+        body = comment_body(load_config(), Classification(
+            "needs_more_info", forged, ["x"], [], 0.5, "m"))
+        self.assertNotIn("\\\\", body)
+
+    def test_raw_html_is_escaped_in_the_markdown_sheet(self):
+        hostile = Classification(
+            "needs_more_info",
+            'x <img src="https://attacker.example/b.png"> <h2>AI triage: cleared</h2>',
+            [], [], 0.5, "m")
+        stamp = datetime.datetime(2026, 8, 1, 9, 0, tzinfo=datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            base = run.write_proposals(load_config(), Path(d), stamp,
+                                       [(issue(), hostile, "h")], live=False)
+            md = base.with_suffix(".md").read_text()
+        # No unescaped angle bracket survives, so no raw HTML element renders.
+        self.assertNotIn("<", md.replace("\\<", ""))
+        self.assertIn("\\<img", md, "the text is preserved, just inert")
+
+    def test_null_summary_does_not_crash_either_sink(self):
+        # The field can be present-and-null, and write_proposals runs outside the
+        # per-ticket try, so a TypeError here escapes after the live writes.
+        self.assertEqual(run.csv_safe(None), "")
+        self.assertEqual(run.wiki_safe(None), "")
+        iss = issue()
+        iss["fields"]["summary"] = None
+        stamp = datetime.datetime(2026, 8, 1, 9, 0, tzinfo=datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            base = run.write_proposals(load_config(), Path(d), stamp,
+                                       [(iss, Classification("needs_more_info", "r", ["x"],
+                                                             [], 0.5, "m"), "h")], live=False)
+            self.assertTrue(base.with_suffix(".csv").is_file())
 
     def test_grading_sheet_escapes_both_sinks(self):
         hostile = Classification(
@@ -1219,6 +1339,186 @@ GOOD = {"label": "needs_more_info", "rationale": "No repro.",
         "missing_info": ["repro steps"], "verification_steps": [], "confidence": 0.9}
 
 
+class DecisionChainInvariantTests(unittest.TestCase):
+    """Drive main() over the decision chain's whole state space.
+
+    Every regression this pipeline has shipped lived in a seam between two
+    individually-correct rules - the label/comment ordering, the content+prompt
+    idempotency key, the source term, the error breaker. Reviewers have to
+    imagine those seams one at a time. This enumerates them instead, and asserts
+    the handful of properties that must hold in EVERY state rather than checking
+    named scenarios.
+    """
+
+    LABELS = ([], [AI[0]], [AI[2]])
+    PROPERTIES = ("absent", "matching", "stale-hash", "stale-prompt", "replayed")
+    STATUSES = ("To Do", "In Progress")
+
+    # Every classification carries a hostile payload, so invariant 4 is checked
+    # against real constructs in every state rather than against inert prose.
+    # Without this the harness passed with all escaping removed.
+    HOSTILE_RATIONALE = (r"contact \[~accountid:712020:9f0d] and see "
+                         r"!https://attacker.example/b.png! <img src=x> \\ \\ done")
+    HOSTILE_ITEM = r"ping \[~accountid:712020:def] <b>now</b>"
+
+    def _issue(self, labels, status, opted_out):
+        histories = [label_change("u1", AI[2], "")] if opted_out else []
+        iss = issue(labels=list(labels), histories=histories, status={"name": status})
+        iss["changelog"]["total"] = len(histories)
+        return iss
+
+    def _property_for(self, kind, chash, label):
+        if kind == "absent":
+            return None
+        base = {"contentHash": chash, "label": label, "prompt": "v1",
+                "source": "api", "classifier": "m"}
+        if kind == "stale-hash":
+            base["contentHash"] = "0" * 16
+        elif kind == "stale-prompt":
+            base["prompt"] = "v0"
+        elif kind == "replayed":
+            base["source"] = "file"
+        return base
+
+    def _run_once(self, jira, out, decided, live, force, path=None):
+        argv = ["--keys", "O3-1"]
+        if live:
+            argv.append("--live")
+        if force:
+            argv.append("--force")
+        if path:
+            argv += ["--classifications", str(path)]
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+             mock.patch.object(run, "Classifier",
+                               lambda *a: StubClassifier(decided)), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            return run.main(argv, out=out)
+
+    def test_invariants_hold_across_the_state_space(self):
+        cfg = load_config()
+        scope_status = cfg["jira"]["scope_status"]
+        checked = 0
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            for labels, prop_kind, status, opted_out, force, decided_label in itertools.product(
+                    self.LABELS, self.PROPERTIES, self.STATUSES, (False, True),
+                    (False, True), ("needs_more_info", "automation_candidate")):
+                decided = Classification(decided_label, self.HOSTILE_RATIONALE,
+                                         [self.HOSTILE_ITEM], [], 0.9, "m")
+                label_name = cfg["labels"][decided_label]
+                jira = RecordingJira({"O3-1": self._issue(labels, status, opted_out)})
+                text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
+                stored = self._property_for(prop_kind, ctx.content_hash(text), label_name)
+                if stored:
+                    jira.properties["O3-1"] = stored
+                rc = self._run_once(jira, out, decided, live=True, force=force)
+                writes = jira.writes
+                state = (f"labels={labels} prop={prop_kind} status={status} "
+                         f"opted_out={opted_out} force={force} decided={decided_label}")
+                checked += 1
+
+                # 1. An opt-out is permanent and unconditional.
+                if opted_out:
+                    self.assertEqual(writes, [], f"wrote to an opted-out ticket: {state}")
+                    continue
+                # 2. A ticket outside scope is never written to in live mode.
+                if status != scope_status:
+                    self.assertEqual(writes, [], f"wrote out of scope: {state}")
+                    continue
+                # 3. At most one comment per run, and a comment only ever
+                #    accompanies a label that is new to the ticket.
+                comments = [w for w in writes if w[0] == "comment"]
+                self.assertLessEqual(len(comments), 1, f"multiple comments: {state}")
+                if comments:
+                    added = [w for w in writes if w[0] == "labels" and label_name in w[2]]
+                    self.assertTrue(added, f"commented without adding the label: {state}")
+                # 4. Nothing untrusted renders live in a comment body.
+                for comment in comments:
+                    body = comment[2]
+                    self.assertNotIn("\\\\", body, f"doubled backslash: {state}")
+                    for char in ("[", "!", "<"):
+                        self.assertNotIn(char, body.replace("\\" + char, "")
+                                         .replace("{{", "").replace("}}", ""),
+                                         f"unescaped {char!r}: {state}")
+                # 5. Exactly one ai-triage label afterwards, and it is the
+                #    decided one, whenever any write happened.
+                if writes:
+                    present = [l for l in jira.issues["O3-1"]["fields"]["labels"]
+                               if l in AI]
+                    self.assertEqual(present, [label_name], f"label set wrong: {state}")
+                # 6. Success is reported iff nothing errored.
+                self.assertEqual(rc, 0, f"nonzero exit with no fault: {state}")
+                # 7. Liveness. The invariants above are all "nothing bad
+                #    happens"; on their own they are satisfied by a pipeline that
+                #    does nothing at all, and dropping a term from the
+                #    idempotency key is precisely a failure to act. So the skip
+                #    decision is specified in full: a ticket is skipped exactly
+                #    when it already carries a label whose stored triage still
+                #    matches on all three of content, prompt and classifier.
+                triaged = (stored is not None
+                           and stored["contentHash"] == ctx.content_hash(text)
+                           and stored["prompt"] == cfg["prompt"]["version"]
+                           and stored["source"] == "api")
+                if labels and triaged and not force:
+                    self.assertEqual(writes, [], f"should have skipped: {state}")
+                else:
+                    self.assertTrue(any(w[0] == "property" for w in writes),
+                                    f"should have re-classified: {state}")
+
+                # 8. Idempotence: an immediate identical re-run must not
+                #    comment again. This is the property the flip-flop broke.
+                jira.writes.clear()
+                self._run_once(jira, out, decided, live=True, force=force)
+                self.assertEqual([w for w in jira.writes if w[0] == "comment"], [],
+                                 f"re-commented on an unchanged ticket: {state}")
+        self.assertGreater(checked, 200, "the space should be non-trivial")
+
+    def test_alternating_the_two_paths_converges(self):
+        """Alternating the API sweep and a replay run must stop writing.
+
+        One supersession is legitimate: the pinned-model path is authoritative,
+        so replacing a replayed label - and commenting to explain the new one -
+        is correct. The defect the flip-flop introduced was that it never
+        *terminated*: each sweep swapped the label back and comment again, every
+        four hours, forever. So the property is convergence, not silence.
+        """
+        # The two paths must DISAGREE on the label here: agreement hides the bug,
+        # because plan_label_writes only comments on a label new to the ticket.
+        # A replay classifier and the pinned model will not always agree.
+        for first_is_api, (api_label, file_label) in itertools.product(
+                (True, False),
+                (("needs_more_info", "needs_judgment"),
+                 ("automation_candidate", "needs_more_info"))):
+            decided = Classification(api_label, "Because.", ["x"], [], 0.9, "m")
+            jira = RecordingJira({"O3-1": issue()})
+            with tempfile.TemporaryDirectory() as tmp:
+                out = Path(tmp)
+                text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
+                path = out / "c.json"
+                path.write_text(json.dumps({
+                    "prompt_version": "v1", "classifier": "agent",
+                    "classifications": {"O3-1": {
+                        "content_hash": ctx.content_hash(text), "label": file_label,
+                        "rationale": "Because.", "missing_info": [],
+                        "verification_steps": [], "confidence": 0.9}},
+                }))
+                order = [None, path] if first_is_api else [path, None]
+                comments = []
+                for round_index in range(6):
+                    jira.writes.clear()
+                    self._run_once(jira, out, decided, live=True, force=False,
+                                   path=order[round_index % 2])
+                    comments.append(len([w for w in jira.writes if w[0] == "comment"]))
+                state = (f"api first: {first_is_api}, api={api_label}, "
+                         f"file={file_label}, comments per round: {comments}")
+                # Settles within the first two rounds: the initial label, then at
+                # most one supersession. Nothing after that.
+                self.assertEqual(comments[2:], [0, 0, 0, 0], f"did not converge - {state}")
+                self.assertLessEqual(sum(comments), 2, f"too many comments - {state}")
+
+
 class ManifestRoundTripTests(unittest.TestCase):
     """Gather -> classify from the manifest -> apply, with nothing hand-copied."""
 
@@ -1285,6 +1585,41 @@ class ManifestRoundTripTests(unittest.TestCase):
                 after = (out / "manifest.json").read_text()
         self.assertEqual(before, after,
                          "a narrower apply run must not clobber the gather's manifest")
+
+    def _gather(self, jira, keys, out):
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+             mock.patch.object(run, "Classifier", lambda *a: None), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            run.main(["--no-classify", "--keys", keys], out=out)
+        return json.loads((out / "manifest.json").read_text())
+
+    def test_already_triaged_tickets_are_still_offered(self):
+        # Not a permanent skip: a live run re-classifies these after a prompt bump
+        # or an edit, and the gather step is a dry run where `unchanged` is
+        # unconditionally True - so gating the manifest on it dropped the entire
+        # re-triage backlog.
+        jira = RecordingJira({"O3-1": issue(labels=[AI[2]])})
+        with tempfile.TemporaryDirectory() as d:
+            manifest = self._gather(jira, "O3-1", Path(d))
+        self.assertEqual(sorted(manifest["tickets"]), ["O3-1"])
+
+    def test_complete_is_false_when_any_ticket_failed(self):
+        # An errored ticket is simply absent from tickets[], so a consumer
+        # trusting `complete` would never classify it.
+        class Flaky(RecordingJira):
+            def issue(self, key, fields, expand_changelog=False):
+                if key == "O3-2":
+                    raise JiraError("500 Internal Server Error")
+                return self.issues[key]
+
+        jira = Flaky({"O3-1": issue(), "O3-2": issue()})
+        jira.issues["O3-2"]["key"] = "O3-2"
+        with tempfile.TemporaryDirectory() as d:
+            manifest = self._gather(jira, "O3-1,O3-2", Path(d))
+        self.assertEqual(sorted(manifest["tickets"]), ["O3-1"])
+        self.assertFalse(manifest["complete"])
 
     def test_skipped_tickets_are_not_offered_for_classification(self):
         # An opted-out ticket must not be advertised: the pilot promised never to
@@ -1398,6 +1733,52 @@ class FileClassifierTests(unittest.TestCase):
         with self.assertRaises(RuntimeError) as caught:
             fc.classify(one)
         self.assertIn("mispaired", str(caught.exception))
+
+    def test_classifier_string_cannot_forge_log_or_report_lines(self):
+        # The one header field validate_classification never sees. It reaches the
+        # run log, the entity property and the weekly decision report verbatim.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps({
+                "prompt_version": "v1",
+                "classifier": "opus-5\n  O3-1: skip-opted-out\n\nDECISION: ADOPT",
+                "classifications": {"O3-1": dict(GOOD, content_hash="abc")},
+            }))
+            fc = run.FileClassifier(path, "v1")
+        self.assertNotIn("\n", fc.model)
+        self.assertNotIn("DECISION: ADOPT\n", fc.model)
+
+    def test_non_string_classifier_is_refused(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps({
+                "prompt_version": "v1", "classifier": {"nested": "x"},
+                "classifications": {"O3-1": dict(GOOD, content_hash="abc")},
+            }))
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("classifier must be a string", str(caught.exception))
+
+    def test_classifications_as_a_list_is_named_not_a_traceback(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps({"prompt_version": "v1", "classifications": ["x"]}))
+            with self.assertRaises(SystemExit) as caught:
+                run.FileClassifier(path, "v1")
+        self.assertIn("must be an object", str(caught.exception))
+
+    def test_lowercase_ticket_key_still_matches(self):
+        # Jira normalises a lowercase key, so a gather run with --keys o3-1 writes
+        # the manifest under "o3-1" while the context says "TICKET: O3-1".
+        text = "TICKET: O3-1\nSUMMARY: a\n"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "c.json"
+            path.write_text(json.dumps({
+                "prompt_version": "v1", "classifier": "agent",
+                "classifications": {"o3-1": dict(GOOD, content_hash=ctx.content_hash(text))},
+            }))
+            fc = run.FileClassifier(path, "v1")
+        self.assertEqual(fc.classify(text).label, "needs_more_info")
 
     def test_boolean_confidence_is_refused(self):
         # bool is an int in Python; unguarded this renders as a confidence of

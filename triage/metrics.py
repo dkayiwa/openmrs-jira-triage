@@ -98,16 +98,19 @@ def main() -> int:
             violations.append(f"{key}: {', '.join(st.human_adds)}")
         if not st.bot_first_labeled_at:
             continue
-        labeled += 1
         # The changelog cannot distinguish a replayed label from a pinned-model
         # one - the bot's credentials wrote both - so the entity property is
         # consulted for the labelled tickets only. Without this the three
         # pre-registered metrics would silently pool two different systems.
+        # Read before the accounting below, so a failed read excludes the ticket
+        # entirely rather than counting it in the denominator while skipping its
+        # contribution to the numerators.
         try:
             prop = jira.get_property(key, PROPERTY_KEY) or {}
         except Exception as e:
             failed.append(f"{key}: reading {PROPERTY_KEY}: {type(e).__name__}: {e}"[:200])
             continue
+        labeled += 1
         if prop.get("source", "api") != "api":
             replayed.append(f"{key}: source={prop.get('source')} "
                             f"classifier={prop.get('classifier')}")
@@ -115,6 +118,15 @@ def main() -> int:
             within += 1
         if st.opted_out:
             removed += 1
+    if failed and not labeled:
+        # Checked before the no-tickets exit: a rate-limit or auth window fails
+        # every property read at once, and reporting "the bot has labelled
+        # nothing" would be the opposite of the truth while discarding the
+        # diagnostic list that explains it.
+        print(f"{len(failed)} of {len(cohort_keys)} cohort ticket(s) could not be read:")
+        for f in failed:
+            print(f"  {f}")
+        sys.exit("no metrics computed - resolve the failures above and re-run")
     if not labeled:
         sys.exit("no bot-labeled tickets in the cohort yet - metrics apply to the live phase")
 
@@ -150,9 +162,15 @@ def main() -> int:
         for r in replayed:
             print(f"  {r}")
         print("\nNO DECISION: the pre-registered thresholds assume one pinned model and "
-              "prompt per label, so this cohort mixes two systems. Re-classify the "
-              "tickets above with the API path (--force), or exclude them by agreement "
-              "with the pilot owners before deciding.")
+              "prompt per label, so this cohort mixes two systems.")
+        print("A plain live sweep re-classifies these (the source mismatch alone makes "
+              "them stale - --force is not needed and would re-charge the whole cohort). "
+              "Tickets that have since been opted out or left "
+              f"\"{cfg['jira']['scope_status']}\" cannot be re-classified at all: those "
+              "need an explicit recorded decision from the pilot owners.")
+        print("Note also that the 24h SLA is measured from the FIRST bot label add, so "
+              "re-classifying does not undo a replay run's latency - the timestamp does "
+              "not move when the label is unchanged.")
         return 1
     print(f"\nDECISION: {decide(pct24, removal_rate, intro, m)}")
     return 0

@@ -101,9 +101,13 @@ over-length text all abort before any Jira call.
 
 Each ticket's entity property records **`source`** (`api` or `file`), set by the
 pipeline, alongside a self-declared `classifier` string. Only `source` is
-evidence — a file can claim any model name it likes. `source` also participates
-in the idempotency key, so a replayed label does not permanently pin a ticket
-against the pinned-model pipeline.
+evidence — a file can claim any model name it likes.
+
+`source` participates in the idempotency key **asymmetrically**: a live API sweep
+treats a replayed label as stale and re-classifies it, so one replay run cannot
+pin a ticket for the rest of the pilot — but a replay run leaves an API label
+alone. Symmetry here would make the two paths swap the label and comment to every
+watcher on every sweep, since this workflow has both touching the same cohort.
 
 > **This is not the pilot's measured path.** The eval gate and the three
 > pre-registered metrics assume one pinned model and prompt version per label.
