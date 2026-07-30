@@ -182,6 +182,23 @@ CSV: mark each row `ok` or `wrong` (plus `correct_label` when wrong), and:
 .venv/bin/python evals/run_evals.py        # re-run after every prompt change
 ```
 
+**Comparing models** is a question the graded set can answer, once it exists:
+
+```sh
+.venv/bin/python evals/run_evals.py --model claude-sonnet-5 --model claude-haiku-4-5
+```
+
+`--model` is repeatable and scores the same frozen contexts against each one, so
+"would a cheaper model do as well" stops being an argument. It is deliberately
+**additive**: there is no way to make the *gate* measure anything but the model
+`config.toml` pins, the comparison labels itself as not the gate, and its exit
+code reports whether the comparison ran rather than whether anything was
+cleared. The pinned pair is what the pilot committed to before seeing results;
+a model shopped for afterwards must not inherit that authority. Note the
+volumes involved are small — a full sweep is ~35k input tokens — so the saving
+from a cheaper model is a few dollars a month against a kill metric that stops
+the pilot at four removals out of ~32.
+
 The graded set becomes the regression suite: iterate `prompt/system.md` (bump
 `[prompt].version`) until agreement is >= 90%, the offline proxy for the
 pilot's "fewer than 1 in 10 labels removed" kill metric. During the live

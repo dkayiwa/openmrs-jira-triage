@@ -1557,6 +1557,123 @@ class EvalGateTests(unittest.TestCase):
         self.assertIn("agreement: 1/2", report)
 
 
+class ModelComparisonTests(unittest.TestCase):
+    """--model runs a comparison that can never inherit the gate's authority."""
+
+    def _harness(self, tmp, cases, labels_by_model):
+        """Eval module whose classifier answers per-model and records the model."""
+        module = load_evals_module()
+        d = Path(tmp)
+        (d / "frozen").mkdir()
+        module.GRADED = d / "graded.csv"
+        module.CONTEXTS = d / "frozen"
+        with open(module.GRADED, "w", newline="") as fh:
+            w = csv.DictWriter(fh, fieldnames=module.GRADED_COLUMNS)
+            w.writeheader()
+            for key in cases:
+                text = f"TICKET: {key}\n"
+                (d / "frozen" / f"{key}.txt").write_text(text)
+                w.writerow({"key": key, "expected_label": "needs_more_info",
+                            "content_hash": ctx.content_hash(text), "notes": ""})
+        self.constructed = []
+        outer = self
+
+        class PerModel:
+            def __init__(self, model, *a):
+                self.model = model
+                outer.constructed.append(model)
+                self.labels = list(labels_by_model.get(model, ["needs_more_info"] * 99))
+
+            def classify(self, text):
+                return Classification(self.labels.pop(0), "r", [], [], 0.9, self.model)
+
+        module.Classifier = PerModel
+        return module
+
+    def _run(self, tmp, cases, labels_by_model, models=None, gate=0.9):
+        module = self._harness(tmp, cases, labels_by_model)
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            rc = module.run(gate, models)
+        return rc, out.getvalue()
+
+    def test_the_default_invocation_still_gates_the_pinned_model(self):
+        # The regression that matters: adding the flag must not change what the
+        # gate measures when the flag is absent.
+        pinned = load_config()["claude"]["model"]
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, report = self._run(tmp, ["O3-1"], {})
+        self.assertEqual(self.constructed, [pinned])
+        self.assertIn("agreement: 1/1", report)
+        self.assertNotIn("COMPARISON", report)
+        self.assertEqual(rc, 0)
+
+    def test_an_override_scores_the_named_model_not_the_pinned_one(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, report = self._run(tmp, ["O3-1"], {}, models=["claude-sonnet-5"])
+        self.assertEqual(self.constructed, ["claude-sonnet-5"])
+        self.assertIn("claude-sonnet-5", report)
+
+    def test_an_override_never_prints_the_gate_verdict(self):
+        # The gate's own line is what a reader (or a grep) treats as authorisation.
+        # A comparison must not produce it for any agreement level.
+        for labels in (["needs_more_info"], ["needs_judgment"]):
+            with tempfile.TemporaryDirectory() as tmp:
+                _, report = self._run(tmp, ["O3-1"], {"m": labels}, models=["m"])
+            self.assertNotIn("agreement: ", report,
+                             "a comparison emitted the gate's agreement line")
+            for word in ("PASS", "FAIL"):
+                self.assertNotIn(word, report,
+                                 f"a comparison used the gate's {word} vocabulary")
+
+    def test_an_override_says_it_is_not_the_gate_and_names_the_pinned_model(self):
+        pinned = load_config()["claude"]["model"]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self._run(tmp, ["O3-1"], {}, models=["claude-haiku-4-5"])
+        self.assertIn("not the pre-registered gate", report)
+        self.assertIn(pinned, report, "the comparison never names what actually gates")
+
+    def test_a_comparisons_exit_code_is_not_a_verdict(self):
+        # Zero means "the comparison ran". A model far below the gate must not
+        # make it non-zero, or a caller will read the code as a pass/fail.
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, report = self._run(tmp, ["O3-1", "O3-2"], {"m": ["needs_judgment"] * 2},
+                                   models=["m"])
+        self.assertEqual(rc, 0)
+        self.assertIn("below", report)
+
+    def test_every_requested_model_is_scored_in_one_run(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self._run(
+                tmp, ["O3-1", "O3-2"],
+                {"good": ["needs_more_info", "needs_more_info"],
+                 "bad": ["needs_judgment", "needs_judgment"]},
+                models=["good", "bad"])
+        self.assertEqual(self.constructed, ["good", "bad"])
+        self.assertIn("2/2", report)
+        self.assertIn("0/2", report)
+
+    def test_the_pinned_model_is_marked_when_included_in_a_comparison(self):
+        pinned = load_config()["claude"]["model"]
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self._run(tmp, ["O3-1"], {}, models=[pinned, "other"])
+        self.assertIn("(pinned)", report)
+        self.assertNotIn("was not run", report)
+
+    def test_omitting_the_pinned_model_says_so(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            _, report = self._run(tmp, ["O3-1"], {}, models=["other"])
+        self.assertIn("was not run", report)
+
+    def test_a_comparison_still_refuses_an_unusable_eval_set(self):
+        # The integrity checks gate the numbers, not the mode - a comparison
+        # measured against an edited context is as meaningless as a gate run.
+        with tempfile.TemporaryDirectory() as tmp:
+            module = self._harness(tmp, ["O3-1"], {})
+            (Path(tmp) / "frozen" / "O3-1.txt").write_text("TICKET: O3-1\nedited\n")
+            with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(SystemExit):
+                module.run(0.9, ["claude-sonnet-5"])
+
+
 class EvalImportTests(unittest.TestCase):
     """A grade must stay pinned to the context it was actually made against."""
 

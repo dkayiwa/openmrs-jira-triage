@@ -10,7 +10,8 @@ should become a new case here - that closes the loop between the
 
 Usage:
   python evals/run_evals.py --import-proposals out/proposals-XXXX.csv
-  python evals/run_evals.py [--min-agreement 0.9]
+  python evals/run_evals.py [--min-agreement 0.9]          # the gate: pinned model
+  python evals/run_evals.py --model claude-sonnet-5 ...     # a labelled comparison
 """
 from __future__ import annotations
 
@@ -144,13 +145,9 @@ def load_cases() -> list[dict]:
     return cases
 
 
-def run(min_agreement: float) -> int:
-    cases = load_cases()
-    if not cases:
-        sys.exit("no graded cases yet - fill in a proposals CSV and --import-proposals it first")
-    cfg = load_config()
-    clf = Classifier(cfg["claude"]["model"], cfg["claude"]["max_tokens"],
-                     (ROOT / "prompt" / "system.md").read_text())
+def score(model: str, max_tokens: int, prompt: str, cases: list[dict]) -> tuple[int, list]:
+    """Run every graded case against one model. Returns (hits, misses)."""
+    clf = Classifier(model, max_tokens, prompt)
     hits = 0
     misses: list[tuple[str, str, str]] = []
     for case in cases:
@@ -167,16 +164,64 @@ def run(min_agreement: float) -> int:
             misses.append((case["key"], case["expected_label"], got_label))
             print("  " + case["key"] + ": MISS expected " + case["expected_label"]
                   + " got " + got_label)
-    agreement = hits / len(cases)
-    # The model is named alongside the prompt: this gate is pre-registered
-    # against a specific pair, and a result that records only one of them cannot
-    # be reproduced later.
-    print(f"\nagreement: {hits}/{len(cases)} = {agreement:.1%} "
-          f"(model {cfg['claude']['model']}, prompt {cfg['prompt']['version']}, "
-          f"gate {min_agreement:.0%})")
-    for key, want, got_label in misses:
-        print(f"  confusion: {key} {want} -> {got_label}")
-    return 0 if agreement >= min_agreement else 1
+    return hits, misses
+
+
+def run(min_agreement: float, models: list[str] | None = None) -> int:
+    """Score the graded set. With no `models`, this IS the pre-registered gate.
+
+    `models` runs a comparison instead, and is deliberately additive: there is no
+    way to make the *gate* measure a model other than the one config.toml pins.
+    The pinned pair is what the pilot committed to before seeing results, so a
+    model shopped for afterwards must not be able to inherit its authority - the
+    comparison says so in its own output, and its exit code reports whether the
+    comparison ran, not whether anything was cleared for go-live.
+    """
+    cases = load_cases()
+    if not cases:
+        sys.exit("no graded cases yet - fill in a proposals CSV and --import-proposals it first")
+    cfg = load_config()
+    prompt = (ROOT / "prompt" / "system.md").read_text()
+    pinned, max_tokens = cfg["claude"]["model"], cfg["claude"]["max_tokens"]
+
+    if not models:
+        hits, misses = score(pinned, max_tokens, prompt, cases)
+        agreement = hits / len(cases)
+        # The model is named alongside the prompt: this gate is pre-registered
+        # against a specific pair, and a result that records only one of them
+        # cannot be reproduced later.
+        print(f"\nagreement: {hits}/{len(cases)} = {agreement:.1%} "
+              f"(model {pinned}, prompt {cfg['prompt']['version']}, "
+              f"gate {min_agreement:.0%})")
+        for key, want, got_label in misses:
+            print(f"  confusion: {key} {want} -> {got_label}")
+        return 0 if agreement >= min_agreement else 1
+
+    print(f"COMPARISON - not the pre-registered gate. config.toml pins {pinned}, and "
+          f"only that model's result authorises go-live. Nothing here changes what "
+          f"the pilot committed to, and the exit code below reports whether the "
+          f"comparison ran - not whether any model was cleared.\n")
+    results = []
+    for model in models:
+        print(f"{model}:")
+        hits, misses = score(model, max_tokens, prompt, cases)
+        results.append((model, hits, hits / len(cases)))
+        for key, want, got_label in misses:
+            print(f"  confusion: {key} {want} -> {got_label}")
+        print()
+    width = max(len(m) for m, _, _ in results)
+    print(f"{'model'.ljust(width)}  agreement        vs {min_agreement:.0%}")
+    for model, hits, agreement in results:
+        # Deliberately not PASS/FAIL: that vocabulary belongs to the gate, and a
+        # comparison row reading PASS is exactly the misreading this guards.
+        standing = "at or above" if agreement >= min_agreement else "below"
+        note = "  (pinned)" if model == pinned else ""
+        print(f"{model.ljust(width)}  {hits}/{len(cases)} {agreement:6.1%}  "
+              f"{standing}{note}")
+    if pinned not in models:
+        print(f"\n{pinned} (pinned) was not run; add --model {pinned} to include it, "
+              "or run with no --model at all for the gate itself.")
+    return 0
 
 
 def main() -> int:
@@ -185,11 +230,15 @@ def main() -> int:
     ap.add_argument("--contexts", default=str(ROOT / "out" / "contexts"),
                     help="where the proposal contexts live (default: out/contexts)")
     ap.add_argument("--min-agreement", type=float, default=0.9)
+    ap.add_argument("--model", action="append", metavar="ID",
+                    help="score this model instead of the pinned one, repeatable. "
+                         "Runs a labelled COMPARISON, never the gate; config.toml is "
+                         "not modified and the pinned model still decides go-live")
     args = ap.parse_args()
     if args.import_proposals:
         import_proposals(args.import_proposals, args.contexts)
         return 0
-    return run(args.min_agreement)
+    return run(args.min_agreement, args.model)
 
 
 if __name__ == "__main__":
