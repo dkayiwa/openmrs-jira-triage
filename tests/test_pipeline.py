@@ -1842,6 +1842,16 @@ class DecisionRuleTests(unittest.TestCase):
         self.assertTrue(sla_met(created, "2026-08-11T08:00:00.000+0000", self.LAUNCH))
         self.assertFalse(sla_met(created, "2026-08-12T09:00:00.000+0000", self.LAUNCH))
 
+    def test_exactly_24h_counts_as_within_24h(self):
+        # "within 24h" is pre-registered, and pre-registration is worth only as
+        # much as the fixity of the definition behind it. Nothing pinned which
+        # side of the boundary is inclusive, so flipping <= to < was a silent
+        # tightening of a committed metric after launch - the one change the
+        # whole design is meant to make impossible.
+        created = "2026-08-10T09:00:00.000+0000"
+        self.assertTrue(sla_met(created, "2026-08-11T09:00:00.000+0000", self.LAUNCH))
+        self.assertFalse(sla_met(created, "2026-08-11T09:00:00.001+0000", self.LAUNCH))
+
     def test_all_three_metrics_pass_adopts(self):
         self.assertEqual(decide(100.0, 0.05, 10, self.M), "ADOPT")
 
@@ -2800,6 +2810,79 @@ class LiveRunTests(unittest.TestCase):
                 rc = run.main(["--live"], out=Path(d))
         self.assertEqual(rc, 1, "a failed sweep must not exit 0")
         self.assertEqual(jira.fetches, run.CONSECUTIVE_ERROR_LIMIT)
+
+    def _sweep(self, jira, classification, argv, out):
+        with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+             mock.patch.object(run, "Classifier",
+                               lambda *a: StubClassifier(classification)), \
+             contextlib.redirect_stdout(io.StringIO()), \
+             contextlib.redirect_stderr(io.StringIO()):
+            rc = run.main(list(argv), out=out)
+        rows = [json.loads(l) for l in (out / "journal.jsonl").read_text().splitlines()]
+        return rc, rows
+
+    def test_a_refusal_is_never_written_as_a_label(self):
+        # A refusal carries label="" by construction. Falling through to the
+        # write path turns that into cfg["labels"][""] - and in a dry run, into
+        # a blank-labelled row on the page headed "what the triage pilot wrote",
+        # which is the page Dennis and Veronica review.
+        refused = Classification("", "", [], [], 0.0, "m", refused=True)
+        jira = RecordingJira({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            rc, rows = self._sweep(jira, refused, ["--live", "--keys", "O3-1"], Path(d))
+        self.assertEqual(rows[-1]["action"], "error-refusal")
+        self.assertEqual(jira.writes, [], "a refusal must touch nothing in Jira")
+
+    def test_consecutive_refusals_trip_the_breaker_like_any_other_error(self):
+        # A refusal costs a paid call exactly like a failure does, and a prompt
+        # that trips the safety classifier trips it on every ticket. Excusing
+        # refusals from the breaker burns the whole cohort, then does it again
+        # every four hours - the precise spend the breaker exists to cap.
+        refused = Classification("", "", [], [], 0.0, "m", refused=True)
+        keys = [f"O3-{i}" for i in range(20)]
+        jira = RecordingJira({k: issue() for k in keys})
+        with tempfile.TemporaryDirectory() as d:
+            rc, rows = self._sweep(jira, refused, ["--live"], Path(d))
+        self.assertEqual(len(rows), run.CONSECUTIVE_ERROR_LIMIT,
+                         "the sweep must stop, not refuse its way through the cohort")
+        self.assertEqual(rc, 1)
+
+    def test_a_comment_that_landed_is_reported_even_if_bookkeeping_fails(self):
+        # Ordering, not presence: the append must happen BEFORE set_property.
+        # The label and comment are already public at that point, so dropping
+        # the ticket when only the internal property write fails hides a real
+        # comment from the report that claims to list them - and set_property
+        # is the permission preflight probes precisely because it is the one
+        # most likely to be missing.
+        class NoProperties(RecordingJira):
+            def set_property(self, key, prop, value):
+                raise JiraError("403: no entity-property permission")
+
+        c = Classification("automation_candidate", "Clear spec.", [], ["run it"], 0.9, "m")
+        jira = NoProperties({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            rc, rows = self._sweep(jira, c, ["--live", "--keys", "O3-1"], out)
+            report = next(out.glob("proposals-*.html")).read_text()
+        self.assertEqual(rows[-1]["action"], "error", "the failure is still reported")
+        self.assertIn("O3-1", report,
+                      "the comment is on the ticket, so it must be in the report")
+
+    def test_a_limited_gather_does_not_claim_a_complete_manifest(self):
+        # `complete` is what the apply step trusts to decide the cohort is fully
+        # described. A --limit run covers a prefix of it; claiming complete
+        # means every ticket past the limit is never classified at all, and
+        # nothing anywhere says so.
+        keys = [f"O3-{i}" for i in range(5)]
+        jira = RecordingJira({k: issue() for k in keys})
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            self._sweep(jira, None, ["--no-classify", "--limit", "2"], out)
+            manifest = json.loads((out / "manifest.json").read_text())
+        self.assertEqual(len(manifest["tickets"]), 2)
+        self.assertFalse(manifest["complete"],
+                         "a manifest covering 2 of 5 tickets is not complete")
 
     def test_all_tickets_failing_returns_nonzero(self):
         class Failing(RecordingJira):
