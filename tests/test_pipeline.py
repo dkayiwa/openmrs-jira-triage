@@ -447,6 +447,93 @@ class WorkflowInvariantTests(unittest.TestCase):
         self.assertIn("github.token", self.sweep["env"]["GITHUB_TOKEN"])
 
 
+class DocumentedSurfaceTests(unittest.TestCase):
+    """The README and config.toml against what the code actually offers.
+
+    Both drift silently and in the direction that wastes someone else's time:
+    a flag renamed in argparse leaves the README telling a maintainer to type
+    something that exits 2, and a config key the code reads but the file lacks
+    is a KeyError on a scheduled live run. These were audited by hand once;
+    a hand audit that is not a test is a fact about one afternoon.
+    """
+
+    ROOT = Path(__file__).resolve().parent.parent
+    MODULES = {"triage.run": "triage/run.py", "triage.preflight": "triage/preflight.py",
+               "triage.metrics": "triage/metrics.py",
+               "evals/run_evals.py": "evals/run_evals.py"}
+
+    @classmethod
+    def setUpClass(cls):
+        cls.readme = (cls.ROOT / "README.md").read_text()
+
+    def test_every_flag_the_readme_tells_you_to_type_is_accepted(self):
+        accepted = {
+            mod: set(re.findall(r'add_argument\(\s*"(--[a-z0-9-]+)"',
+                                (self.ROOT / path).read_text()))
+            for mod, path in self.MODULES.items()
+        }
+        # Any invocation, however it is prefixed: the README writes most of them
+        # as `.venv/bin/python -m ...` inside fenced blocks and a few inline.
+        # Anchoring on a line-initial "python" found two flags out of nineteen,
+        # which the floor below caught - a passing extraction test that extracts
+        # nothing is the vacuous-guard failure this whole suite keeps hunting.
+        commands = [m.group(0).split("#")[0]
+                    for m in re.finditer(r'python (?:-m triage\.[a-z_]+|evals/[a-z_]+\.py)'
+                                         r'[^\n`]*', self.readme)]
+        checked = 0
+        for command in commands:
+            mod = next((m for m in self.MODULES if m in command), None)
+            if not mod:
+                continue
+            for flag in re.findall(r'(--[a-z0-9-]+)', command):
+                checked += 1
+                self.assertIn(flag, accepted[mod],
+                              f"README says `{command.strip()}` but {mod} has no {flag}")
+        self.assertGreater(checked, 5, "the extraction found almost no flags to check, "
+                                       "so a passing result here means nothing")
+
+    def test_every_flag_the_readme_mentions_in_prose_still_exists(self):
+        # The prose list ("Useful flags: `--keys ...`, `--no-classify`") carries
+        # no module context, so it is checked against the union - weaker than
+        # the per-command check above, but it is what catches a rename in the
+        # half of the README that is sentences rather than shell blocks, and
+        # that half is where a reader looks first.
+        accepted = set()
+        for path in self.MODULES.values():
+            accepted |= set(re.findall(r'add_argument\(\s*"(--[a-z0-9-]+)"',
+                                       (self.ROOT / path).read_text()))
+        mentioned = set(re.findall(r'`(--[a-z0-9-]+)[^`]*`', self.readme))
+        self.assertGreater(len(mentioned), 3, "extraction found nothing to check")
+        self.assertEqual(mentioned - accepted, set(),
+                         "the README names flags no module accepts")
+
+    def test_every_runnable_the_readme_names_exists(self):
+        targets = set(re.findall(r'python -m (triage\.[a-z_]+)', self.readme))
+        targets |= set(re.findall(r'python (evals/[a-z_]+\.py)', self.readme))
+        self.assertGreater(len(targets), 2, "extraction found nothing to check")
+        for target in targets:
+            path = target if target.endswith(".py") else target.replace(".", "/") + ".py"
+            self.assertTrue((self.ROOT / path).exists(),
+                            f"README tells you to run {target}, which does not exist")
+
+    def test_every_config_key_the_code_reads_is_present(self):
+        # Direction that matters: a key the code reads but the file lacks is a
+        # KeyError mid-sweep. The reverse (an unused key) is only clutter, and
+        # cannot be checked this way anyway - most sections are read through a
+        # bound intermediate like `m = cfg["metrics"]`, which no regex sees.
+        cfg = load_config()
+        source = "\n".join((self.ROOT / p).read_text() for p in
+                           ("triage/run.py", "triage/metrics.py", "triage/preflight.py",
+                            "triage/context.py", "evals/run_evals.py"))
+        pattern = r'cfg\[["\']([a-z_]+)["\']\]\[["\']([a-z_]+)["\']\]'
+        found = set(re.findall(pattern, source))
+        self.assertGreater(len(found), 5, "extraction found nothing to check")
+        for section, key in sorted(found):
+            self.assertIn(section, cfg, f'code reads cfg["{section}"], which is absent')
+            self.assertIn(key, cfg[section],
+                          f'code reads cfg["{section}"]["{key}"], which is absent')
+
+
 class AgreementIntervalTests(unittest.TestCase):
     """What the pre-registered gate can actually resolve.
 
