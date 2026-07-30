@@ -600,6 +600,31 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("[FAIL] bot can read and write entity properties", report)
 
+    def test_a_missing_acceptance_criteria_field_fails_the_gate(self):
+        # The rubric turns on acceptance criteria being visible - "features need
+        # some observable way to tell the work is done". If the field cannot be
+        # discovered the sweep classifies without it, so preflight must not wave
+        # that through. Nothing covered this: dropping the `ok &=` left the
+        # suite green.
+        class NoAcField(self.Stub):
+            def fields(self):
+                self._guard("fields")
+                return [{"id": "customfield_1", "name": "Something Else"}]
+
+        rc, report = self._run(NoAcField())
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] Acceptance Criteria field", report)
+
+    def test_no_cleanup_is_attempted_for_a_label_that_never_landed(self):
+        # When the hyphenated add fails - a mistyped --scratch key, a missing
+        # permission - running the removal anyway prints "remove manually" for a
+        # label that was never applied, sending the operator to look for
+        # something that is not there, on exactly the broken-key path.
+        rc, report = self._run(self.Stub(raises={"update_labels"}),
+                               argv=["--scratch", "O3-9999"])
+        self.assertEqual(rc, 1)
+        self.assertNotIn("could not remove ai-triage-charset-test", report)
+
     def test_an_unevaluated_dev_panel_clause_fails_rather_than_passing_empty(self):
         # Jira answers a development[] clause it cannot evaluate with an empty
         # result set, not an error - so attempt() reports success and the gate
