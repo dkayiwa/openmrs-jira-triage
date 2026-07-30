@@ -447,6 +447,55 @@ class WorkflowInvariantTests(unittest.TestCase):
         self.assertIn("github.token", self.sweep["env"]["GITHUB_TOKEN"])
 
 
+class AgreementIntervalTests(unittest.TestCase):
+    """What the pre-registered gate can actually resolve.
+
+    The rule (>= 90%, exit 0/1) is the pilot owners' and is untouched. What was
+    missing is any statement of its precision: each case is scored once, the
+    graded set is roughly cohort-sized, and the classifier is measured to
+    disagree with itself. A reader seeing "90.3%" against a "90%" gate reads a
+    clean pass.
+    """
+
+    def _mod(self):
+        import importlib
+        return importlib.import_module("evals.run_evals")
+
+    def test_a_cohort_sized_set_cannot_separate_ninety_from_seventy_five(self):
+        # The number that matters for this pilot: 31 in-scope tickets.
+        lo, hi = self._mod().agreement_interval(28, 31)
+        self.assertLess(lo, 0.80, "an observed 90% over 31 cases reaches below 80%")
+        self.assertGreater(hi, 0.95)
+
+    def test_more_cases_narrow_the_interval(self):
+        m = self._mod()
+        width = lambda hits, n: (lambda b: b[1] - b[0])(m.agreement_interval(hits, n))
+        self.assertLess(width(180, 200), width(18, 20),
+                        "200 cases must resolve more than 20")
+        self.assertLess(width(18, 20), width(9, 10))
+
+    def test_a_unanimous_small_set_still_admits_doubt(self):
+        # Wilson rather than the normal approximation precisely for this: at
+        # p=1 the usual formula gives a zero-width interval and would report
+        # 5/5 as certainty.
+        lo, hi = self._mod().agreement_interval(5, 5)
+        self.assertLess(lo, 0.9, "5 for 5 is not evidence of clearing a 90% gate")
+        self.assertLessEqual(hi, 1.0)
+
+    def test_an_empty_set_claims_nothing(self):
+        # graded.csv is empty today, so this is the live state, and the gate
+        # must not read as 0% agreement (a confident failure) either.
+        self.assertEqual(self._mod().agreement_interval(0, 0), (0.0, 1.0))
+
+    def test_the_interval_never_escapes_zero_to_one(self):
+        m = self._mod()
+        for hits, n in ((0, 1), (1, 1), (0, 3), (3, 3), (1, 2)):
+            lo, hi = m.agreement_interval(hits, n)
+            self.assertGreaterEqual(lo, 0.0, (hits, n))
+            self.assertLessEqual(hi, 1.0, (hits, n))
+            self.assertLessEqual(lo, hi, (hits, n))
+
+
 class InjectionAttributionTests(unittest.TestCase):
     """The adversarial eval's decision rule, which is pure and so testable here
     even though collecting its data costs API calls.

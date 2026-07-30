@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import math
 import pathlib
 import re
 import sys
@@ -196,6 +197,29 @@ def score(model: str, max_tokens: int, prompt: str, cases: list[dict]) -> tuple[
     return hits, misses
 
 
+def agreement_interval(hits: int, n: int, z: float = 1.96) -> tuple[float, float]:
+    """Wilson score interval for the observed agreement.
+
+    Reported, never enforced: the pass/fail rule below is pre-registered and is
+    the pilot owners' to change, not this harness's. What was missing is any
+    statement of what the rule can actually resolve. Each case is classified
+    once, against a model measured to disagree with itself (see
+    evals/injection_eval.py), and the graded set is roughly cohort-sized - so
+    at n=31 an observed 90% carries a 95% interval of about 75%-97%. A reader
+    seeing "90.3%" against a "90%" gate reads a pass; the same number with its
+    interval reads as what it is, which is not distinguishable from a model
+    that agrees three times in four. Wilson rather than normal-approximation
+    because it stays sane at small n and near 0 or 1, which is exactly here.
+    """
+    if n <= 0:
+        return (0.0, 1.0)
+    p = hits / n
+    denom = 1 + z * z / n
+    centre = (p + z * z / (2 * n)) / denom
+    half = z * math.sqrt(p * (1 - p) / n + z * z / (4 * n * n)) / denom
+    return max(0.0, centre - half), min(1.0, centre + half)
+
+
 def run(min_agreement: float, models: list[str] | None = None) -> int:
     """Score the graded set. With no `models`, this IS the pre-registered gate.
 
@@ -219,9 +243,25 @@ def run(min_agreement: float, models: list[str] | None = None) -> int:
         # The model is named alongside the prompt: this gate is pre-registered
         # against a specific pair, and a result that records only one of them
         # cannot be reproduced later.
+        lo, hi = agreement_interval(hits, len(cases))
         print(f"\nagreement: {hits}/{len(cases)} = {agreement:.1%} "
               f"(model {pinned}, prompt {cfg['prompt']['version']}, "
               f"gate {min_agreement:.0%})")
+        print(f"95% interval: {lo:.1%} - {hi:.1%} over {len(cases)} case(s), "
+              "one classification each")
+        # The verdict below is the pre-registered rule and is unchanged. This
+        # says what that verdict is worth, which nothing did before: a pass
+        # whose interval reaches under the gate has not shown the model clears
+        # it, only that this draw did.
+        if agreement >= min_agreement and lo < min_agreement:
+            print(f"  NOTE: the interval reaches below the {min_agreement:.0%} gate, so "
+                  f"this run does not establish that the model clears it - a set of "
+                  f"{len(cases)} cases scored once each cannot separate {agreement:.0%} "
+                  f"from {lo:.0%}. Grading more cases is the only thing that narrows "
+                  "this; re-running the same ones does not.")
+        elif agreement < min_agreement and hi >= min_agreement:
+            print(f"  NOTE: the interval also reaches above the {min_agreement:.0%} gate, "
+                  "so this failure is likewise within sampling noise.")
         for key, want, got_label in misses:
             print(f"  confusion: {key} {want} -> {got_label}")
         return 0 if agreement >= min_agreement else 1

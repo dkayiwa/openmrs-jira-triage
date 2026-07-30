@@ -233,6 +233,28 @@ phase, every human label-removal gets added here as a new case.
 4. **Preflight with the write test:** `python -m triage.preflight --scratch O3-XXXX`.
 5. **Dry-run the whole cohort, grade, iterate** until the eval gate passes.
 
+   **Know what passing it proves.** The gate is a point estimate: each graded
+   case is classified once, and 90% is compared against the fraction that came
+   back. `evals/run_evals.py` now prints the interval around that fraction, and
+   at cohort scale it is wide — an observed 90.3% over 31 cases carries a 95%
+   interval of 75%–97%, so it does not separate a model that agrees nine times
+   in ten from one that agrees three times in four. Only more *graded cases*
+   narrow it; re-running the same ones does not. Two consequences: treat a
+   near-90% pass as "not yet ruled out" rather than cleared, and prefer grading
+   breadth over prompt micro-iteration once you are close, because past a point
+   the gate can no longer see the difference you are making.
+
+   **The classifier is not deterministic.** Measured by
+   `evals/injection_eval.py`: the same ticket text, five runs, four
+   `automation_candidate` and one `needs_judgment`. `temperature` is deprecated
+   on this model, so it cannot be pinned. This bears on the kill metric in step
+   7 — a re-classification after a content edit can move a label for no reason
+   but the draw, which posts a fresh comment and counts as a removal if a
+   maintainer prefers the first — and it means part of any agreement shortfall
+   is the model disagreeing with itself rather than with the graders. Whether
+   that is acceptable is a pilot-design call for the owners; it is recorded
+   here so it is made deliberately.
+
    **Grade the contested tickets first.** Unanimity teaches you least — a case
    every model labels the same way was easy. Classify the frozen contexts with
    two or three candidate models and grade where they *split*: that set is both
