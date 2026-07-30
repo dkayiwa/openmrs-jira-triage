@@ -63,7 +63,7 @@ def _load_dotenv(env: pathlib.Path | None = None) -> None:
     env = env or ROOT / ".env"
     if not env.exists():
         return
-    for line in env.read_text().splitlines():
+    for line in env.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if not line or line.startswith("#") or "=" not in line:
             continue
@@ -161,7 +161,7 @@ class FileClassifier:
         # Every failure here is fatal and named, before any ticket is fetched:
         # this file decides what gets written to public tickets.
         try:
-            doc = json.loads(path.read_text())
+            doc = json.loads(path.read_text(encoding="utf-8"))
         except FileNotFoundError:
             sys.exit(f"{path}: no such file")
         except json.JSONDecodeError as e:
@@ -300,7 +300,7 @@ def schedule_conflict(root: pathlib.Path, in_ci: bool) -> str | None:
         # dry-run on a machine without PyYAML should still work.
         import yaml
 
-        doc = yaml.safe_load(path.read_text()) or {}
+        doc = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
         # YAML reads a bare `on:` as the boolean True, so the triggers live under
         # either key depending on whether the file quotes it.
         triggers = doc.get(True) or doc.get("on") or {}
@@ -459,7 +459,7 @@ def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, prop
                     live: bool, source: str = "api") -> pathlib.Path:
     base = proposal_base(out, stamp)
     url = cfg["jira"]["base_url"] + "/browse/"
-    with open(base.with_suffix(".csv"), "w", newline="") as fh:
+    with open(base.with_suffix(".csv"), "w", newline="", encoding="utf-8") as fh:
         w = csv.writer(fh)
         w.writerow(PROPOSAL_COLUMNS)
         for issue, c, chash in proposals:
@@ -470,7 +470,7 @@ def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, prop
                  csv_safe("; ".join(c.missing_info)),
                  csv_safe("; ".join(c.verification_steps)), chash, source, "", "", ""]
             )
-    with open(base.with_suffix(".md"), "w") as fh:
+    with open(base.with_suffix(".md"), "w", encoding="utf-8") as fh:
         # The mode is stated because this file is also written on live runs,
         # where it is an audit trail of writes that already happened - not a
         # preview of writes that did not.
@@ -670,7 +670,7 @@ def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime
         ]
     parts.append("</body></html>")
     report = base.with_suffix(".html")
-    report.write_text("\n".join(parts))
+    report.write_text("\n".join(parts), encoding="utf-8")
     return report
 
 
@@ -709,7 +709,7 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     elif not args.no_classify:
         classifier = Classifier(
             cfg["claude"]["model"], cfg["claude"]["max_tokens"],
-            (ROOT / "prompt" / "system.md").read_text(),
+            (ROOT / "prompt" / "system.md").read_text(encoding="utf-8"),
         )
 
     jira = jira_from_env(cfg)
@@ -804,7 +804,7 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                          jira.changelog(key, issue.get("changelog")))
             text = ctx.assemble(jira, issue, ac_field, blocked)
             chash = ctx.content_hash(text)
-            (out / "contexts" / f"{key}.txt").write_text(text)
+            (out / "contexts" / f"{key}.txt").write_text(text, encoding="utf-8")
             row["hash"] = chash
 
             # Dry-run skips the property read: nothing was written, so the
@@ -966,7 +966,7 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             consecutive += 1
         else:
             consecutive = 0
-        with open(journal, "a") as fh:
+        with open(journal, "a", encoding="utf-8") as fh:
             fh.write(json.dumps(row) + "\n")
         suffix = f" -> {row['label']}" if row.get("label") else ""
         if row["action"] == "error":

@@ -43,10 +43,10 @@ KEY_RE = re.compile(r"[A-Z][A-Z0-9]*-\d+")
 def import_proposals(path: str, contexts_dir: str) -> None:
     rows: dict[str, dict] = {}
     if GRADED.exists():
-        with open(GRADED) as fh:
+        with open(GRADED, encoding="utf-8") as fh:
             rows = {r["key"]: r for r in csv.DictReader(fh)}
     added = 0
-    with open(path) as fh:
+    with open(path, encoding="utf-8") as fh:
         for r in csv.DictReader(fh):
             grade = (r.get("grade(ok/wrong)") or "").strip().lower()
             if grade not in ("ok", "wrong"):
@@ -102,19 +102,19 @@ def import_proposals(path: str, contexts_dir: str) -> None:
             # sweep landing between those reads left a frozen file and a stored
             # hash that agreed with each other and with nothing a human had
             # graded, while "imported N" reported a verified freeze.
-            text = src.read_text()
+            text = src.read_text(encoding="utf-8")
             if content_hash(text) != graded_hash:
                 print(f"skip {r['key']}: {src} changed since grading; re-run the "
                       "dry-run for this ticket and re-grade it")
                 continue
             CONTEXTS.mkdir(exist_ok=True)
-            (CONTEXTS / src.name).write_text(text)
+            (CONTEXTS / src.name).write_text(text, encoding="utf-8")
             # The stored hash is the one that was verified, not a fresh read.
             rows[r["key"]] = {"key": r["key"], "expected_label": expected,
                               "content_hash": graded_hash,
                               "notes": r.get("grader_notes", "")}
             added += 1
-    with open(GRADED, "w", newline="") as fh:
+    with open(GRADED, "w", newline="", encoding="utf-8") as fh:
         w = csv.DictWriter(fh, fieldnames=GRADED_COLUMNS, extrasaction="ignore")
         w.writeheader()
         for row in sorted(rows.values(), key=lambda x: x["key"]):
@@ -131,7 +131,7 @@ def load_cases() -> list[dict]:
     """
     if not GRADED.exists():
         sys.exit(f"{GRADED} does not exist - --import-proposals a graded sheet first")
-    with open(GRADED) as fh:
+    with open(GRADED, encoding="utf-8") as fh:
         rows = list(csv.DictReader(fh))
     cases, rejected, seen = [], [], set()
     for row in rows:
@@ -163,7 +163,7 @@ def load_cases() -> list[dict]:
             rejected.append(f"{key}: no content_hash recorded, so the frozen "
                             "context cannot be verified against what was graded")
             continue
-        if content_hash(frozen.read_text()) != graded_hash:
+        if content_hash(frozen.read_text(encoding="utf-8")) != graded_hash:
             rejected.append(f"{key}: frozen context has been edited since grading")
             continue
         cases.append({"key": key, "expected_label": expected, "context": frozen})
@@ -184,7 +184,7 @@ def score(model: str, max_tokens: int, prompt: str, cases: list[dict]) -> tuple[
         # Per-case isolation: one API hiccup must not discard the paid
         # classifications already made; an errored case counts as a miss.
         try:
-            got_label = clf.classify(case["context"].read_text()).label
+            got_label = clf.classify(case["context"].read_text(encoding="utf-8")).label
         except Exception as e:
             got_label = f"ERROR ({type(e).__name__}: {str(e)[:120]})"
         if got_label == case["expected_label"]:
@@ -234,7 +234,7 @@ def run(min_agreement: float, models: list[str] | None = None) -> int:
     if not cases:
         sys.exit("no graded cases yet - fill in a proposals CSV and --import-proposals it first")
     cfg = load_config()
-    prompt = (ROOT / "prompt" / "system.md").read_text()
+    prompt = (ROOT / "prompt" / "system.md").read_text(encoding="utf-8")
     pinned, max_tokens = cfg["claude"]["model"], cfg["claude"]["max_tokens"]
 
     if not models:

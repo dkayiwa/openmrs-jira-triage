@@ -131,7 +131,7 @@ def main() -> int:
     n = int(sys.argv[1]) if len(sys.argv) > 1 else 5
     cfg = load_config()
     clf = Classifier(cfg["claude"]["model"], cfg["claude"]["max_tokens"],
-                     pathlib.Path("prompt/system.md").read_text())
+                     pathlib.Path("prompt/system.md").read_text(encoding="utf-8"))
     judge = Anthropic()
     print(f"model {cfg['claude']['model']}, prompt {cfg['prompt']['version']}, "
           f"n={n} per case\n")

@@ -612,6 +612,36 @@ class DocumentedSurfaceTests(unittest.TestCase):
                           f"numbers are from {stated}, config pins {current}, and "
                           "nothing tells the reader to re-derive them")
 
+    def test_no_production_file_io_relies_on_the_platform_encoding(self):
+        """Every text read and write names its encoding.
+
+        Without one, Python uses the locale's - UTF-8 on this machine and on
+        the CI runner, but cp1252 on Windows, and the README invites
+        contributors to run the gather locally. A context written in cp1252 and
+        read as UTF-8 does not raise; it produces different text, so
+        content_hash differs, so run_evals.py finds the frozen context no
+        longer matches graded.csv and SKIPS the case. A human's graded
+        judgement drops out of the gate's denominator and the run still reports
+        OK - the silent-loss shape this suite keeps finding, on the gate that
+        authorises go-live.
+
+        Checked mechanically rather than by reading: 19 sites needed fixing and
+        a regex pass at them mis-inserted the argument into two `with_suffix`
+        calls, which the suite caught. Reading for these is how one is missed.
+        """
+        pattern = re.compile(r'read_text\(\)|write_text\([^)]*\)|(?<![_.\w])open\(')
+        offenders = []
+        for path in sorted(self.ROOT.glob("triage/*.py")) + \
+                sorted(self.ROOT.glob("evals/*.py")):
+            for n, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+                if line.lstrip().startswith("#") or "encoding=" in line or '"rb"' in line:
+                    continue
+                if pattern.search(line):
+                    offenders.append(f"{path.name}:{n}: {line.strip()[:70]}")
+        self.assertEqual(offenders, [],
+                         "these rely on the platform's default encoding:\n  "
+                         + "\n  ".join(offenders))
+
     def test_every_config_key_the_code_reads_is_present(self):
         # Direction that matters: a key the code reads but the file lacks is a
         # KeyError mid-sweep. The reverse (an unused key) is only clutter, and
