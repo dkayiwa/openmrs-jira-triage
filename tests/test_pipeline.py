@@ -162,6 +162,11 @@ class StubSession:
         self.calls.append({"method": "GET", "url": url, **(params or {})})
         return self.pages.pop(0)
 
+    def post(self, url, json=None, timeout=None):
+        assert timeout is not None, "every network call must carry a timeout"
+        self.calls.append({"method": "POST", "url": url, **(json or {})})
+        return self.pages.pop(0)
+
     def delete(self, url, timeout=None):
         assert timeout is not None, "every network call must carry a timeout"
         self.calls.append({"method": "DELETE", "url": url})
@@ -909,6 +914,38 @@ class PaginationTests(unittest.TestCase):
         self.assertIn("0", result, "the oldest entry must not be dropped")
         self.assertEqual([c["startAt"] for c in client.session.calls], [0, 100, 200])
 
+    def test_an_issue_fetched_without_its_labels_is_refused(self):
+        # "We did not ask" must not read as "there are none": that makes every
+        # already-labelled ticket look fresh, so the whole cohort is re-labelled
+        # and re-commented to every watcher on the next sweep.
+        with self.assertRaises(ValueError) as cm:
+            inspect({"key": "O3-1", "fields": {"summary": "x"}}, AI, "bot", [])
+        self.assertIn("labels", str(cm.exception))
+
+    def test_an_unattributed_removal_is_an_opt_out_when_no_bot_id_is_set(self):
+        # This is the configuration running today - TRIAGE_BOT_ACCOUNT_ID is
+        # unset - and Jira does not attribute every changelog entry: a deleted
+        # user, an automation rule or an app can arrive with no accountId.
+        # Dropping the `bot_account_id is not None` guard makes None == None
+        # true, so that removal reads as the bot's own housekeeping and the
+        # maintainer's opt-out is discarded. inspect() then reports
+        # opted_out=False and the next sweep re-labels the ticket they opted
+        # out of. The docstring promises the opposite ("every ai-triage removal
+        # counts as an opt-out, the safe direction"); nothing enforced it.
+        anonymous = {"author": {"displayName": "Former user"},
+                     "created": "2026-07-29T10:00:00.000+0000",
+                     "items": [{"field": "labels", "fromString": AI[2], "toString": ""}]}
+        st = inspect(issue(), AI, None, [anonymous])
+        self.assertTrue(st.opted_out, "an unattributable removal must fail safe")
+
+    def test_the_bots_own_adds_are_not_reported_as_violations_without_a_bot_id(self):
+        # The mirror of the rule above. With no bot id nothing can be attributed,
+        # so attributing anyway puts every label the bot applied into the weekly
+        # digest as a maintainer breaking the no-manual-labels convention -
+        # accusing the humans of the bot's own work, on every ticket it touches.
+        st = inspect(issue(), AI, None, [label_change("someone", "", AI[0])])
+        self.assertEqual(st.human_adds, [])
+
     def test_opt_out_past_the_embedded_window_is_detected(self):
         embedded = {"histories": [{"items": []}] * 100, "total": 101}
         client = stub_client([StubResponse(
@@ -924,6 +961,104 @@ class PaginationTests(unittest.TestCase):
                        + [{"items": []}] * 100, "total": 101})])
         st = inspect(issue(), AI, "bot", client.changelog("O3-1", embedded))
         self.assertEqual(st.human_adds, ["Maintainer"])
+
+
+    def test_a_short_page_is_refused_rather_than_returned_as_the_whole_history(self):
+        # Jira says 264 entries, hands back 100, then stops. Returning those 100
+        # as the complete changelog is how a maintainer's opt-out in entry 180
+        # becomes invisible - and inspect() then reports opted_out=False with
+        # full confidence, so the bot re-labels a ticket a human opted out of.
+        # Permanently, publicly, and with nothing in the log to show for it.
+        client = stub_client([
+            StubResponse({"values": [{"id": str(i)} for i in range(100)], "total": 264}),
+            StubResponse({"values": [], "total": 264}),
+        ])
+        with self.assertRaises(JiraError) as cm:
+            client.changelog("O3-1", {"histories": [{"id": "x"}] * 100, "total": 264})
+        self.assertIn("264", str(cm.exception))
+        self.assertIn("100", str(cm.exception))
+
+    def test_a_short_page_of_comments_is_refused(self):
+        # Same read, other caller: a dropped comment is a maintainer's answer
+        # the classifier never sees, so it asks for information already given.
+        client = stub_client([StubResponse({"comments": [{"body": "c0"}], "total": 9}),
+                              StubResponse({"comments": [], "total": 9})])
+        with self.assertRaises(JiraError):
+            client.comments("O3-1", {"comments": [{"body": "x"}], "total": 9})
+
+    def test_an_unrecognised_page_shape_is_refused_not_read_as_empty(self):
+        # If the dedicated endpoint's wrapper key ever changes, every page reads
+        # as empty. Before this, that returned [] - a ticket with no history and
+        # no comments, silently, for every ticket in the cohort at once.
+        client = stub_client([StubResponse({"histories": [{"id": "1"}], "total": 264})])
+        with self.assertRaises(JiraError):
+            client.changelog("O3-1", {"histories": [{"id": "x"}] * 100, "total": 264})
+
+    def test_an_absent_embedded_page_is_fetched_not_assumed_empty(self):
+        # embedded=None means "not asked for", never "there are none". Defaulting
+        # the total to the zero items in hand made 0 >= 0 true and returned a
+        # complete-looking empty history without a single request.
+        client = stub_client([StubResponse(
+            {"values": [label_change("u1", AI[2], "")], "total": 1})])
+        result = client.changelog("O3-1", None)
+        self.assertEqual(len(result), 1)
+        self.assertEqual(len(client.session.calls), 1, "it must actually go and ask")
+
+    def test_a_page_without_a_total_is_refused(self):
+        # No total is no way to know whether the page in hand is all of them.
+        client = stub_client([StubResponse({"values": [{"id": "1"}]})])
+        with self.assertRaises(JiraError):
+            client.changelog("O3-1", None)
+
+    def test_a_genuinely_empty_dedicated_response_is_accepted(self):
+        # The fail-closed guards must not reject a ticket that truly has no
+        # history - that would fail every fresh ticket in the cohort.
+        client = stub_client([StubResponse({"values": [], "total": 0})])
+        self.assertEqual(client.changelog("O3-1", None), [])
+
+
+class SearchKeysTests(unittest.TestCase):
+    """The real cohort query. Every other test stubs search_keys out, so this
+    pagination had never executed - on the call that decides which tickets the
+    pilot touches at all."""
+
+    def test_all_pages_are_collected(self):
+        client = stub_client([
+            StubResponse({"issues": [{"key": "O3-1"}], "nextPageToken": "t1"}),
+            StubResponse({"issues": [{"key": "O3-2"}]}),
+        ])
+        self.assertEqual(client.search_keys("project = O3"), ["O3-1", "O3-2"])
+        self.assertEqual(client.session.calls[1]["nextPageToken"], "t1")
+
+    def test_a_body_that_is_not_a_search_result_is_refused(self):
+        # Jira answers 200 with only warningMessages when a JQL field is
+        # unknown - which is exactly what an unavailable development[] clause
+        # can look like. Read as an empty cohort, the sweep touches nothing and
+        # reports success, and the go-live gate sees a clean run.
+        client = stub_client([StubResponse(
+            {"warningMessages": ["Field 'development' does not exist"]})])
+        with self.assertRaises(JiraError) as cm:
+            client.search_keys("project = O3")
+        self.assertIn("warningMessages", str(cm.exception))
+
+    def test_an_empty_cohort_is_still_accepted(self):
+        client = stub_client([StubResponse({"issues": []})])
+        self.assertEqual(client.search_keys("project = O3"), [])
+
+    def test_a_repeating_page_token_is_refused_rather_than_looped_on(self):
+        # A cursor that does not advance is an unbounded loop: the sweep never
+        # finishes, never reports, and burns the rate limit until CI kills it.
+        client = stub_client([StubResponse({"issues": [{"key": "O3-1"}],
+                                            "nextPageToken": "t1"})] * 3)
+        with self.assertRaises(JiraError) as cm:
+            client.search_keys("project = O3")
+        self.assertIn("not advancing", str(cm.exception))
+
+    def test_an_unauthenticated_post_falls_back_to_get(self):
+        client = stub_client([StubResponse({}, 401),
+                              StubResponse({"issues": [{"key": "O3-1"}]})])
+        self.assertEqual(client.search_keys("project = O3"), ["O3-1"])
+        self.assertEqual([c["method"] for c in client.session.calls], ["POST", "GET"])
 
 
 class ChangelogExpansionTests(unittest.TestCase):
@@ -1897,7 +2032,8 @@ class EvalGateTests(unittest.TestCase):
             with mock.patch.object(Path, "read_text", sweep_lands_after_the_first_read), \
                  contextlib.redirect_stdout(io.StringIO()):
                 module.import_proposals(str(sheet), str(d / "out"))
-            row = next(csv.DictReader(open(module.GRADED)))
+            with open(module.GRADED) as fh:
+                row = next(csv.DictReader(fh))
             frozen = (module.CONTEXTS / "O3-1.txt").read_text()
         self.assertEqual(frozen, graded_text, "froze text that was never graded")
         self.assertEqual(row["content_hash"], ctx.content_hash(graded_text))
@@ -1923,7 +2059,8 @@ class EvalGateTests(unittest.TestCase):
                             "grade(ok/wrong)": "ok"})
             with contextlib.redirect_stdout(io.StringIO()):
                 module.import_proposals(str(sheet), str(d / "out"))
-            row = next(csv.DictReader(open(module.GRADED)))
+            with open(module.GRADED) as fh:
+                row = next(csv.DictReader(fh))
             frozen = (module.CONTEXTS / "O3-1.txt").read_text()
         self.assertEqual(row["content_hash"], ctx.content_hash(frozen))
         self.assertEqual(frozen, text)

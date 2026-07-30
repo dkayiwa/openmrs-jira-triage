@@ -42,8 +42,19 @@ def inspect(issue: dict, ai_labels: list[str], bot_account_id: str | None,
     (the 24h SLA's start point). Rather than truncate silently, that case raises
     - the convenience default must not become a quiet correctness hole.
     """
+    fields = issue["fields"]
+    # Not `.get("labels", [])`. Both callers request the field today, so this is
+    # a guard rather than a fix - but if one ever trims its field list, the
+    # default turns "we did not ask" into "there are none", and every already
+    # labelled ticket in the cohort reads as fresh: re-labelled and re-commented
+    # to every watcher, silently, on the next sweep. Jira returns the key for a
+    # ticket with no labels, so its absence only ever means it was not requested.
+    if "labels" not in fields:
+        raise ValueError(f"{issue.get('key')}: the issue was fetched without its "
+                         "labels, so which ai-triage labels it already carries is "
+                         "unknown; add 'labels' to the requested fields")
     st = TicketState(
-        ai_labels_present=[l for l in issue["fields"].get("labels", []) if l in ai_labels]
+        ai_labels_present=[l for l in fields["labels"] if l in ai_labels]
     )
     if histories is None:
         changelog = issue.get("changelog") or {}

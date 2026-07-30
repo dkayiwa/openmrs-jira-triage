@@ -58,6 +58,7 @@ class JiraClient:
         """All issue keys matching jql (POST /rest/api/3/search/jql, GET fallback)."""
         keys: list[str] = []
         token: str | None = None
+        seen_tokens: set[str] = set()
         while True:
             body: dict = {"jql": jql, "fields": ["key"], "maxResults": 100}
             if token:
@@ -70,10 +71,27 @@ class JiraClient:
                     params["nextPageToken"] = token
                 resp = self._get("/rest/api/3/search/jql", params=params)
             data = self._check(resp)
-            keys += [i["key"] for i in data.get("issues", [])]
+            # An empty cohort and a body that is not a search result look the
+            # same through .get("issues", []): both yield zero keys, and zero
+            # keys is a sweep that does nothing and reports success. Jira
+            # returns "issues" even for no matches, so its absence means the
+            # response is something else - a warningMessages-only body from a
+            # JQL field Jira does not know, an error envelope, a proxy page.
+            if "issues" not in data:
+                raise JiraError(
+                    f"search/jql returned 200 whose body is not a search result "
+                    f"(keys: {sorted(data)[:6]}); that is no answer, not an empty cohort")
+            keys += [i["key"] for i in data["issues"]]
             token = data.get("nextPageToken")
             if not token:
                 return keys
+            # A token Jira has already handed us means the cursor is not moving.
+            # Left unguarded that is an infinite loop: the sweep never finishes,
+            # never reports, and burns the rate limit until the job is killed.
+            if token in seen_tokens:
+                raise JiraError(f"search/jql repeated nextPageToken {token!r} after "
+                                f"{len(keys)} keys; the cursor is not advancing")
+            seen_tokens.add(token)
 
     def _complete(self, path: str, embedded: dict | None, embedded_key: str,
                   page_key: str) -> list[dict]:
@@ -90,19 +108,46 @@ class JiraClient:
         discarded and the dedicated endpoint is read from the start.
         """
         emb = embedded or {}
-        items = list(emb.get(embedded_key, []))
-        total = emb.get("total", len(items))
-        if len(items) >= total:
-            return items
+        # "No embedded page" is not "no items". An absent page - the caller did
+        # not request the field, or Jira dropped it - carries no total, so
+        # defaulting the total to the zero items in hand certifies an emptiness
+        # that was never obtained: the check below compares 0 >= 0 and returns
+        # a complete-looking answer without one request. Unknown means go and
+        # ask. (Same disarming default as a search whose total_count falls back
+        # to len(items), which github.py refuses for the same reason.)
+        if embedded is not None and "total" in emb:
+            items = list(emb.get(embedded_key, []))
+            if len(items) >= emb["total"]:
+                return items
         items = []
+        total = None
         while True:
             data = self._check(self._get(path, params={"startAt": len(items),
                                                        "maxResults": 100}))
             page = data.get(page_key) or []
             items += page
-            total = data.get("total", total)
-            if not page or len(items) >= total:
+            if "total" in data:
+                total = data["total"]
+            # Everything below fails CLOSED, because this helper's callers read
+            # its result as exhaustive: changelog() decides whether a human
+            # opted a ticket out, and comments() decides whether a question has
+            # already been answered. A short read is indistinguishable from a
+            # complete one, and answering "no opt-out" from history nobody
+            # fetched re-labels a ticket a maintainer opted out of - permanently
+            # and publicly. Raising costs one ticket, which the caller journals.
+            if total is None:
+                raise JiraError(
+                    f"GET {path} returned no total, so there is no way to tell "
+                    f"whether these {len(items)} entries are all of them")
+            if len(items) >= total:
                 return items
+            if not page:
+                # Guards the loop against a server that never advances, but the
+                # bound must not be paid for by silently truncating: returning
+                # here is exactly the short read described above.
+                raise JiraError(
+                    f"GET {path} reported {total} entries but stopped returning "
+                    f"them at {len(items)}; the remainder cannot be ruled out")
 
     def comments(self, key: str, embedded: dict | None) -> list[dict]:
         """Every comment on the ticket.
