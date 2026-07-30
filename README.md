@@ -204,9 +204,19 @@ CSV: mark each row `ok` or `wrong` (plus `correct_label` when wrong), and:
 code reports whether the comparison ran rather than whether anything was
 cleared. The pinned pair is what the pilot committed to before seeing results;
 a model shopped for afterwards must not inherit that authority. Note the
-volumes involved are small — a full sweep is ~35k input tokens — so the saving
-from a cheaper model is a few dollars a month against a kill metric that stops
-the pilot at four removals out of ~32.
+volumes involved are small — a full sweep is ~49k input tokens, measured over
+the 31-ticket cohort under prompt v3 — so the saving from a cheaper model is a
+few dollars a month against a kill metric that stops the pilot at four removals
+out of ~31. Steady-state sweeps cost far less again, because an unchanged
+ticket is skipped before it is ever sent.
+
+   Worth knowing before optimising the wrong thing: **73% of that input is the
+   system prompt, not the tickets.** It is 4,665 characters re-sent with all 31
+   calls (~36k tokens) against ~13k for every context combined. So the lever on
+   cost is prompt caching, not a cheaper model — and caching would leave the
+   pinned pair, and therefore the pre-registered metrics, untouched. Not
+   implemented here: it changes how the pipeline calls the API, which is the
+   owners' call during a pre-registered pilot, not a hardening change.
 
 The graded set becomes the regression suite: iterate `prompt/system.md` (bump
 `[prompt].version`) until agreement is >= 90%, the offline proxy for the
@@ -293,7 +303,10 @@ phase, every human label-removal gets added here as a new case.
    of 32, which is within about twice the harness effect measured alongside it,
    so that gap may be the test wrapper rather than the model. Note the stakes are
    asymmetric — the saving from a cheaper model is a few dollars a month against
-   a kill metric that stops the pilot at four removals out of ~32.
+   a kill metric that stops the pilot at four removals out of ~31. (Both figures
+   restated above under "Running without an Anthropic API key"; they were two
+   copies of one sentence and had already drifted apart by the time anyone
+   checked, which is the argument for reading that section as the source.)
 6. **Enable writes:** add the four repo secrets, uncomment the `schedule` block
    in `.github/workflows/triage.yml`, or run `python -m triage.run --live`.
    (`GITHUB_TOKEN` is not a fifth secret — the workflow passes the automatic
