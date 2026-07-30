@@ -3644,6 +3644,76 @@ class LiveRunTests(unittest.TestCase):
         self.assertEqual(rows[-1]["action"], "skip-already-triaged",
                          "the repaired property must settle on the next sweep")
 
+    def test_the_journal_describes_what_was_actually_written(self):
+        """The whole loop's state space, checked against the audit trail.
+
+        Individual branches are tested and plan_ticket's decision chain was
+        enumerated, but the loop composes pieces added in different passes -
+        the open-PR skip, the property guard, the write ordering, the breaker -
+        and the skill's rule is to re-derive the merged result rather than
+        trust the reviews that approved each piece alone.
+
+        The invariant nothing checked is fidelity: the journal is what Dennis
+        and Veronica read to see what the bot did, so an action that disagrees
+        with the writes is an audit trail that lies. "labeled" must mean a
+        comment was posted, "refreshed" must mean one was not, and any skip
+        must mean nothing was written at all.
+        """
+        cfg = load_config()
+        chosen = cfg["labels"]["needs_judgment"]
+        other = cfg["labels"]["needs_more_info"]
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        fresh = ctx.content_hash(ctx.assemble(StubJira(), issue(), None, []))
+        properties = {
+            "absent": None,
+            "empty": {},
+            "current": {"contentHash": fresh, "prompt": cfg["prompt"]["version"],
+                        "source": "api"},
+            "stale-hash": {"contentHash": "old", "prompt": cfg["prompt"]["version"],
+                           "source": "api"},
+            "stale-prompt": {"contentHash": fresh, "prompt": "v0", "source": "api"},
+            "replayed": {"contentHash": fresh, "prompt": cfg["prompt"]["version"],
+                         "source": "file"},
+            "malformed": ["not", "an", "object"],
+        }
+        seen = set()
+        for labels in ([], [chosen], [other]):
+            for pname, prop in properties.items():
+                for opted_out in (False, True):
+                    hist = ([label_change("u1", chosen, "", display="M")]
+                            if opted_out else [])
+
+                    class Fixed(RecordingJira):
+                        def get_property(self, key, name):
+                            return prop
+
+                    jira = Fixed({"O3-1": issue(labels=list(labels), histories=hist)})
+                    with tempfile.TemporaryDirectory() as d:
+                        _, rows = self._sweep(jira, c, ["--live", "--keys", "O3-1"],
+                                              Path(d))
+                    action = rows[-1]["action"]
+                    kinds = [w[0] for w in jira.writes]
+                    where = f"labels={labels} property={pname} opted_out={opted_out}"
+                    seen.add(action)
+
+                    if opted_out:
+                        self.assertEqual(action, "skip-opted-out", where)
+                    if action.startswith("skip"):
+                        self.assertEqual(jira.writes, [],
+                                         f"journal says {action} but wrote: {where}")
+                    if action == "labeled":
+                        self.assertEqual(kinds.count("comment"), 1,
+                                         f"journal says labeled without a comment: {where}")
+                    if action == "refreshed":
+                        self.assertEqual(kinds.count("comment"), 0,
+                                         f"journal says refreshed but commented: {where}")
+                    if action != "error":
+                        self.assertNotIn("error", rows[-1], where)
+
+        self.assertEqual(seen, {"labeled", "refreshed", "skip-already-triaged",
+                                "skip-opted-out"},
+                         f"the enumeration missed an outcome; reached {sorted(seen)}")
+
     def test_live_without_credentials_refuses_to_start(self):
         # The guard against a --live run that would sweep anonymously: it cannot
         # write, so every ticket fails, but it would fail them five at a time on
