@@ -600,6 +600,35 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("[FAIL] bot can read and write entity properties", report)
 
+    def test_an_unevaluated_dev_panel_clause_fails_rather_than_passing_empty(self):
+        # Jira answers a development[] clause it cannot evaluate with an empty
+        # result set, not an error - so attempt() reports success and the gate
+        # used to print "[PASS] scope JQL - 0 ticket(s)" and exit 0, certifying a
+        # sweep that would find nothing. The clause-free count separates "no
+        # cohort" from "clause silently ignored".
+        class EmptyWithClause(self.Stub):
+            def search_keys(self, jql):
+                self._guard("search_keys")
+                return [] if "development[" in jql else ["O3-1", "O3-2"]
+
+        rc, report = self._run(EmptyWithClause())
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] scope JQL", report)
+        self.assertIn("not being evaluated", report)
+
+    def test_a_genuinely_empty_cohort_still_passes(self):
+        class EmptyEither(self.Stub):
+            def search_keys(self, jql):
+                self._guard("search_keys")
+                return []
+
+        rc, report = self._run(EmptyEither())
+        self.assertEqual(rc, 0, report)
+        self.assertIn("genuinely empty", report)
+        # And the backstop probe says its key was invented rather than implying
+        # it exercised something the sweep will ask for.
+        self.assertIn("synthetic", report)
+
     def test_scratch_without_credentials_fails_rather_than_skipping(self):
         # README step 4 is `preflight --scratch O3-XXXX`. Run it without bot
         # credentials and every write probe is skipped - but preflight used to

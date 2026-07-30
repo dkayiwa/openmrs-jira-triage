@@ -14,7 +14,6 @@ import os
 import sys
 
 from . import context as ctx
-from .jira import JiraError
 from .run import bot_identity_error, github_from_env, jira_from_env, load_config
 from .state import PROPERTY_KEY
 
@@ -96,8 +95,26 @@ def main(argv=None) -> int:
     dev_clause = cfg["jira"]["dev_panel_clause"]
     scope_label = "scope JQL (with development[] clause)"
     scope_ok, keys = attempt(scope_label, lambda: jira.search_keys(jql))
-    if scope_ok:
+    if scope_ok and keys:
         ok &= check(scope_label, True, f"{len(keys)} ticket(s); doc estimates ~35")
+    elif scope_ok:
+        # An empty result is not an error, so attempt() calls it a success - but
+        # a development[] clause Jira cannot evaluate (no GitHub-for-Jira app, or
+        # no dev-panel access) returns an empty set rather than a 400. Reporting
+        # PASS on that means the gate certifies a sweep that will find nothing.
+        # The clause-free count tells the two apart: both zero is a genuinely
+        # empty cohort; a difference is the clause silently not being applied.
+        bare_ok, bare = attempt("scope JQL without the development[] clause",
+                                lambda: jira.search_keys(jql.replace(dev_clause, "")))
+        if bare_ok and bare:
+            ok &= check(scope_label, False,
+                        f"0 ticket(s) with the development[] clause but {len(bare)} "
+                        "without it - the clause is not being evaluated here, so "
+                        "the sweep would see an empty cohort")
+        else:
+            ok &= check(scope_label, True,
+                        "0 ticket(s), and 0 without the development[] clause too - "
+                        "the cohort is genuinely empty")
     else:
         ok = False
         fallback_ok, fallback = attempt("scope JQL without the development[] clause",
@@ -119,13 +136,17 @@ def main(argv=None) -> int:
         gh_label = "github open-PR backstop"
         # A key the sweep will actually ask about, so a probe that passes proves
         # the query the pipeline runs - not a simpler one.
-        probe_key = keys[0] if scope_ok and keys else cfg["jira"]["project"] + "-1"
+        real_key = bool(scope_ok and keys)
+        probe_key = keys[0] if real_key else cfg["jira"]["project"] + "-1"
         probed, urls = attempt(gh_label, lambda: gh.open_pr_urls(probe_key))
         if probed:
             auth = "GITHUB_TOKEN" if gh.authenticated else \
                 f"unauthenticated: {gh.min_interval:.0f}s/search, set GITHUB_TOKEN to cut it"
-            ok &= check(gh_label, True, f"org {gh.org}, searched {probe_key} "
-                                        f"({len(urls)} open PR(s)); {auth}")
+            # Say so when the key is made up: the probe still proves the
+            # search works, but not against anything the sweep will ask for.
+            provenance = "" if real_key else " (synthetic - the scope query returned nothing)"
+            ok &= check(gh_label, True, f"org {gh.org}, searched {probe_key}"
+                                        f"{provenance} ({len(urls)} open PR(s)); {auth}")
         else:
             ok = False
             print("       the sweep fails a ticket rather than classifying it when this "
@@ -142,7 +163,7 @@ def main(argv=None) -> int:
             jira.update_labels(args.scratch, [hyphen_label], [])
             hyphen_ok = True
             ok &= check("hyphenated label accepted", True, hyphen_label)
-        except JiraError as e:
+        except Exception as e:
             ok &= check("hyphenated label accepted", False, str(e)[:200])
         # Only clean up what actually landed, and catch broadly: a transport
         # error is not a JiraError, and letting one escape would abort
@@ -161,7 +182,7 @@ def main(argv=None) -> int:
         # opposite conclusion, and leave the label on the scratch ticket.
         try:
             jira.update_labels(args.scratch, [slash_label], [])
-        except JiraError as e:
+        except Exception as e:
             if hyphen_ok:
                 check("slash rejected in labels", True,
                       "hyphenated ai-triage-* names are required")
@@ -188,7 +209,7 @@ def main(argv=None) -> int:
             posted = jira.add_comment(args.scratch, "triage pilot preflight - "
                                       "verifying Add Comments; this will be deleted")
             ok &= check("bot can add comments", True, f"comment {posted.get('id')}")
-        except JiraError as e:
+        except Exception as e:
             ok &= check("bot can add comments", False, str(e)[:200])
         finally:
             if posted and posted.get("id"):
@@ -209,7 +230,7 @@ def main(argv=None) -> int:
             ok &= check("bot can read and write entity properties",
                         (stored or {}).get("probe") == "triage pilot preflight",
                         "idempotency depends on this")
-        except JiraError as e:
+        except Exception as e:
             ok &= check("bot can read and write entity properties", False, str(e)[:200])
         finally:
             try:

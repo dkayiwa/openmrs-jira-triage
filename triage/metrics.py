@@ -110,6 +110,16 @@ def main() -> int:
         except Exception as e:
             failed.append(f"{key}: reading {PROPERTY_KEY}: {type(e).__name__}: {e}"[:200])
             continue
+        # Computed before anything is counted. A missing `created`, or a
+        # timestamp fromisoformat cannot parse from either the field or the
+        # changelog, would otherwise raise out of the loop and discard every
+        # ticket already walked along with the `failed` diagnostics explaining
+        # why - the opposite of the per-ticket isolation this walk is built on.
+        try:
+            met_sla = sla_met(issue["fields"]["created"], st.bot_first_labeled_at, launch)
+        except Exception as e:
+            failed.append(f"{key}: computing the 24h SLA: {type(e).__name__}: {e}"[:200])
+            continue
         labeled += 1
         # A bot-labelled ticket with NO property is unknown provenance, not api
         # provenance, and defaulting it to "api" failed open on precisely the
@@ -130,7 +140,7 @@ def main() -> int:
             source, classifier = f"malformed ({type(prop).__name__})", None
         if source != "api":
             replayed.append(f"{key}: source={source} classifier={classifier}")
-        if sla_met(issue["fields"]["created"], st.bot_first_labeled_at, launch):
+        if met_sla:
             within += 1
         if st.opted_out:
             removed += 1
