@@ -106,7 +106,16 @@ def main(argv=None) -> int:
         # empty cohort; a difference is the clause silently not being applied.
         bare_ok, bare = attempt("scope JQL without the development[] clause",
                                 lambda: jira.search_keys(jql.replace(dev_clause, "")))
-        if bare_ok and bare:
+        # Three states, not two. attempt() prints its own FAIL line for a control
+        # query that raised but does not touch `ok`, so folding that case in with
+        # "both empty" would assert a clause-free count of zero that was never
+        # obtained - the same unearned PASS, surviving in the error state.
+        if not bare_ok:
+            ok &= check(scope_label, False,
+                        "0 ticket(s), and the clause-free control query failed too, "
+                        "so there is no evidence either way about whether the cohort "
+                        "is empty or the development[] clause is being ignored")
+        elif bare:
             ok &= check(scope_label, False,
                         f"0 ticket(s) with the development[] clause but {len(bare)} "
                         "without it - the clause is not being evaluated here, so "

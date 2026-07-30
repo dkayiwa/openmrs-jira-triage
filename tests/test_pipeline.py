@@ -616,6 +616,23 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("[FAIL] scope JQL", report)
         self.assertIn("not being evaluated", report)
 
+    def test_an_empty_cohort_with_a_failed_control_query_is_not_a_pass(self):
+        # The tri-state the first version of this fix missed: attempt() prints a
+        # FAIL line for a control query that raised but does not touch `ok`, so
+        # folding that case in with "both empty" asserted a clause-free count of
+        # zero that was never obtained - the same unearned PASS one state over.
+        class EmptyThenBroken(self.Stub):
+            def search_keys(self, jql):
+                self.calls.append("search_keys")
+                if "development[" in jql:
+                    return []
+                raise JiraError("400: bad JQL")
+
+        rc, report = self._run(EmptyThenBroken())
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] scope JQL", report)
+        self.assertIn("no evidence either way", report)
+
     def test_a_genuinely_empty_cohort_still_passes(self):
         class EmptyEither(self.Stub):
             def search_keys(self, jql):
