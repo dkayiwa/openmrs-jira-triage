@@ -1013,6 +1013,41 @@ class PreflightTests(unittest.TestCase):
         self.assertIn("[FAIL] github open-PR backstop", report)
         self.assertIn("--no-pr-check", report)
 
+    def test_the_gate_accepts_the_escape_hatch_it_recommends(self):
+        """The documented recovery path, walked rather than read.
+
+        On a backstop failure this gate printed "pass --no-pr-check", and
+        preflight itself answered "unrecognized arguments" - the flag existed
+        only on the sweep. That was survivable while preflight was a laptop
+        command, and stopped being so when it became a required workflow step:
+        a GitHub outage then left the gate red with no way to say "yes,
+        deliberately, proceed without the backstop", so the sweep could not run
+        at all.
+        """
+        rc, report = self._run(self.Stub(), argv=["--no-pr-check"])
+        self.assertEqual(rc, 0, report)
+        self.assertIn("skipped (--no-pr-check)", report)
+        self.assertEqual(StubGitHub.searched, [], "probed despite --no-pr-check")
+        self.assertNotIn("[PASS] github open-PR backstop", report,
+                         "a skipped probe must not read as a passed one")
+        # Not merely unused - not built. The sweep is already pinned this way
+        # (test_no_pr_check_skips_the_lookup_entirely), and the flag should
+        # mean the same thing in both: touch GitHub not at all, including not
+        # reading GITHUB_TOKEN to construct a client that is then discarded.
+        self.assertEqual(StubGitHub.built, 0, "built a client despite --no-pr-check")
+
+    def test_the_failure_advice_names_a_command_that_works(self):
+        # The advice used to send the reader to a flag their current command
+        # rejected. It has to name where the flag goes, and say what is being
+        # given up - scope then rests on the dev panel, which is the thing the
+        # backstop exists to distrust.
+        StubGitHub.error = gh.GitHubError("503 upstream unavailable")
+        self.addCleanup(StubGitHub.reset)
+        _, report = self._run(self.Stub())
+        self.assertIn("BOTH this gate", report)
+        self.assertIn("triage.run", report)
+        self.assertIn("check_open_prs = false", report)
+
     def test_the_synthetic_probe_key_cannot_match_a_page_of_prs(self):
         # GitHub search is full text, so a short key is a loose token. Measured
         # against the real org: "O3-1" matches 85 open PRs and "O3-0" matches

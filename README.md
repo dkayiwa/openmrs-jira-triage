@@ -66,7 +66,11 @@ the automatic `github.token`, so no new repo secret is needed. A failed search
 **fails that ticket** rather than classifying it — fail-open would silently
 re-open this gap on exactly the tickets most likely to be in review. Use
 `--no-pr-check` (or `[github].check_open_prs = false`) to sweep on Jira's word
-alone; either way the run says which mode it is in.
+alone; either way the run says which mode it is in. **Pass the flag to
+`triage.preflight` as well as `triage.run`** — the gate probes the same search
+and runs as a required workflow step, so skipping it in one place and not the
+other leaves the sweep blocked by a red gate. The config toggle needs saying
+once and covers both.
 
 ## Quickstart (dry-run, no Jira credentials needed)
 

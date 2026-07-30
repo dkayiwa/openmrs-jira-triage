@@ -44,6 +44,13 @@ def attempt(label: str, fn):
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="triage pilot preflight")
     ap.add_argument("--scratch", help="issue key for the label-charset write test (needs bot auth)")
+    # The same flag the sweep takes, because preflight tells the operator to
+    # reach for it. Before this, the failure below advised "pass --no-pr-check"
+    # and preflight itself answered "unrecognized arguments" - and since
+    # preflight became a required workflow step, a GitHub outage left the gate
+    # red with no way to say "yes, deliberately, proceed without the backstop".
+    ap.add_argument("--no-pr-check", action="store_true",
+                    help="skip the open-PR backstop probe (the sweep needs the same flag)")
     args = ap.parse_args(argv)
 
     cfg = load_config()
@@ -146,8 +153,11 @@ def main(argv=None) -> int:
     # key here would take minutes and teach nothing the sweep will not report.
     # Built by the same factory the sweep uses, so preflight cannot pass against a
     # differently-configured backstop than the one that will run.
-    gh = github_from_env(cfg)
-    if gh is None:
+    gh = None if args.no_pr_check else github_from_env(cfg)
+    if args.no_pr_check:
+        print("       open-PR backstop: skipped (--no-pr-check); the sweep must be given "
+              "the same flag, or it will still fail every ticket on this search")
+    elif gh is None:
         print("       open-PR backstop: disabled in config.toml; scope rests on Jira's "
               "dev panel alone")
     else:
@@ -178,7 +188,10 @@ def main(argv=None) -> int:
         else:
             ok = False
             print("       the sweep fails a ticket rather than classifying it when this "
-                  "search fails; pass --no-pr-check to sweep without the backstop")
+                  "search fails. To proceed without the backstop, pass --no-pr-check to "
+                  "BOTH this gate and `python -m triage.run`, or set "
+                  "[github].check_open_prs = false - and note that scope then rests on "
+                  "Jira's dev panel, which is what the backstop exists to distrust.")
 
     if args.scratch and jira.authenticated:
         # The hyphenated add runs FIRST and gates the slash conclusion. Without
