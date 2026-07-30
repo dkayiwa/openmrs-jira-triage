@@ -577,6 +577,75 @@ class DocumentedSurfaceTests(unittest.TestCase):
                           f'code reads cfg["{section}"]["{key}"], which is absent')
 
 
+class ReportMarkupTests(unittest.TestCase):
+    """No untrusted field may introduce an element into the HTML report.
+
+    The report is built by string concatenation and it is the document Dennis
+    and Veronica open to review what the bot wrote. Reading the source for
+    missing esc() calls is the weak check - 41 interpolations, and judging each
+    by eye is how one gets missed. This puts a payload in every field that
+    comes from a ticket or from the model, then parses the result and asks the
+    parser which elements exist.
+    """
+
+    PAYLOAD = '<script>alert(1)</script><img src=x onerror=alert(2)>"><b>x</b>'
+
+    def _elements(self, html_text):
+        import html.parser
+
+        found = []
+
+        class Collect(html.parser.HTMLParser):
+            def handle_starttag(self, tag, attrs):
+                found.append((tag, dict(attrs)))
+
+        Collect().feed(html_text)
+        return found
+
+    def _report(self, source="api"):
+        cfg = load_config()
+        c = Classification("needs_more_info", f"Rationale {self.PAYLOAD}",
+                           [f"missing {self.PAYLOAD}"], [f"verify {self.PAYLOAD}"],
+                           0.8, f"model {self.PAYLOAD}")
+        iss = issue(summary=f"Summary {self.PAYLOAD}")
+        excluded = [{"key": "O3-2", "open_prs": [f"https://x/{self.PAYLOAD}"],
+                     "summary": f"Excluded {self.PAYLOAD}"}]
+        stamp = datetime.datetime(2026, 8, 1, tzinfo=datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            base = run.proposal_base(Path(d), stamp)
+            path = run.write_comment_report(cfg, base, stamp, [(iss, c, "abc")],
+                                            False, source, excluded, swept=2, errors=0)
+            return path.read_text()
+
+    def _assert_inert(self, text, marker):
+        self.assertIn(marker, text, "the fixture never reached the report")
+        tags = {tag for tag, _ in self._elements(text)}
+        for injected in ("script", "img", "b"):
+            self.assertNotIn(injected, tags,
+                             f"<{injected}> was introduced by a field the model "
+                             f"or a ticket controls; tags present: {sorted(tags)}")
+        for _, attrs in self._elements(text):
+            for name in attrs:
+                # An attribute can execute without a new element, so tag names
+                # alone would miss onerror= landing inside the report's own tags.
+                self.assertFalse(name.startswith("on"),
+                                 f"event handler {name}= reached the report")
+
+    def test_no_element_from_an_untrusted_field_reaches_the_document(self):
+        self._assert_inert(self._report(), "Summary")
+
+    def test_the_replay_banner_escapes_its_self_declared_classifier(self):
+        # This banner only renders when source != "api", so the api-path test
+        # above never reaches it - and dropping esc() there survived the whole
+        # suite. The string is the `classifier` field of a classifications
+        # file, which run.py's own comment calls a label rather than proof:
+        # "a file can claim any model name it likes". FileClassifier flattens
+        # its whitespace, which stops a forged log line but not markup.
+        text = self._report(source="file")
+        self.assertIn("replayed from a file", text, "the banner did not render")
+        self._assert_inert(text, "Summary")
+
+
 class AgreementIntervalTests(unittest.TestCase):
     """What the pre-registered gate can actually resolve.
 
