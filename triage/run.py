@@ -77,6 +77,43 @@ def load_config() -> dict:
         return tomllib.load(fh)
 
 
+def cohort_since_error(value, today: datetime.date | None = None) -> str | None:
+    """Why this cohort window is unusable, or None.
+
+    `cohort_created_since` is a bare date typed by hand and interpolated
+    straight into JQL, and both ways of getting it wrong are silent. Jira does
+    not reject an impossible date: measured, `2026-14-01` returns zero results
+    rather than an error, and so does a year typed one ahead. Zero results then
+    reaches preflight's three-state scope check, which compares the count with
+    and without the development[] clause to tell "the clause is not being
+    evaluated" from "the cohort is empty" - and both counts are zero, so it
+    concludes the cohort is genuinely empty and PASSES.
+
+    The sweep then does nothing, every four hours, and the gate says it is
+    fine. The check is not wrong about what it measures; the cohort really is
+    empty. It is the question that is wrong, because an empty cohort and an
+    unanswerable query look identical from inside the query.
+
+    A future window is refused outright: this value is launch minus ninety
+    days by construction, so unlike pilot_launch there is no reading of it that
+    is legitimately ahead of today.
+    """
+    if not value or not isinstance(value, str):
+        return f"cohort_created_since is {value!r}; it must be a date like 2026-04-29"
+    try:
+        date = datetime.date.fromisoformat(value)
+    except ValueError:
+        return (f"cohort_created_since is {value!r}, which is not a real date. Jira "
+                "accepts it and returns nothing, so the sweep would find an empty "
+                "cohort and the gate would call it genuinely empty")
+    today = today or datetime.datetime.now(datetime.timezone.utc).date()
+    if date > today:
+        return (f"cohort_created_since is {value}, which is after today ({today}). No "
+                "ticket can have been created in that window, so the cohort is empty "
+                "by construction and every sweep would do nothing")
+    return None
+
+
 def ai_label_names(cfg: dict) -> list[str]:
     """The pilot's ai-triage-* label names.
 
@@ -761,6 +798,9 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     if args.keys:
         keys = [k.strip() for k in args.keys.split(",") if k.strip()]
     else:
+        window_error = cohort_since_error(cfg["jira"]["cohort_created_since"])
+        if window_error:
+            sys.exit(f"config.toml [jira]: {window_error}")
         jql = cfg["jira"]["scope_jql"].format(since=cfg["jira"]["cohort_created_since"])
         try:
             keys = jira.search_keys(jql)

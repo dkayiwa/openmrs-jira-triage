@@ -1085,6 +1085,40 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("[FAIL] bot can read and write entity properties", report)
 
+    def test_an_impossible_cohort_window_fails_the_gate(self):
+        """Jira does not reject a date that cannot exist.
+
+        Measured against the real instance: `2026-14-01` returns zero results
+        rather than an error, and so does a year typed one ahead. Both counts -
+        with and without the development[] clause - are then zero, so the
+        three-state scope check concludes "the cohort is genuinely empty" and
+        passes. It is not wrong about what it measured; the cohort really is
+        empty. The question is wrong, because an empty cohort and an
+        unanswerable query are indistinguishable from inside the query, and the
+        result is a sweep that does nothing every four hours under a green gate.
+        """
+        for since in ("2026-14-01", "not-a-date", ""):
+            cfg = load_config()
+            cfg["jira"] = dict(cfg["jira"], cohort_created_since=since)
+            with mock.patch.object(preflight, "load_config", lambda c=cfg: c):
+                rc, report = self._run(self.Stub())
+            self.assertEqual(rc, 1, f"{since!r} passed the gate")
+            self.assertIn("[FAIL] cohort window", report)
+
+    def test_a_cohort_window_in_the_future_fails_the_gate(self):
+        # Unlike pilot_launch, where "tomorrow" is legitimate, this value is
+        # launch minus ninety days by construction - there is no future reading
+        # of it, so refusing one costs nothing.
+        cfg = load_config()
+        cfg["jira"] = dict(cfg["jira"], cohort_created_since="2099-01-01")
+        with mock.patch.object(preflight, "load_config", lambda: cfg):
+            rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 1)
+        self.assertIn("after today", report)
+
+    def test_the_shipped_cohort_window_is_valid(self):
+        self.assertIsNone(run.cohort_since_error(load_config()["jira"]["cohort_created_since"]))
+
     def test_a_threshold_in_the_wrong_unit_fails_the_gate(self):
         # Checked at the gate rather than only in metrics.py because of when
         # each runs: the thresholds are pre-registered and typed once, and
@@ -4049,6 +4083,24 @@ class LiveRunTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as d:
             _, rows = self._sweep(jira, c, ["--live", "--keys", "O3-1"], Path(d))
         self.assertEqual(rows[-1]["convention_violation_adds"], ["A Maintainer"])
+
+    def test_the_sweep_refuses_a_cohort_window_it_cannot_trust(self):
+        # Guarded in the sweep as well as at the gate, because a local run does
+        # not invoke preflight. Without it the sweep queries a window that
+        # matches nothing, journals nothing, exits 0, and looks like a cohort
+        # that happened to be quiet.
+        cfg = load_config()
+        cfg["jira"] = dict(cfg["jira"], cohort_created_since="2026-14-01")
+        with tempfile.TemporaryDirectory() as d:
+            with mock.patch.object(run, "load_config", lambda: cfg), \
+                 mock.patch.object(run, "jira_from_env",
+                                   lambda c: RecordingJira({"O3-1": issue()})), \
+                 mock.patch.object(run, "Classifier", lambda *a: StubClassifier(None)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()), \
+                 self.assertRaises(SystemExit) as caught:
+                run.main(["--no-classify"], out=Path(d))
+        self.assertIn("not a real date", str(caught.exception))
 
     def test_live_without_credentials_refuses_to_start(self):
         # The guard against a --live run that would sweep anonymously: it cannot

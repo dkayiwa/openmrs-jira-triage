@@ -16,7 +16,8 @@ import sys
 from anthropic import Anthropic
 
 from . import context as ctx
-from .run import bot_identity_error, github_from_env, jira_from_env, load_config
+from .run import (bot_identity_error, cohort_since_error, github_from_env,
+                  jira_from_env, load_config)
 from .state import PROPERTY_KEY
 
 
@@ -93,6 +94,12 @@ def main(argv=None) -> int:
     else:
         ok = False
 
+    # Checked before the scope query, because the scope check cannot tell an
+    # empty cohort from an unanswerable one - both return zero, and it reports
+    # "genuinely empty" and passes.
+    window_error = cohort_since_error(cfg["jira"]["cohort_created_since"])
+    ok &= check("cohort window is a real date in the past", not window_error,
+                window_error or cfg["jira"]["cohort_created_since"])
     jql = cfg["jira"]["scope_jql"].format(since=cfg["jira"]["cohort_created_since"])
     dev_clause = cfg["jira"]["dev_panel_clause"]
     scope_label = "scope JQL (with development[] clause)"
