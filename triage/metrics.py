@@ -22,12 +22,18 @@ from .run import ai_label_names, jira_from_env, load_config
 from .state import PROPERTY_KEY, inspect
 
 
-def parse_launch(value: str | None) -> datetime.datetime:
+def parse_launch(value: str | None, today: datetime.date | None = None) -> datetime.datetime:
     """Midnight UTC on the pre-registered launch date.
 
     A bare YYYY-MM-DD only: appending a time to anything else yields a malformed
     string and an opaque "Invalid isoformat string" from fromisoformat, which
     says nothing about which config field is wrong.
+
+    Only an obviously-mistyped year is refused here; the precise check lives in
+    sla_met, where the data is. A first attempt rejected any future date and
+    the test suite immediately objected: the fixtures launch tomorrow, and so
+    does a real pilot whose config is committed the day before go-live. A gate
+    that turns red on the eve of launch is a worse bug than the one it guards.
     """
     if not value:
         sys.exit("set [metrics].pilot_launch in config.toml at launch - it anchors the 24h SLA")
@@ -35,6 +41,11 @@ def parse_launch(value: str | None) -> datetime.datetime:
         date = datetime.date.fromisoformat(value)
     except ValueError:
         sys.exit(f"[metrics].pilot_launch must be a bare date like 2026-08-01, not {value!r}")
+    today = today or datetime.datetime.now(datetime.timezone.utc).date()
+    if (date - today).days > 90:
+        sys.exit(f"[metrics].pilot_launch is {value}, over 90 days after today ({today}). "
+                 "That is a typed year rather than a launch date, and it would make every "
+                 "ticket report as sorted within 24h - see sla_met.")
     return datetime.datetime.combine(date, datetime.time(), datetime.timezone.utc)
 
 
@@ -64,9 +75,30 @@ def sla_met(created: str, labeled_at: str, launch: datetime.datetime) -> bool:
 
     Measured from max(created, launch) because the initial backlog cohort is
     older than 24h by definition.
+
+    A label that predates the launch is refused rather than measured. Because
+    the start is max(created, launch), a launch after the label makes the
+    elapsed time NEGATIVE, and negative is comfortably within 24 hours - so
+    every such ticket reports as sorted on time. Measured before this guard: a
+    ticket created 2026-08-10 and labelled 2026-09-20, forty-one days late,
+    returned True under a launch of 2027-08-01. The report then prints
+    "sorted within 24h : 100.0%  [PASS]" and a pre-registered decision can
+    reach ADOPT on a number nobody measured.
+
+    It is reachable from one hand-typed string: pilot_launch is set once, at
+    launch, and a mistyped year is the ordinary way that goes wrong. Raising
+    puts the ticket in metrics.py's `failed` list, which suppresses the
+    decision entirely - the right answer, since the anchor is wrong for the
+    whole cohort and not just this ticket.
     """
     start = max(datetime.datetime.fromisoformat(created), launch)
-    return datetime.datetime.fromisoformat(labeled_at) - start <= datetime.timedelta(hours=24)
+    labeled = datetime.datetime.fromisoformat(labeled_at)
+    if labeled < launch:
+        raise ValueError(
+            f"labelled {labeled.date()} but [metrics].pilot_launch is "
+            f"{launch.date()}: the bot cannot have labelled a ticket before the "
+            "pilot began, so the launch date is wrong")
+    return labeled - start <= datetime.timedelta(hours=24)
 
 
 def decide(pct24: float, removal_rate: float, intro: int, m: dict) -> str:

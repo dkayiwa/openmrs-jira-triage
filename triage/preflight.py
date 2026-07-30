@@ -261,7 +261,35 @@ def main(argv=None) -> int:
         print("       (label-charset write test skipped: pass --scratch O3-XXXX with bot credentials)")
 
     ok &= check_anthropic(cfg)
+    ok &= check_pilot_launch(cfg)
     return 0 if ok else 1
+
+
+def check_pilot_launch(cfg: dict) -> bool:
+    """Is the SLA anchor a date that could have happened?
+
+    Checked here as well as in metrics.py because of when each one runs. This
+    value is typed by hand once, at launch; metrics.py first reads it a week
+    later, by which point the sweeps have already been measured against it. The
+    gate runs before every sweep, so it is where a typo gets caught while it
+    still costs nothing.
+
+    Unset stays informational - the sweep does not need it and the pilot has
+    run for weeks without it - but a value that is set and impossible fails,
+    the same split as the Anthropic credential above.
+    """
+    value = cfg["metrics"].get("pilot_launch")
+    if not value:
+        print("       [metrics].pilot_launch: unset - set it at launch; "
+              "`python -m triage.metrics` needs it to anchor the 24h SLA")
+        return True
+    try:
+        from .metrics import parse_launch
+
+        parse_launch(value)
+    except SystemExit as e:
+        return check("[metrics].pilot_launch is a date in the past", False, str(e)[:200])
+    return check("[metrics].pilot_launch is a date in the past", True, value)
 
 
 def check_anthropic(cfg: dict) -> bool:

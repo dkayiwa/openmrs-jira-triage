@@ -1084,6 +1084,28 @@ class PreflightTests(unittest.TestCase):
         self.assertEqual(rc, 1)
         self.assertIn("[FAIL] bot can read and write entity properties", report)
 
+    def test_a_future_pilot_launch_fails_the_gate(self):
+        # Caught here rather than only in metrics.py because of timing: the
+        # date is typed once at launch, and metrics.py does not read it until
+        # a week later, by which point every sweep has been measured against
+        # it. The gate runs before each sweep.
+        cfg = load_config()
+        cfg["metrics"] = dict(cfg["metrics"], pilot_launch="2099-01-01")
+        with mock.patch.object(preflight, "load_config", lambda: cfg):
+            rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 1)
+        self.assertIn("[FAIL] [metrics].pilot_launch", report)
+
+    def test_an_unset_pilot_launch_is_reported_but_not_fatal(self):
+        # Its current state, and the sweep does not need it - failing here
+        # would block the dry runs the pilot has lived on for weeks.
+        cfg = load_config()
+        cfg["metrics"] = dict(cfg["metrics"], pilot_launch="")
+        with mock.patch.object(preflight, "load_config", lambda: cfg):
+            rc, report = self._run(self.Stub())
+        self.assertEqual(rc, 0, report)
+        self.assertIn("pilot_launch: unset", report)
+
     def test_a_rejected_anthropic_key_fails_the_gate(self):
         # The line this replaces reported whether an environment variable
         # existed, which a rotated or revoked key satisfies just as well as a
@@ -2518,6 +2540,33 @@ class DecisionRuleTests(unittest.TestCase):
              self.assertRaises(SystemExit) as caught:
             metrics.main()
         self.assertIn("TRIAGE_BOT_ACCOUNT_ID", str(caught.exception))
+
+    def test_a_label_predating_the_launch_is_refused_not_measured(self):
+        # The bug, precisely stated. sla_met starts from max(created, launch),
+        # so a launch after the label makes the elapsed time negative - and
+        # negative is within 24 hours, so the ticket reports as sorted on time.
+        # Measured before the guard: created 2026-08-10, labelled 2026-09-20
+        # (41 days late), launch 2027-08-01 -> True. The report then prints
+        # 100.0% [PASS] and a pre-registered decision can reach ADOPT on a
+        # number nobody measured. One mistyped year in config.toml does it.
+        way_ahead = datetime.datetime(2027, 8, 1, tzinfo=datetime.timezone.utc)
+        with self.assertRaises(ValueError) as caught:
+            sla_met("2026-08-10T09:00:00.000+0000",
+                    "2026-09-20T09:00:00.000+0000", way_ahead)
+        self.assertIn("before the pilot began", str(caught.exception))
+
+    def test_a_launch_the_day_before_go_live_is_still_valid(self):
+        # The first version of this guard rejected any future launch date, and
+        # the suite objected: committing the config the day before launch is
+        # normal, and the fixtures do exactly that. A gate that turns red on
+        # the eve of go-live is worse than the bug it guards.
+        tomorrow = parse_launch("2026-08-01", today=datetime.date(2026, 7, 31))
+        self.assertEqual(tomorrow.date(), datetime.date(2026, 8, 1))
+
+    def test_a_mistyped_year_is_still_refused_up_front(self):
+        with self.assertRaises(SystemExit) as caught:
+            parse_launch("2027-08-01", today=datetime.date(2026, 7, 31))
+        self.assertIn("typed year", str(caught.exception))
 
     def test_exactly_24h_counts_as_within_24h(self):
         # "within 24h" is pre-registered, and pre-registration is worth only as
