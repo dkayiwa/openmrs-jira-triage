@@ -802,6 +802,27 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             # it graded under two prompt versions. Re-classification is quiet
             # unless the label actually flips.
             prop = {} if not args.live else (jira.get_property(key, PROPERTY_KEY) or {})
+            # The property is OUR bookkeeping, but it lives in Jira, so anyone
+            # with API access to the issue can put anything under this key -
+            # and the key is in a public repo. A non-dict raised AttributeError
+            # on the .get below, which errored the ticket; five such tickets
+            # tripped the consecutive-error breaker and aborted the sweep. The
+            # scope JQL orders by created ASC, so the same five would be met
+            # first on every run: the pilot stops, permanently, and the only
+            # trace is a journal nobody reads. metrics.py already guards this
+            # exact read - "hand-set, or written by something else" - because
+            # the same thought occurred there and not here.
+            #
+            # Treated as absent rather than fatal: unknown bookkeeping means we
+            # cannot claim the ticket is unchanged, so it is re-classified and
+            # the property is rewritten. That costs one classification and
+            # repairs itself, where failing costs the whole sweep forever.
+            if not isinstance(prop, dict):
+                print(f"WARN: {key}: entity property {PROPERTY_KEY} is "
+                      f"{type(prop).__name__}, not an object - something other than "
+                      "this pipeline wrote it; treating the ticket as untriaged",
+                      file=sys.stderr)
+                prop = {}
             # Asymmetric on purpose. The pinned-model path must not skip a label
             # a replay produced, or one replay run would pin those tickets for
             # the rest of the pilot. The reverse must NOT hold: if a file run

@@ -3595,6 +3595,55 @@ class LiveRunTests(unittest.TestCase):
         self.assertEqual(rows[-1]["action"], "skip-already-triaged",
                          "the bot's own flip was read as a maintainer opt-out")
 
+    def test_a_hand_set_entity_property_cannot_halt_the_pilot(self):
+        """Availability, not correctness: the sweep used to stop for good.
+
+        The property is our bookkeeping but it lives in Jira, so anyone with
+        API access to an issue can write anything under the key - which is
+        published in this repo. A non-dict raised AttributeError before
+        classification, so the ticket errored; five of them tripped the
+        consecutive-error breaker. scope_jql orders by created ASC, so the same
+        five are reached first on every run: every sweep aborts, forever, and
+        the only evidence is a journal line.
+
+        metrics.py already handled this read defensively - "hand-set, or
+        written by something else" - so the thought had occurred once, on the
+        other reader of the same property.
+        """
+        class HandSet(RecordingJira):
+            def get_property(self, key, prop):
+                return ["not", "an", "object"]
+
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        jira = HandSet({f"O3-{i}": issue() for i in range(8)})
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            rc, rows = self._sweep(jira, c, ["--live"], out)
+        self.assertEqual(len(rows), 8, "the sweep stopped short of the cohort")
+        self.assertEqual([r["action"] for r in rows], ["labeled"] * 8,
+                         "a malformed property must not error the ticket")
+        self.assertEqual(rc, 0)
+
+    def test_a_malformed_property_is_repaired_rather_than_left(self):
+        # Treating it as absent is only safe because the ticket is then
+        # re-classified and the property rewritten - one classification, and
+        # the ticket is healthy again. If it were left in place the warning
+        # would repeat on every sweep for the life of the pilot.
+        class HandSet(RecordingJira):
+            def get_property(self, key, prop):
+                return self.properties.get(key, "a bare string")
+
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        jira = HandSet({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            self._sweep(jira, c, ["--live", "--keys", "O3-1"], Path(d))
+        self.assertIsInstance(jira.properties.get("O3-1"), dict,
+                              "the malformed property was not overwritten")
+        with tempfile.TemporaryDirectory() as d:
+            rc, rows = self._sweep(jira, c, ["--live", "--keys", "O3-1"], Path(d))
+        self.assertEqual(rows[-1]["action"], "skip-already-triaged",
+                         "the repaired property must settle on the next sweep")
+
     def test_live_without_credentials_refuses_to_start(self):
         # The guard against a --live run that would sweep anonymously: it cannot
         # write, so every ticket fails, but it would fail them five at a time on
