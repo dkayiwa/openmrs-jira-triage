@@ -77,6 +77,7 @@ echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env   # .env is gitignored and auto-loade
 .venv/bin/python -m unittest discover -s tests -q  # offline logic tests
 .venv/bin/python -m triage.preflight  # connectivity, statuses, AC field, scope JQL
 .venv/bin/python -m triage.run --limit 5   # dry-run: proposals + contexts + journal
+open out/proposals-*.html                  # what it would write to each ticket
 ```
 
 Useful flags: `--keys O3-4522,O3-5823` (specific tickets), `--no-classify`
@@ -164,8 +165,17 @@ automatically with no `.env` at all.
 
 ## What to hand to Dennis & Veronica
 
-A dry run produces `out/proposals-<stamp>.md` (readable) and `.csv` (gradable).
-They mark each row `ok` or `wrong` (plus `correct_label` when wrong), then:
+Every run writes three files sharing one stamp:
+
+| File | For |
+|---|---|
+| `proposals-<stamp>.html` | **Review before launch.** Every label and the exact comment body each ticket would receive, plus the tickets held back as already in review. Rendered by the same `comment_body()` and `plan_label_writes()` the live path calls, so it is the text Jira receives rather than a restatement of it. Written on live runs too, where it is an audit trail of what *was* posted. |
+| `proposals-<stamp>.md` | Readable list of proposals |
+| `proposals-<stamp>.csv` | Gradable sheet |
+
+Send the HTML report round first — it is the artifact to sign off on, because
+comments notify every watcher and Jira Cloud has no off switch. Then grade the
+CSV: mark each row `ok` or `wrong` (plus `correct_label` when wrong), and:
 
 ```sh
 .venv/bin/python evals/run_evals.py --import-proposals out/proposals-<stamp>.csv
@@ -228,6 +238,6 @@ triage/preflight.py   pre-launch checks incl. label charset test
 triage/metrics.py     live-phase metrics + decision rule
 evals/run_evals.py    graded regression set for prompt changes
 tests/                offline unit tests (no network, no API key)
-out/                  journal.jsonl, contexts/, proposals (gitignored)
+out/                  journal.jsonl, contexts/, proposals .html/.md/.csv (gitignored)
 ```
 

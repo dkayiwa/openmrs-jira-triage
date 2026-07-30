@@ -32,11 +32,22 @@ SEARCH_URL = "https://api.github.com/search/issues"
 # ticket 11 of 34 and failing the rest of the sweep.
 RATE_LIMIT_PER_MIN = {True: 30, False: 10}
 
+# Pacing at exactly the documented rate is pacing at the limit: measured on a
+# real 32-ticket sweep, a 2.0s interval (30/min authenticated, the documented
+# maximum) took a 403 on the last ticket, because anything else sharing the
+# token - a `gh` invocation, a previous sweep's tail - lands in the same window.
+# Aim below the ceiling so the sweep has somewhere to drift.
+RATE_HEADROOM = 0.8
+
 # One bounded wait when the limit is hit anyway (clock skew, a shared runner
 # IP), then fail loudly. Sleeping through a long reset would silently stall a
 # sweep the pilot expects to finish inside its 24h SLA.
 MAX_RATE_WAIT_SECONDS = 75
 
+# The search window is a minute, so this is the wait when GitHub says "rate
+# limit exceeded" without a header saying when it reopens - the secondary-limit
+# response, which carries neither retry-after nor an exhausted remaining count.
+DEFAULT_RATE_WAIT_SECONDS = 60
 
 class GitHubError(RuntimeError):
     pass
@@ -78,7 +89,7 @@ class GitHubClient:
 
     @property
     def min_interval(self) -> float:
-        return 60.0 / RATE_LIMIT_PER_MIN[self.authenticated]
+        return 60.0 / (RATE_LIMIT_PER_MIN[self.authenticated] * RATE_HEADROOM)
 
     def _throttle(self) -> None:
         if self._last_request is not None:
@@ -121,7 +132,15 @@ class GitHubClient:
 
     @staticmethod
     def _retry_delay(resp) -> float | None:
-        """Seconds until the window reopens, from whichever header GitHub sent."""
+        """Seconds until the window reopens, or None if this is not a rate limit.
+
+        Three shapes, because GitHub sends three. `retry-after` is explicit.
+        An exhausted `x-ratelimit-remaining` pairs with a reset timestamp. And
+        the secondary limit sends neither - just a 403 whose body says the limit
+        was exceeded - which is the one a real 32-ticket sweep actually hit;
+        reading that as "not a rate limit" is why it failed the ticket instead of
+        waiting a minute for the window to reopen.
+        """
         headers = resp.headers or {}
         retry_after = headers.get("retry-after")
         if retry_after:
@@ -129,17 +148,19 @@ class GitHubClient:
                 return max(0.0, float(retry_after))
             except ValueError:
                 pass
-        # Only meaningful when the remaining count is actually exhausted; a 403
-        # for any other reason (a bad token) must not be read as a wait.
-        if headers.get("x-ratelimit-remaining") not in ("0", 0):
-            return None
-        reset = headers.get("x-ratelimit-reset")
-        if not reset:
-            return None
-        try:
-            return max(0.0, float(reset) - time.time())
-        except ValueError:
-            return None
+        if headers.get("x-ratelimit-remaining") in ("0", 0):
+            reset = headers.get("x-ratelimit-reset")
+            try:
+                return max(0.0, float(reset) - time.time())
+            except (TypeError, ValueError):
+                return DEFAULT_RATE_WAIT_SECONDS
+        # No usable header. Believe the body, but only when it says so: a 403 for
+        # any other reason (a bad token, SAML enforcement) must not be read as a
+        # wait, or every such failure costs a pointless minute per ticket.
+        body = (getattr(resp, "text", "") or "").lower()
+        if "rate limit" in body or "secondary rate limit" in body:
+            return DEFAULT_RATE_WAIT_SECONDS
+        return None
 
     def open_pr_urls(self, key: str) -> list[str]:
         """URLs of open PRs whose title or body names `key`.

@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime
+import html
 import json
 import os
 import pathlib
@@ -391,6 +392,152 @@ def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, prop
     return base
 
 
+REPORT_CSS = """
+:root { color-scheme: light dark; --fg:#1a1a1a; --bg:#fff; --muted:#5c5c5c;
+        --line:#d8d8d8; --pre-bg:#f6f6f4; --accent:#0f62fe; }
+@media (prefers-color-scheme: dark) {
+  :root { --fg:#e8e8e8; --bg:#161616; --muted:#a0a0a0; --line:#393939;
+          --pre-bg:#202020; --accent:#78a9ff; }
+}
+* { box-sizing: border-box; }
+body { margin:0 auto; padding:2rem 1.25rem 5rem; max-width:52rem; background:var(--bg);
+       color:var(--fg); font:16px/1.55 -apple-system, BlinkMacSystemFont, "Segoe UI",
+       Roboto, Helvetica, Arial, sans-serif; }
+h1 { font-size:1.6rem; line-height:1.2; margin:0 0 .5rem; }
+h2 { font-size:1.15rem; margin:2.5rem 0 .75rem; padding-bottom:.3rem;
+     border-bottom:1px solid var(--line); }
+h3 { font-size:1rem; margin:2rem 0 .4rem; }
+a { color:var(--accent); }
+p, li { margin:.5rem 0; }
+.lede, .meta { color:var(--muted); font-size:.9rem; }
+.note { border-left:3px solid var(--accent); padding:.6rem .9rem; margin:1.25rem 0;
+        background:var(--pre-bg); border-radius:0 4px 4px 0; font-size:.92rem; }
+table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:.92rem; }
+th, td { text-align:left; padding:.4rem .6rem; border-bottom:1px solid var(--line); }
+th { font-weight:600; }
+td.num { text-align:right; font-variant-numeric:tabular-nums; }
+code { font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:.88em;
+       background:var(--pre-bg); padding:.1em .35em; border-radius:3px; }
+pre { background:var(--pre-bg); border:1px solid var(--line); border-radius:6px;
+      padding:.9rem 1rem; overflow-x:auto; white-space:pre-wrap;
+      word-wrap:break-word; font-family:ui-monospace, SFMono-Regular, Menlo, monospace;
+      font-size:.85rem; line-height:1.5; }
+.tag { display:inline-block; font-size:.78rem; padding:.1rem .45rem; border-radius:3px;
+       background:var(--pre-bg); border:1px solid var(--line);
+       font-family:ui-monospace, SFMono-Regular, Menlo, monospace; }
+.wrap { overflow-x:auto; }
+"""
+
+
+def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime,
+                         proposals: list, live: bool, source: str,
+                         excluded: list[dict]) -> pathlib.Path:
+    """Every label and comment this run writes (or would write), as one page.
+
+    The reviewable artifact: Dennis and Veronica sign off on the wording before
+    it reaches a public ticket. Rendered from the same comment_body() and
+    plan_label_writes() the live path calls, so it is what Jira receives rather
+    than a restatement of it - a report assembled independently could agree with
+    the intent and still differ from the bytes.
+
+    Everything interpolated is html.escape()d. Ticket text is untrusted, so
+    model output derived from it is untrusted too: wiki_safe already defuses the
+    Jira constructs, but this file is opened in a browser, where an unescaped
+    <img src> in a rationale would be a tracking beacon fired at every reviewer.
+    """
+    ai_labels = ai_label_names(cfg)
+    url = cfg["jira"]["base_url"] + "/browse/"
+    rows = []
+    for issue, c, _ in proposals:
+        label = cfg["labels"][c.label]
+        present = [l for l in issue["fields"].get("labels") or [] if l in ai_labels]
+        add, remove, post_comment = plan_label_writes(present, label)
+        rows.append({"issue": issue, "c": c, "label": label, "add": add,
+                     "remove": remove, "post_comment": post_comment})
+
+    def esc(text) -> str:
+        return html.escape(str(text or ""))
+
+    verb = "wrote" if live else "would write"
+    parts = [
+        "<!doctype html>", '<html lang="en"><head><meta charset="utf-8">',
+        '<meta name="viewport" content="width=device-width, initial-scale=1">',
+        f"<title>Triage pilot: what it {esc(verb)} - {stamp:%Y-%m-%d %H:%M} UTC</title>",
+        f"<style>{REPORT_CSS}</style></head><body>",
+        f"<h1>What the triage pilot {esc(verb)}</h1>",
+        f'<p class="lede">{stamp:%Y-%m-%d %H:%M} UTC &middot; prompt '
+        f'<code>{esc(cfg["prompt"]["version"])}</code> &middot; '
+        f'{"LIVE - labels and comments applied" if live else "dry run - nothing written"}'
+        f' &middot; {len(rows)} ticket(s) in scope'
+        + (f", {len(excluded)} excluded as already in review" if excluded else "")
+        + "</p>",
+    ]
+    if not live:
+        parts.append(
+            '<p class="meta">Every comment below is rendered by the same '
+            "<code>comment_body()</code> the live path calls, and every label "
+            "decision by the same <code>plan_label_writes()</code>, so this is the "
+            "text Jira would receive verbatim.</p>")
+    if source != "api":
+        # Only `source` is evidence; the classifier string is self-declared.
+        parts.append(
+            '<div class="note"><strong>Not the pilot\'s measured path.</strong> These '
+            f"classifications were replayed from a file (<code>source={esc(source)}</code>, "
+            f"classifier <em>{esc(rows[0]['c'].model if rows else '?')}</em>), not produced "
+            "by the pinned model through the API. The three pre-registered metrics assume "
+            "one pinned model and prompt per label, so <code>triage.metrics</code> "
+            "refuses to print a decision while such labels are in the cohort. Use this to "
+            "review the rubric and the wording.</div>")
+
+    counts = {key: 0 for key in LABEL_KEYS}
+    for r in rows:
+        counts[r["c"].label] += 1
+    commented = sum(1 for r in rows if r["post_comment"])
+    parts += ["<h2>Summary</h2>", '<div class="wrap"><table>',
+              "<tr><th>Label</th><th>Tickets</th><th>Share</th></tr>"]
+    for key in LABEL_KEYS:
+        share = f"{counts[key] / len(rows) * 100:.0f}%" if rows else "-"
+        parts.append(f'<tr><td><code>{esc(cfg["labels"][key])}</code></td>'
+                     f'<td class="num">{counts[key]}</td><td class="num">{share}</td></tr>')
+    parts += [f'<tr><th>total</th><th class="num">{len(rows)}</th><th></th></tr>',
+              "</table></div>",
+              f"<p>{commented} of {len(rows)} {'received' if live else 'would receive'} a "
+              "comment as well as a label. A comment accompanies only a label that is new "
+              "to its ticket, so a re-run that reaches the same label is silent.</p>"]
+
+    if excluded:
+        parts += ["<h2>Excluded: already in review</h2>",
+                  "<p>No label, no comment. The Jira dev panel reported no pull request "
+                  "for these, so <code>scope_jql</code> returned them; the open-PR "
+                  "backstop caught them.</p>", "<ul>"]
+        for row in excluded:
+            links = " ".join(f'<a href="{esc(u)}">{esc(u)}</a>' for u in row["open_prs"])
+            parts.append(f'<li><a href="{url}{esc(row["key"])}">{esc(row["key"])}</a> '
+                         f'{esc(row["summary"])} &mdash; {links}</li>')
+        parts.append("</ul>")
+
+    parts.append(f"<h2>The comments</h2>")
+    for r in rows:
+        issue, c = r["issue"], r["c"]
+        key = issue["key"]
+        removed = (" &middot; removed: " +
+                   ", ".join(f'<span class="tag">{esc(l)}</span>' for l in r["remove"])
+                   if r["remove"] else "")
+        no_comment = "" if r["post_comment"] else (
+            " &middot; label already present, so no comment")
+        parts += [
+            f'<h3><a href="{url}{esc(key)}">{esc(key)}</a> '
+            f'{esc(issue["fields"].get("summary"))}</h3>',
+            f'<p class="meta"><span class="tag">{esc(r["label"])}</span> &middot; '
+            f"confidence {c.confidence:.2f}{removed}{no_comment}</p>",
+            f"<pre>{esc(comment_body(cfg, c))}</pre>",
+        ]
+    parts.append("</body></html>")
+    report = base.with_suffix(".html")
+    report.write_text("\n".join(parts))
+    return report
+
+
 def main(argv=None, out: pathlib.Path | None = None) -> int:
     ap = argparse.ArgumentParser(description="OpenMRS O3 AI triage pilot")
     ap.add_argument("--live", action="store_true", help="apply labels/comments (default: dry-run)")
@@ -493,6 +640,10 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
 
     fields = ctx.ISSUE_FIELDS + ([ac_field] if ac_field else [])
     proposals: list = []
+    # Carried into the comment report: a reviewer seeing 32 tickets where the
+    # sweep said 34 needs to know which two were held back and on what evidence,
+    # not just notice that they are missing.
+    excluded: list[dict] = []
     manifest: dict = {}
     errors = consecutive = 0
     journal = out / "journal.jsonl"
@@ -578,6 +729,8 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                     # Journalled so the exclusion is auditable: this is the one
                     # skip whose evidence lives outside Jira entirely.
                     row["open_prs"] = open_prs
+                    excluded.append({"key": key, "open_prs": open_prs,
+                                     "summary": issue["fields"].get("summary") or ""})
                 elif action == "skip-already-triaged":
                     row["labels"] = st.ai_labels_present
             else:
@@ -664,7 +817,11 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
 
     if proposals:
         base = write_proposals(cfg, out, stamp, proposals, args.live, source)
+        report = write_comment_report(cfg, base, stamp, proposals, args.live, source,
+                                     excluded)
         print(f"\nGrading sheet: {base}.csv (and .md); contexts in {out / 'contexts'}")
+        wrote = "what was written" if args.live else "what would be written"
+        print(f"Comment report ({wrote}): {report}")
     if errors:
         # Non-zero so a scheduled run turns red. Previously a sweep in which
         # every ticket failed still exited 0, so the only evidence was a line

@@ -11,6 +11,7 @@ from __future__ import annotations
 import contextlib
 import csv
 import datetime
+import html
 import io
 import itertools
 import json
@@ -1047,18 +1048,28 @@ class GitHubClientTests(unittest.TestCase):
         client = self._client([gh_response([{"number": 7, "title": "O3-5816 fix"}])])
         self.assertEqual(client.open_pr_urls("O3-5816"), ["openmrs#7"])
 
-    def test_searches_are_throttled_to_the_unauthenticated_rate(self):
+    def test_searches_are_throttled_below_the_unauthenticated_rate(self):
         client = self._client([gh_response([]), gh_response([])])
-        self.assertEqual(client.min_interval, 6.0)
+        self.assertGreater(client.min_interval, 60.0 / gh.RATE_LIMIT_PER_MIN[False])
         client.open_pr_urls("O3-1")
         client.open_pr_urls("O3-2")
         # The clock did not advance between them, so the whole interval is waited.
-        self.assertEqual(self.slept, [6.0])
+        self.assertEqual(self.slept, [client.min_interval])
 
     def test_a_token_raises_the_rate(self):
         client = self._client([gh_response([]), gh_response([])], token="t")
-        self.assertEqual(client.min_interval, 2.0)
         self.assertTrue(client.authenticated)
+        self.assertLess(client.min_interval, gh.GitHubClient("openmrs").min_interval)
+
+    def test_neither_rate_is_paced_at_the_documented_ceiling(self):
+        # Measured: pacing at exactly 30/min took a 403 on the last ticket of a
+        # 32-ticket sweep, because anything else sharing the token lands in the
+        # same window. The interval must leave the sweep somewhere to drift.
+        for token in (None, "t"):
+            client = gh.GitHubClient("openmrs", token)
+            ceiling = 60.0 / gh.RATE_LIMIT_PER_MIN[bool(token)]
+            self.assertGreater(client.min_interval, ceiling,
+                               f"token={token!r} paces at the documented limit")
 
     def test_a_token_is_sent_as_a_bearer_header(self):
         # Built without the stub session, which would discard the real headers.
@@ -1094,10 +1105,39 @@ class GitHubClientTests(unittest.TestCase):
     def test_a_403_that_is_not_a_rate_limit_is_not_waited_out(self):
         # A bad token must fail now, not after a pointless sleep.
         denied = gh_response([], 403, {"x-ratelimit-remaining": "42"})
+        denied.text = '{"message": "Bad credentials"}'
         client = self._client([denied])
         with self.assertRaises(gh.GitHubError):
             client.open_pr_urls("O3-1")
         self.assertEqual(self.slept, [])
+
+    def test_the_secondary_limit_is_waited_out_even_with_no_headers(self):
+        # The shape a real sweep hit: a 403 saying the limit was exceeded, with
+        # neither retry-after nor an exhausted remaining count. Reading it as
+        # "not a rate limit" failed the ticket instead of waiting out the window.
+        limited = gh_response([], 403, {})
+        limited.text = ('{"message": "API rate limit exceeded for user ID 1390773. '
+                        'If you reach out to GitHub Support for help..."}')
+        client = self._client([limited, gh_response([pr(1, title="O3-1 fix")])])
+        self.assertEqual(len(client.open_pr_urls("O3-1")), 1)
+        self.assertIn(gh.DEFAULT_RATE_WAIT_SECONDS, self.slept)
+
+    def test_an_exhausted_limit_with_an_unparseable_reset_still_waits(self):
+        limited = gh_response([], 403, {"x-ratelimit-remaining": "0",
+                                        "x-ratelimit-reset": "not-a-number"})
+        client = self._client([limited, gh_response([])])
+        client.open_pr_urls("O3-1")
+        self.assertIn(gh.DEFAULT_RATE_WAIT_SECONDS, self.slept)
+
+    def test_a_second_rate_limit_in_a_row_fails_rather_than_looping(self):
+        limited = gh_response([], 403, {})
+        limited.text = '{"message": "API rate limit exceeded"}'
+        again = gh_response([], 403, {})
+        again.text = '{"message": "API rate limit exceeded"}'
+        client = self._client([limited, again])
+        with self.assertRaises(gh.GitHubError):
+            client.open_pr_urls("O3-1")
+        self.assertEqual(len(self.slept), 1, "waited more than once")
 
     def test_a_reset_timestamp_is_honoured_when_there_is_no_retry_after(self):
         limited = gh_response([], 429, {"x-ratelimit-remaining": "0",
@@ -2302,6 +2342,137 @@ class SinkEscapingTests(unittest.TestCase):
         self.assertTrue(row["rationale"].startswith("'"), row["rationale"][:20])
         self.assertTrue(row["missing_info"].startswith("'"))
         self.assertNotIn("![](", md)
+
+    def test_nothing_untrusted_renders_live_in_the_html_report(self):
+        # The report is opened in a browser, so an unescaped <img src> in a
+        # rationale is the tracking beacon fired at every reviewer - the same
+        # attack wiki_safe defuses for Jira, in a different sink.
+        hostile = Classification(
+            "needs_more_info", '<img src=x onerror=alert(1)> and <script>bad()</script>',
+            ['<iframe src="https://attacker.example"></iframe>'], [], 0.5, "m")
+        stamp = datetime.datetime(2026, 8, 1, 9, 0, tzinfo=datetime.timezone.utc)
+        hostile_summary = issue(summary='<img src=y> "quoted" & bare')
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(d) / "proposals-20260801-090000"
+            report = run.write_comment_report(
+                load_config(), base, stamp, [(hostile_summary, hostile, "h")],
+                live=False, source="file",
+                excluded=[{"key": "O3-2", "summary": "<b>bold</b>",
+                           "open_prs": ["https://github.com/o/r/pull/1?a=1&b=2"]}])
+            page = report.read_text()
+        self.assertEqual(report.suffix, ".html")
+        for live_markup in ("<img", "<script", "<iframe", "<b>bold"):
+            self.assertNotIn(live_markup, page.replace("&lt;", ""),
+                             f"{live_markup} renders live in the report")
+        # Escaped, not dropped: a reviewer must still see what the model wrote.
+        self.assertIn("&lt;img src=x", page)
+        self.assertIn("onerror", page)
+
+    def test_the_report_is_self_contained(self):
+        # It is mailed around and opened offline; a remote stylesheet or script
+        # would also be a request to a third party on every open.
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        stamp = datetime.datetime(2026, 8, 1, 9, 0, tzinfo=datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            page = run.write_comment_report(
+                load_config(), Path(d) / "p", stamp, [(issue(), c, "h")],
+                live=False, source="api", excluded=[]).read_text()
+        for remote in ("<script", "src=\"http", "href=\"http://cdn", "@import"):
+            self.assertNotIn(remote, page)
+        # Ticket links are the one exception, and they point at Jira only.
+        self.assertIn(load_config()["jira"]["base_url"], page)
+
+
+class CommentReportTests(unittest.TestCase):
+    """The reviewable artifact: exactly what would reach a public ticket."""
+
+    STAMP = datetime.datetime(2026, 8, 1, 9, 30, 15, tzinfo=datetime.timezone.utc)
+
+    def _report(self, proposals, live=False, source="api", excluded=(), out=None):
+        with tempfile.TemporaryDirectory() as d:
+            base = Path(out or d) / "proposals-20260801-093015"
+            return run.write_comment_report(load_config(), base, self.STAMP, proposals,
+                                            live, source, list(excluded)).read_text()
+
+    def test_the_body_is_the_one_jira_would_receive(self):
+        # Rendered from comment_body(), not restated: a report assembled
+        # independently could agree with the intent and still differ from the
+        # bytes, which is the only thing a reviewer is actually signing off on.
+        c = Classification("needs_more_info", "No repro steps.", ["repro steps"], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")])
+        self.assertIn(html.escape(run.comment_body(load_config(), c)), page)
+
+    def test_a_dry_run_says_nothing_was_written(self):
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")])
+        self.assertIn("would write", page)
+        self.assertIn("nothing written", page)
+
+    def test_a_live_run_says_the_writes_already_happened(self):
+        # The same file is produced on live runs, where it is an audit trail of
+        # writes that happened - not a preview of writes that did not.
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], live=True)
+        self.assertIn("LIVE", page)
+        self.assertNotIn("would write", page)
+
+    def test_a_replayed_run_is_flagged_as_off_the_measured_path(self):
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        self.assertIn("measured path", self._report([(issue(), c, "h")], source="file"))
+
+    def test_an_api_run_carries_no_such_warning(self):
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        self.assertNotIn("measured path", self._report([(issue(), c, "h")], source="api"))
+
+    def test_excluded_tickets_are_listed_with_their_evidence(self):
+        # A reviewer seeing 32 where the sweep said 34 must be told which two
+        # were held back, and why.
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], excluded=[
+            {"key": "O3-5816", "summary": "Login crashes",
+             "open_prs": ["https://github.com/openmrs/openmrs-esm-core/pull/1818"]}])
+        self.assertIn("already in review", page)
+        self.assertIn("O3-5816", page)
+        self.assertIn("openmrs-esm-core/pull/1818", page)
+
+    def test_a_ticket_that_gets_no_comment_says_so(self):
+        # Its label is already present, so plan_label_writes suppresses the
+        # comment; a reviewer counting comments would otherwise over-count.
+        c = Classification("needs_more_info", "No repro.", ["steps"], [], 0.8, "m")
+        label = load_config()["labels"]["needs_more_info"]
+        page = self._report([(issue(labels=[label]), c, "h")])
+        self.assertIn("no comment", page)
+        self.assertIn("0 of 1", page)
+
+    def test_a_label_flip_names_what_is_removed(self):
+        c = Classification("needs_more_info", "No repro.", ["steps"], [], 0.8, "m")
+        page = self._report([(issue(labels=[AI[0]]), c, "h")])
+        self.assertIn("removed:", page)
+        self.assertIn(AI[0], page)
+
+    def test_the_share_column_survives_an_empty_proposal_list(self):
+        # write_comment_report is only called when there are proposals, but a
+        # division by zero here would abort a run after its writes had landed.
+        self.assertIn("Summary", self._report([]))
+
+    def test_a_run_produces_the_report_beside_the_grading_sheet(self):
+        StubGitHub.reset()
+        self.addCleanup(StubGitHub.reset)
+        jira = RecordingJira({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d, \
+             mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+             mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+             mock.patch.object(run, "Classifier", lambda *a: StubClassifier(
+                 Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m"))), \
+             contextlib.redirect_stdout(io.StringIO()) as printed, \
+             contextlib.redirect_stderr(io.StringIO()):
+            run.main(["--keys", "O3-1"], out=Path(d))
+            reports = sorted(Path(d).glob("proposals-*.html"))
+            sheets = sorted(Path(d).glob("proposals-*.csv"))
+        self.assertEqual(len(reports), 1, "no comment report was written")
+        # Same stamp as the sheet, so the two are trivially correlated.
+        self.assertEqual(reports[0].stem, sheets[0].stem)
+        self.assertIn("Comment report", printed.getvalue())
 
 
 class ClassifierTests(unittest.TestCase):
