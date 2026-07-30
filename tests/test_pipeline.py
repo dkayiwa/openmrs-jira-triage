@@ -237,6 +237,43 @@ class RecordingJira:
         self.writes.append(("comment", key, body))
 
 
+class LivingJira(RecordingJira):
+    """RecordingJira, but the changelog reflects what was written.
+
+    The parent already applies label writes to the labels field. It does not
+    record them in the changelog, so no test had ever seen the bot read back
+    its OWN add on a later sweep - and that add is half of the pair the opt-out
+    guarantee is decided from. A stub that accepts a write and then denies it
+    happened cannot show a sequence bug, only confirm the fixture.
+    """
+
+    def __init__(self, issues):
+        super().__init__(issues)
+        self.clock = 0
+
+    def _stamp(self) -> str:
+        self.clock += 1
+        return f"2026-08-10T{9 + self.clock:02d}:00:00.000+0000"
+
+    def _log(self, key, author, display, frm, to):
+        self.issues[key]["changelog"]["histories"].append(
+            label_change(author, frm, to, display=display, created=self._stamp()))
+
+    def update_labels(self, key, add, remove):
+        before = " ".join(self.issues[key]["fields"]["labels"])
+        super().update_labels(key, add, remove)
+        after = " ".join(self.issues[key]["fields"]["labels"])
+        self._log(key, "bot", "Triage Bot", before, after)
+
+    def human_removes(self, key, label):
+        """A maintainer takes the label off - the pilot's opt-out gesture."""
+        before = " ".join(self.issues[key]["fields"]["labels"])
+        self.issues[key]["fields"]["labels"] = [
+            l for l in self.issues[key]["fields"]["labels"] if l != label]
+        after = " ".join(self.issues[key]["fields"]["labels"])
+        self._log(key, "maintainer", "A Maintainer", before, after)
+
+
 class StateTests(unittest.TestCase):
     def test_human_removal_is_opt_out(self):
         st = inspect(issue(histories=[label_change("u1", AI[2], "")]), AI, "bot")
@@ -3295,6 +3332,114 @@ class LiveRunTests(unittest.TestCase):
         self.assertEqual(len(manifest["tickets"]), 2)
         self.assertFalse(manifest["complete"],
                          "a manifest covering 2 of 5 tickets is not complete")
+
+    def test_an_opt_out_survives_every_later_sweep(self):
+        """The pilot's central promise, run as a sequence rather than a fixture.
+
+        Every existing opt-out test is either inspect() in isolation or a single
+        sweep against a hand-written changelog. Neither can show that the
+        pipeline PRODUCES a history its own reader then interprets as an
+        opt-out: sweep one's add and the maintainer's removal are a pair, and
+        only a real sequence puts both in the log the way Jira would.
+
+        The promise is not "skip it once". The comment posted on every ticket
+        says removing the label opts the ticket out, so it has to outlast a
+        content edit, a prompt bump and an explicit --force - each of which
+        exists precisely to make the pipeline reconsider a ticket.
+        """
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        label = load_config()["labels"]["needs_judgment"]
+        jira = LivingJira({"O3-1": issue()})
+
+        def sweep(*extra):
+            with tempfile.TemporaryDirectory() as d:
+                return self._sweep(jira, c, ["--live", "--keys", "O3-1", *extra], Path(d))
+
+        rc, rows = sweep()
+        self.assertEqual(rows[-1]["action"], "labeled")
+        self.assertIn(("labels", "O3-1", (label,), ()), jira.writes)
+
+        jira.human_removes("O3-1", label)
+        writes_at_opt_out = len(jira.writes)
+
+        # 1. plain re-sweep 2. after a content edit 3. after a prompt bump
+        # 4. under --force. Each is a different reason the pipeline would
+        # normally act, and none may override a human's opt-out.
+        rc, rows = sweep()
+        self.assertEqual(rows[-1]["action"], "skip-opted-out")
+        self.assertEqual(rows[-1]["by"], "A Maintainer")
+
+        jira.issues["O3-1"]["fields"]["summary"] = "Fix the widget, urgently"
+        rc, rows = sweep()
+        self.assertEqual(rows[-1]["action"], "skip-opted-out",
+                         "an edited ticket is still an opted-out ticket")
+
+        jira.properties["O3-1"] = dict(jira.properties.get("O3-1", {}), prompt="v0")
+        rc, rows = sweep()
+        self.assertEqual(rows[-1]["action"], "skip-opted-out",
+                         "a prompt bump must not resurrect an opted-out ticket")
+
+        rc, rows = sweep("--force")
+        self.assertEqual(rows[-1]["action"], "skip-opted-out", "--force must not either")
+
+        self.assertEqual(len(jira.writes), writes_at_opt_out,
+                         f"the pilot wrote to an opted-out ticket: "
+                         f"{jira.writes[writes_at_opt_out:]}")
+
+    def test_a_second_sweep_of_an_unchanged_ticket_stays_silent(self):
+        # The counterpart: the living changelog must not make the pipeline
+        # paranoid about its own history.
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        jira = LivingJira({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            self._sweep(jira, c, ["--live", "--keys", "O3-1"], Path(d))
+        after_first = len(jira.writes)
+        with tempfile.TemporaryDirectory() as d:
+            rc, rows = self._sweep(jira, c, ["--live", "--keys", "O3-1"], Path(d))
+        self.assertEqual(rows[-1]["action"], "skip-already-triaged")
+        self.assertEqual(len(jira.writes), after_first, "a quiet re-run wrote something")
+
+    def test_the_bots_own_label_flip_is_not_read_as_an_opt_out(self):
+        """Three sweeps, because that is the shortest sequence that can fail.
+
+        This is the cohort-wide failure bot_identity_error warns about, and
+        working out how to reach it corrected me: a misread label ADD is only a
+        convention violation, so the bot's first sweep cannot trigger it. The
+        opt-out comes from a misread REMOVAL, and the bot only removes a label
+        when it flips one - which needs an edit between two sweeps. Verified by
+        simulating a wrong TRIAGE_BOT_ACCOUNT_ID: fourteen tests notice, and
+        before this one, not a single sweep-level test was among them.
+
+        If it ever regresses, the bot re-classifies a ticket, reads its own
+        removal as a maintainer's opt-out, and permanently excludes it - across
+        the cohort, silently, while the removal metric reports a kill.
+        """
+        first = Classification("needs_more_info", "No steps.", ["repro steps"], [], 0.8, "m")
+        second = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        cfg = load_config()
+        jira = LivingJira({"O3-1": issue()})
+
+        def sweep(c):
+            with tempfile.TemporaryDirectory() as d:
+                return self._sweep(jira, c, ["--live", "--keys", "O3-1"], Path(d))
+
+        rc, rows = sweep(first)
+        self.assertEqual(rows[-1]["action"], "labeled")
+
+        # An edit changes the content hash, so the next sweep reclassifies -
+        # and this time to a different label, so the bot removes its own.
+        jira.issues["O3-1"]["fields"]["description"] = "Steps: open the ward view."
+        rc, rows = sweep(second)
+        self.assertEqual(rows[-1]["action"], "labeled")
+        self.assertIn(("labels", "O3-1", (cfg["labels"]["needs_judgment"],),
+                       (cfg["labels"]["needs_more_info"],)), jira.writes,
+                      "the flip must actually remove the old label")
+
+        # The removal is now in the changelog, authored by the bot. Read as a
+        # human's, this ticket is opted out forever.
+        rc, rows = sweep(second)
+        self.assertEqual(rows[-1]["action"], "skip-already-triaged",
+                         "the bot's own flip was read as a maintainer opt-out")
 
     def test_live_without_credentials_refuses_to_start(self):
         # The guard against a --live run that would sweep anonymously: it cannot
