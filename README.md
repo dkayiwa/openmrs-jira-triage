@@ -339,6 +339,17 @@ phase, every human label-removal gets added here as a new case.
    code walks the same shapes on real bytes. Read-only. The numbers are
    meaningless as pilot metrics; the code producing them is what runs live.
 
+   **Set `pilot_launch` earlier than the labels you are rehearsing on** — an
+   existing label was applied months or years ago, and `sla_met` refuses a
+   label that predates the launch, because in production that means the launch
+   date is mistyped and every ticket would otherwise report as sorted on time.
+   In a rehearsal it means nothing of the sort, but the guard cannot tell the
+   difference. Skip this and every ticket fails with "the bot cannot have
+   labelled a ticket before the pilot began" and the run exits having computed
+   nothing. Rehearsed on `curated` with `pilot_launch = "2024-01-01"`: 9
+   tickets measured, SLA 11.1%, removal rate 0.000, and the decision correctly
+   withheld because none carries an entity property.
+
    Two shapes are worth arranging deliberately, because they are what the
    guarantees rest on. A ticket the stand-in bot labelled and *someone else*
    unlabelled must count as an opt-out; a ticket where the stand-in both added
