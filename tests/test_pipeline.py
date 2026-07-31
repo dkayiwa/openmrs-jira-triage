@@ -710,7 +710,14 @@ class DocumentedSurfaceTests(unittest.TestCase):
         # the paragraph it sits in is the one claiming what is verified.
         claimed = re.search(r"# (\d+) tests, ~\d+s, no network", self.readme)
         self.assertIsNotNone(claimed, "the verification block lost its test count")
-        actual = unittest.defaultTestLoader.discover(str(self.ROOT / "tests")).countTestCases()
+        # A FRESH loader, not defaultTestLoader. The runner mutates the shared
+        # one - `-k` sets testNamePatterns on it - so an inner discover() using
+        # it inherits the filter and counts only the matching tests. This test
+        # then compared the README against a handful rather than the suite and
+        # failed, for anyone running `python -m unittest ... -k` while working.
+        # Found by running each class in its own process; the full-suite run
+        # never sets a pattern, so it could not surface there.
+        actual = unittest.TestLoader().discover(str(self.ROOT / "tests")).countTestCases()
         self.assertEqual(int(claimed.group(1)), actual,
                          "the README's test count has drifted from the suite")
 
