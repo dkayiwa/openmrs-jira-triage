@@ -475,8 +475,20 @@ def comment_body(cfg: dict, c) -> str:
         lines += ["", "How to verify:"] + [f"- {wiki_safe(v)}" for v in c.verification_steps]
     lines += [
         "",
+        # "Permanently, and putting it back does not undo that" is the part
+        # that has to be here rather than only in the announcement. This
+        # comment is what a maintainer reads at the moment they decide, and
+        # most will never have seen the announcement. Measured: remove the
+        # label and restore it a minute later and the ticket is still opted
+        # out (the removal is in the changelog forever, and --force does not
+        # override it), while the restore is additionally recorded as a
+        # convention violation and names them in the weekly digest. Saying
+        # only "opts the ticket out" invites a tidy-up that cannot be undone,
+        # on the pilot whose kill metric is people removing labels.
         "_Applied by the triage pilot bot from this ticket's visible content only. "
-        f"Removing the label opts the ticket out of the pilot. (prompt {cfg['prompt']['version']})_",
+        "Removing the label opts this ticket out of the pilot permanently - putting "
+        "the label back does not undo it - so please remove it to say the triage was "
+        f"wrong, not to tidy up. (prompt {cfg['prompt']['version']})_",
     ]
     return "\n".join(lines)
 

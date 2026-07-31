@@ -1633,7 +1633,38 @@ class CommentTests(unittest.TestCase):
         body = comment_body(cfg, c)
         self.assertIn(cfg["labels"]["needs_more_info"], body)
         self.assertIn("- repro steps", body)
-        self.assertIn("opts the ticket out", body)
+        self.assertIn("opts this ticket out of the pilot permanently", body)
+
+    def test_the_comment_says_the_opt_out_cannot_be_undone(self):
+        """The artifact at the point of the decision, not the announcement.
+
+        Most maintainers will read this comment and never the announcement, and
+        it used to say only "Removing the label opts the ticket out of the
+        pilot" - which reads as reversible. Measured: remove the label and put
+        it back a minute later and the ticket is still opted out, because the
+        removal is in the changelog forever; --force does not override it, and
+        the restore is separately recorded as a manual label change that names
+        the maintainer in the weekly digest. Inviting a tidy-up on those terms,
+        on the pilot whose kill metric is label removals, is the worst possible
+        place to be imprecise.
+        """
+        cfg = load_config()
+        body = comment_body(cfg, Classification("needs_judgment", "A call.", [], [], 0.8, "m"))
+        self.assertIn("permanently", body)
+        self.assertIn("putting the label back does not undo it", body)
+        self.assertIn("not to tidy up", body)
+
+    def test_a_restored_label_still_leaves_the_ticket_opted_out(self):
+        # The behaviour the comment now describes. If this ever changes, the
+        # comment is overstating and must be softened - so the claim is pinned
+        # to the code rather than left as prose.
+        hist = [label_change("bot", "", AI[2], created="2026-08-10T09:00:00.000+0000"),
+                label_change("u1", AI[2], "", display="M", created="2026-08-10T09:05:00.000+0000"),
+                label_change("u1", "", AI[2], display="M", created="2026-08-10T09:06:00.000+0000")]
+        st = inspect(issue(labels=[AI[2]], histories=hist), AI, "bot")
+        self.assertTrue(st.opted_out, "a restore now clears the opt-out; fix the comment")
+        self.assertEqual(plan_ticket(st, unchanged=False, force=True, can_classify=True),
+                         "skip-opted-out", "--force now overrides it; fix the comment")
 
     def test_automation_candidate_comment_lists_verification(self):
         cfg = load_config()

@@ -41,6 +41,12 @@ Removing an `ai-triage-*` label is how you tell us the label was wrong, and it's
 also a **permanent opt-out** — that ticket will not be labelled again for the
 rest of the pilot. No need to explain, though we'd love to hear why.
 
+**Putting the label back does not undo it.** The opt-out is read from the
+ticket's history, so a removal counts even if you restore the label a minute
+later; the ticket stays out for good, and the restore also shows up in our
+weekly digest as a manual label change. If you remove one by accident, tell us
+in the thread rather than trying to repair it on the ticket.
+
 Two things follow from that:
 
 - **Please don't remove the label just to tidy up.** It's our main quality
