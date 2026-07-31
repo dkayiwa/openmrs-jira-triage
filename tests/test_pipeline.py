@@ -682,6 +682,41 @@ class DocumentedSurfaceTests(unittest.TestCase):
                         .read_text(encoding="utf-8").split())
         self.assertIn("two comments over the pilot", flat)
 
+    def test_every_config_value_the_pilot_needs_has_a_step_that_sets_it(self):
+        """A required value mentioned in passing is a value nobody sets on time.
+
+        pilot_launch had no numbered step. It appeared once, parenthetically,
+        inside step 7 - the weekly run, a week after step 6 starts the bot
+        labelling - as "set pilot_launch in config first", which reads as "set
+        it now". Demonstrated: dated today at that point, every already-labelled
+        ticket predates the launch, sla_met refuses each one, and the first
+        weekly report prints "no metrics computed" instead of numbers. Dated to
+        when writes were enabled, the same run works.
+
+        Checked by walking the numbered steps, because the failure was one of
+        sequence: each instruction was true and the order was wrong.
+        """
+        # Located by heading, not by position. Splitting on "^\d+\. \*\*" and
+        # indexing found seven blocks for eight steps - a numbered line inside
+        # one step's prose breaks the mapping - so steps[5] was not step 6, and
+        # the test passed against a README with the instruction deleted.
+        # `\s*` before the number, because requiring column zero makes the
+        # helper silently swallow the following step when one is indented -
+        # and a test about which step says what cannot afford to merge two.
+        def step(heading):
+            start = self.readme.index(f"**{heading}")
+            after = re.search(r"^\s*\d+\. \*\*", self.readme[start:], re.M)
+            return self.readme[start:start + (after.start() if after else len(self.readme))]
+
+        enable = step("Enable writes:")
+        self.assertIn("pilot_launch", enable,
+                      "the step that starts the pilot does not set the value the 24h "
+                      "SLA is measured from")
+        self.assertIn("today", enable, "it must say which date to use")
+        self.assertNotIn("set `pilot_launch` in config first", step("Weekly:"),
+                         "the weekly step still reads as 'set it now', which dates the "
+                         "launch after labels the bot has already applied")
+
     def test_the_write_probe_warns_that_it_notifies_watchers(self):
         """Step 4 told you to point real writes at a production ticket.
 

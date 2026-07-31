@@ -357,10 +357,20 @@ phase, every human label-removal gets added here as a new case.
    in `.github/workflows/triage.yml`, or run `python -m triage.run --live`.
    (`GITHUB_TOKEN` is not a fifth secret — the workflow passes the automatic
    `github.token`, which `permissions: contents: read` already covers.)
+
+   **Set `[metrics].pilot_launch` to today, in the same change.** It had no
+   step of its own and was mentioned only in passing in step 7, a week later —
+   at which point setting it to "today" dates the launch after labels the bot
+   has already applied, and `sla_met` refuses a label that predates the launch.
+   Demonstrated: every ticket lands in `failed` and the first weekly report
+   prints "no metrics computed" instead of numbers. It must be the date this
+   step happens, because the 24h SLA is measured from it. Preflight reports it
+   as unset until you do.
 7. **Weekly:** `python -m triage.metrics` prints the three pilot metrics, any
    non-bot `ai-triage-*` label adds (convention violations), and a draft
    ADOPT / EXTEND / STOP against the pre-registered thresholds, computed purely
-   from Jira changelogs (set `pilot_launch` in config first). Pair with a native
+   from Jira changelogs (`pilot_launch` should already be set, from step 6 — if
+   it is not, use the date writes were enabled, not today). Pair with a native
    Jira filter subscription for the dashboard digest.
    A local `--live` run while the scheduled sweep may fire is **refused**, not
    merely discouraged: the workflow's `concurrency` group only serialises runs
