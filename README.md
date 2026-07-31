@@ -362,6 +362,18 @@ phase, every human label-removal gets added here as a new case.
    have to be applied to triaged tickets, or the third pre-registered threshold
    stays at zero and ADOPT is unreachable however good the triage is.
 
+   **Measure the ask before making it** (numbers taken 2026-07-31). `intro` is
+   not a dead label - 215 O3 tickets carry it - but the rate at which *new*
+   tickets receive one is 0.4 to 0.9 per fortnight, measured over six months,
+   one year and two years, and 0 in the current cohort window. `not-intro` has
+   never been used on O3 at all. The threshold is 5 per measurement period, on
+   tickets the bot has also labelled, so it asks for roughly six to twelve
+   times the historical rate and a label nobody has ever applied. That may be
+   the right ask - it is the pilot's only measure of whether triage produced
+   anything a newcomer could pick up - but it should be made knowing its size,
+   and the threshold reconsidered before launch rather than after a STOP that
+   says more about the ask than about the triage.
+
    It is numbered here, before writes are enabled, because it used to be the
    last item on this list while being titled "first" - a reader working the
    numbers in order would have commented on thirty-odd public tickets and run

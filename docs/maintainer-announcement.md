@@ -84,9 +84,13 @@ silence isn't.
 Being straight with you about why: "did triage help us produce
 newcomer-ready tickets" is one of three pre-registered measures this pilot is
 judged on, and it currently sits at **zero** — no ticket created in the cohort
-window carries `intro`, and `not-intro` has never been used on O3 at all. If
-this habit doesn't take hold, the pilot cannot show it succeeded even if the
-triage itself is good.
+window carries `intro`, and `not-intro` has never been used on O3 at all.
+
+We should be straight about the size of what we're asking, too. Across the last
+six months to two years, new O3 tickets picked up `intro` at roughly half a
+ticket a fortnight. We need five, on tickets the bot has labelled. That is a
+real change in habit, not a rounding error — and if it doesn't happen, the
+pilot cannot show it succeeded even if the triage itself is good.
 
 ## What happens next
 
