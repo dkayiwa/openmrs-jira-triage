@@ -3529,6 +3529,33 @@ class EvalImportTests(unittest.TestCase):
         self.assertEqual(rows, [])
         self.assertIn("not a Jira issue key", log)
 
+    def test_the_grading_sheet_warns_about_replayed_rows_before_the_work(self):
+        """The import refuses an `ok` on a replayed row; the sheet never said so.
+
+        A `source=file` row was classified outside the pinned model, so an `ok`
+        grade would seed the eval set with an unverified classifier's own
+        label. import_proposals refuses it and explains itself well - but at
+        import time, after the grading, and its remedy is to re-classify
+        through the API path and grade the ticket again.
+
+        The replay path is the documented fallback for when Anthropic credit
+        runs out, so mixed sheets are expected rather than exotic, and grading
+        effort is the scarcest input the pilot has: the gate needs far more
+        cases than the cohort holds. A warning is worth more before the session
+        than a diagnosis after it.
+        """
+        cfg = load_config()
+        c = Classification("needs_more_info", "No steps.", ["repro"], [], 0.8, "m")
+        stamp = datetime.datetime(2026, 8, 1, tzinfo=datetime.timezone.utc)
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            run.write_proposals(cfg, out, stamp, [(issue(), c, "abc")], False, "file")
+            sheet = next(out.glob("proposals-*.md")).read_text(encoding="utf-8")
+        self.assertIn("source", sheet, "the sheet never mentions the column that decides this")
+        self.assertIn("cannot be used", sheet)
+        self.assertIn("mark it `wrong` with", sheet,
+                      "it must say what to do instead, not only what fails")
+
     def test_a_wholly_skipped_import_fails_instead_of_reporting_zero(self):
         """Grading an afternoon away and being told nothing went wrong.
 

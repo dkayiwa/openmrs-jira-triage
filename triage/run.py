@@ -531,6 +531,18 @@ def write_proposals(cfg: dict, out: pathlib.Path, stamp: datetime.datetime, prop
             fh.write(
                 "Grade in the matching CSV: `ok` or `wrong` in grade(ok/wrong); when wrong, set "
                 "correct_label to automation_candidate / needs_judgment / needs_more_info.\n\n"
+                # Said before the work, not after. The import refuses an `ok` on
+                # a replayed row - agreeing with a classifier the gate has not
+                # verified would seed the eval set with its own label - and it
+                # says so clearly, but by then the grading is done and the only
+                # remedy is to re-classify through the API path and grade again.
+                # Grading effort is the scarce input here: the gate needs far
+                # more cases than the cohort has tickets.
+                "Check the `source` column first. A row with `source=file` was replayed from a "
+                "classifications file rather than produced by the pinned model, so grading it "
+                "`ok` cannot be used and the import will skip it. Either mark it `wrong` with "
+                "an explicit correct_label - your label is yours either way - or leave it and "
+                "grade the `source=api` rows.\n\n"
             )
         # Escaped for the same reason as the comment body: `![](url)` in a
         # rationale is a tracking beacon fetched by everyone who opens this file.

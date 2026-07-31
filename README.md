@@ -437,7 +437,7 @@ phase, every human label-removal gets added here as a new case.
 ## Verifying a change
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -q     # 422 tests, ~3s, no network
+.venv/bin/python -m unittest discover -s tests -q     # 423 tests, ~3s, no network
 .venv/bin/python -m triage.preflight                  # the go-live gate, read-only
 ```
 
