@@ -682,6 +682,38 @@ class DocumentedSurfaceTests(unittest.TestCase):
                         .read_text(encoding="utf-8").split())
         self.assertIn("two comments over the pilot", flat)
 
+    def test_the_maintainers_are_told_before_anything_is_written(self):
+        """A step titled "first" was the last item on the list.
+
+        Its correct placement was stated in its own second paragraph - "post it
+        after the charset test in step 4" - which a reader working the numbers
+        top-to-bottom has not reached when they arrive at Enable writes. Follow
+        the list in order as written and the bot comments on thirty-odd public
+        tickets and runs a week of metrics before anyone is told it exists.
+
+        Checked by position rather than by prose, because the prose was already
+        right and the numbering was what people follow.
+        """
+        order = re.findall(r"^(\d+)\. \*\*([^*]+)\*\*", self.readme, re.M)
+        by_name = {name.rstrip(":,. ").lower(): int(num) for num, name in order}
+        tell = by_name.get("tell the maintainers first")
+        write = by_name.get("enable writes")
+        self.assertIsNotNone(tell, f"no announcement step; found {sorted(by_name)}")
+        self.assertIsNotNone(write, f"no enable-writes step; found {sorted(by_name)}")
+        self.assertLess(tell, write,
+                        "the checklist tells maintainers about the bot only after it "
+                        "has started writing to their tickets")
+
+    def test_the_documented_test_count_is_the_real_one(self):
+        # It said 378 for four cycles while the suite grew to 420. A number
+        # that drifts teaches the reader to discount the others around it, and
+        # the paragraph it sits in is the one claiming what is verified.
+        claimed = re.search(r"# (\d+) tests, ~\d+s, no network", self.readme)
+        self.assertIsNotNone(claimed, "the verification block lost its test count")
+        actual = unittest.defaultTestLoader.discover(str(self.ROOT / "tests")).countTestCases()
+        self.assertEqual(int(claimed.group(1)), actual,
+                         "the README's test count has drifted from the suite")
+
     def test_every_config_value_the_pilot_needs_has_a_step_that_sets_it(self):
         """A required value mentioned in passing is a value nobody sets on time.
 

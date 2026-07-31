@@ -269,7 +269,7 @@ phase, every human label-removal gets added here as a new case.
    probe posts a comment to verify Add Comments and then removes it. Without
    the permission the probe still passes, prints a WARN, and leaves the comment
    behind - on a real public ticket, saying "this will be deleted if the bot is
-   permitted to", from a bot whose announcement (step 5) has not gone out yet.
+   permitted to", from a bot whose announcement (step 6) has not gone out yet.
    The pilot itself never deletes anything; if you would rather not grant it,
    that is fine, but expect to remove the probe comment by hand. Note Edit Issues
    is not field-granular in Jira, so "never edits ticket text" is enforced by
@@ -283,7 +283,7 @@ phase, every human label-removal gets added here as a new case.
    key you hand it. Per the note above, comments always notify watchers and
    Jira Cloud has no way to suppress that - so pointing this at an existing O3
    ticket sends its watchers a notification from a bot account whose
-   announcement is still one step away, saying "triage pilot preflight". Close
+   announcement is still two steps away, saying "triage pilot preflight". Close
    the throwaway afterwards; it never enters the cohort, because scope is
    `status = "To Do"` and tickets created before `cohort_created_since` are out
    of the window anyway.
@@ -353,23 +353,41 @@ phase, every human label-removal gets added here as a new case.
    restated above under "Running without an Anthropic API key"; they were two
    copies of one sentence and had already drifted apart by the time anyone
    checked, which is the argument for reading that section as the source.)
-6. **Enable writes:** add the four repo secrets, uncomment the `schedule` block
+6. **Tell the maintainers first**, using `docs/maintainer-announcement.md`
+   (fill in the bracketed placeholders). Three asks, and none of them are
+   optional: removing an `ai-triage-*` label opts the ticket out permanently, so
+   it must not be done as housekeeping - including after promoting a ticket to
+   `intro`, since the intro metric counts tickets holding both labels. Keys go in
+   PR titles, or the open-PR backstop cannot see the PR. And `intro`/`not-intro`
+   have to be applied to triaged tickets, or the third pre-registered threshold
+   stays at zero and ADOPT is unreachable however good the triage is.
+
+   It is numbered here, before writes are enabled, because it used to be the
+   last item on this list while being titled "first" - a reader working the
+   numbers in order would have commented on thirty-odd public tickets and run
+   a week of metrics before telling anyone. Post it after the charset test in
+   step 4 and before step 7: the announcement names the
+   labels, and a rename after posting means the community is watching for a label
+   that never arrives. The label names in it are pinned to `config.toml` by the
+   test suite, so a rename breaks the build rather than the announcement.
+
+7. **Enable writes:** add the four repo secrets, uncomment the `schedule` block
    in `.github/workflows/triage.yml`, or run `python -m triage.run --live`.
    (`GITHUB_TOKEN` is not a fifth secret — the workflow passes the automatic
    `github.token`, which `permissions: contents: read` already covers.)
 
    **Set `[metrics].pilot_launch` to today, in the same change.** It had no
-   step of its own and was mentioned only in passing in step 7, a week later —
+   step of its own and was mentioned only in passing in step 8, a week later —
    at which point setting it to "today" dates the launch after labels the bot
    has already applied, and `sla_met` refuses a label that predates the launch.
    Demonstrated: every ticket lands in `failed` and the first weekly report
    prints "no metrics computed" instead of numbers. It must be the date this
    step happens, because the 24h SLA is measured from it. Preflight reports it
    as unset until you do.
-7. **Weekly:** `python -m triage.metrics` prints the three pilot metrics, any
+8. **Weekly:** `python -m triage.metrics` prints the three pilot metrics, any
    non-bot `ai-triage-*` label adds (convention violations), and a draft
    ADOPT / EXTEND / STOP against the pre-registered thresholds, computed purely
-   from Jira changelogs (`pilot_launch` should already be set, from step 6 — if
+   from Jira changelogs (`pilot_launch` should already be set, from step 7 — if
    it is not, use the date writes were enabled, not today). Pair with a native
    Jira filter subscription for the dashboard digest.
    A local `--live` run while the scheduled sweep may fire is **refused**, not
@@ -416,24 +434,10 @@ phase, every human label-removal gets added here as a new case.
    warning (needs a property only a write can create) and the failed-read
    NO DECISION path. Both parse data this pipeline writes itself rather than
    anything Jira's shape can surprise us with.
-8. **Tell the maintainers first**, using `docs/maintainer-announcement.md`
-   (fill in the bracketed placeholders). Three asks, and none of them are
-   optional: removing an `ai-triage-*` label opts the ticket out permanently, so
-   it must not be done as housekeeping - including after promoting a ticket to
-   `intro`, since the intro metric counts tickets holding both labels. Keys go in
-   PR titles, or the open-PR backstop cannot see the PR. And `intro`/`not-intro`
-   have to be applied to triaged tickets, or the third pre-registered threshold
-   stays at zero and ADOPT is unreachable however good the triage is.
-
-   Post it **after** the charset test in step 4: the announcement names the
-   labels, and a rename after posting means the community is watching for a label
-   that never arrives. The label names in it are pinned to `config.toml` by the
-   test suite, so a rename breaks the build rather than the announcement.
-
 ## Verifying a change
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -q     # 378 tests, ~3s, no network
+.venv/bin/python -m unittest discover -s tests -q     # 422 tests, ~3s, no network
 .venv/bin/python -m triage.preflight                  # the go-live gate, read-only
 ```
 
