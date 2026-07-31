@@ -4050,6 +4050,49 @@ class LiveRunTests(unittest.TestCase):
                          "the sweep must stop, not refuse its way through the cohort")
         self.assertEqual(rc, 1)
 
+    def test_a_label_left_without_its_comment_is_named_in_the_report(self):
+        """The mirror of the bookkeeping case below, and the worse one.
+
+        Labels are written before comments, so a refused comment leaves a
+        public ticket carrying a label with no explanation - and no later sweep
+        adds one, because the label already being there is what suppresses it.
+        preflight calls this the one failure the pipeline cannot recover from.
+
+        The proposal is appended only after the comment succeeds, so these
+        tickets were absent from the page headed "What the triage pilot wrote"
+        altogether. The journal had them as `error`; the artifact Dennis and
+        Veronica review did not, which meant the writes most needing a human
+        were the ones it omitted.
+        """
+        class CommentRefused(RecordingJira):
+            def add_comment(self, key, body):
+                raise JiraError("403: Add Comments permission missing")
+
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        jira = CommentRefused({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            _, rows = self._sweep(jira, c, ["--live", "--keys", "O3-1"], out)
+            report = next(out.glob("proposals-*.html")).read_text(encoding="utf-8")
+        self.assertEqual(rows[-1]["action"], "error")
+        self.assertIn(("labels", "O3-1", (load_config()["labels"]["needs_judgment"],), ()),
+                      jira.writes, "the label really did land")
+        self.assertIn("Labelled, but the comment failed", report)
+        self.assertIn("O3-1", report)
+        self.assertIn("Add Comments permission missing", report,
+                      "the reason has to travel with it, or it is not actionable")
+
+    def test_a_healthy_run_has_no_orphaned_label_section(self):
+        # The section must not appear when nothing is wrong, or it becomes
+        # furniture the reader learns to skip.
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            self._sweep(RecordingJira({"O3-1": issue()}), c,
+                        ["--live", "--keys", "O3-1"], out)
+            report = next(out.glob("proposals-*.html")).read_text(encoding="utf-8")
+        self.assertNotIn("Labelled, but the comment failed", report)
+
     def test_a_comment_that_landed_is_reported_even_if_bookkeeping_fails(self):
         # Ordering, not presence: the append must happen BEFORE set_property.
         # The label and comment are already public at that point, so dropping

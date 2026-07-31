@@ -586,7 +586,7 @@ pre { background:var(--pre-bg); border:1px solid var(--line); border-radius:6px;
 def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime,
                          proposals: list, live: bool, source: str,
                          excluded: list[dict], swept: int | None = None,
-                         errors: int = 0) -> pathlib.Path:
+                         errors: int = 0, orphaned: list[dict] | None = None) -> pathlib.Path:
     """Every label and comment this run writes (or would write), as one page.
 
     The reviewable artifact: Dennis and Veronica sign off on the wording before
@@ -674,6 +674,27 @@ def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime
               f"<p>{commented} of {len(rows)} {'received' if live else 'would receive'} a "
               "comment as well as a label. A comment accompanies only a label that is new "
               "to its ticket, so a re-run that reaches the same label is silent.</p>"]
+
+    if orphaned:
+        # The one failure preflight calls unrecoverable: labels are written
+        # before comments, so a refused comment leaves a public ticket carrying
+        # a label with no explanation, and no later run will add one because
+        # the label's presence suppresses it. Those tickets used to be absent
+        # from this page entirely - the proposal is appended only after the
+        # comment succeeds - so a page headed "what the triage pilot wrote"
+        # omitted the writes most needing a human. The journal had them; this
+        # is what anyone actually reads.
+        parts += ["<h2>Labelled, but the comment failed</h2>",
+                  "<p>These tickets carry a label with no explanation on them. No later "
+                  "sweep will add one, because the label already being there is what "
+                  "suppresses the comment. Post the comment by hand, or remove the "
+                  "label - and note that removing it opts the ticket out of the pilot "
+                  "for good.</p>", "<ul>"]
+        for row in orphaned:
+            parts.append(f'<li><a href="{url}{esc(row["key"])}">{esc(row["key"])}</a> '
+                         f'&mdash; <code>{esc(row["label"])}</code> applied; '
+                         f'comment refused: {esc(row["error"])}</li>')
+        parts.append("</ul>")
 
     if excluded:
         parts += ["<h2>Excluded: already in review</h2>",
@@ -839,6 +860,7 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     # sweep said 34 needs to know which two were held back and on what evidence,
     # not just notice that they are missing.
     excluded: list[dict] = []
+    orphaned: list[dict] = []
     manifest: dict = {}
     errors = consecutive = 0
     journal = out / "journal.jsonl"
@@ -973,7 +995,17 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                         if add or remove:
                             jira.update_labels(key, add, remove)
                         if post_comment:
-                            jira.add_comment(key, comment_body(cfg, c))
+                            try:
+                                jira.add_comment(key, comment_body(cfg, c))
+                            except Exception as e:
+                                # The label is already on a public ticket and no
+                                # later sweep will explain it. Recorded for the
+                                # report before re-raising, so the page headed
+                                # "what the triage pilot wrote" names the writes
+                                # that most need a human.
+                                orphaned.append({"key": key, "label": label,
+                                                 "error": f"{type(e).__name__}: {e}"[:200]})
+                                raise
                         # Recorded here, before the property write. Everything a
                         # watcher can see has already landed; set_property is
                         # internal bookkeeping. Dropping the ticket when only
@@ -1058,9 +1090,10 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     if proposals:
         write_proposals(cfg, out, stamp, proposals, args.live, source)
         print(f"\nGrading sheet: {base}.csv (and .md); contexts in {out / 'contexts'}")
-    if proposals or excluded or errors:
+    if proposals or excluded or errors or orphaned:
         report = write_comment_report(cfg, base, stamp, proposals, args.live, source,
-                                      excluded, swept=len(keys), errors=errors)
+                                      excluded, swept=len(keys), errors=errors,
+                                      orphaned=orphaned)
         wrote = "what was written" if args.live else "what would be written"
         print(f"\nComment report ({wrote}): {report}")
     if errors:
