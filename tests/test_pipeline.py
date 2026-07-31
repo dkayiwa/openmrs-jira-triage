@@ -643,6 +643,45 @@ class DocumentedSurfaceTests(unittest.TestCase):
                          "these rely on the platform's default encoding:\n  "
                          + "\n  ".join(offenders))
 
+    def test_the_announcement_states_the_decision_rule_the_code_implements(self):
+        """The one document the whole community reads, against `decide`.
+
+        It told maintainers "if more than 1 in 10 labels get removed, we stop
+        the pilot", and that is not the pre-registered rule: at 11-20% with the
+        other two measures passing, decide() returns EXTEND. STOP needs the
+        rate past 20%, or two of the three failing. The claim overstated the
+        consequence twofold, and it was doing persuasive work - it is the
+        reason given for not removing labels as housekeeping.
+
+        Checked against decide() rather than against wording, so tuning the
+        thresholds in config.toml fails here until the announcement is
+        rewritten to match.
+        """
+        text = (self.ROOT / "docs" / "maintainer-announcement.md").read_text(encoding="utf-8")
+        m = load_config()["metrics"]
+        kill = m["max_label_removal_rate"]
+        self.assertEqual(decide(100.0, kill + 0.01, 9, m), "EXTEND (two weeks)",
+                         "the code no longer extends just past the threshold")
+        self.assertEqual(decide(100.0, 2 * kill + 0.01, 9, m), "STOP")
+        # So the document must not claim the threshold itself stops the pilot.
+        flat = " ".join(text.split())
+        self.assertNotIn("get removed, we stop the pilot", flat)
+        self.assertIn("past 1 in 5 we stop outright", flat,
+                      "the announcement must state where STOP actually begins")
+
+    def test_the_announcement_does_not_promise_only_one_comment_ever(self):
+        # plan_label_writes posts a comment whenever the label is new to the
+        # ticket, so a re-classification that flips the label adds a second.
+        # A maintainer promised "one comment" and seeing two would reasonably
+        # conclude the bot is malfunctioning.
+        cfg = load_config()
+        _, _, comments_again = plan_label_writes(
+            [cfg["labels"]["needs_more_info"]], cfg["labels"]["automation_candidate"])
+        self.assertTrue(comments_again, "a flip no longer comments; relax the wording")
+        flat = " ".join((self.ROOT / "docs" / "maintainer-announcement.md")
+                        .read_text(encoding="utf-8").split())
+        self.assertIn("two comments over the pilot", flat)
+
     def test_the_permission_list_covers_every_jira_write_the_code_makes(self):
         """The checklist's permission scheme against the client's actual verbs.
 

@@ -1,10 +1,14 @@
 # AI triage pilot on O3 — starting [DATE], and three things we need from you
 
 We're running a time-boxed pilot to help sort the O3 backlog. A bot account
-(**[BOT DISPLAY NAME]**) will add **one** `ai-triage-*` label and **one**
-explanatory comment to O3 tickets that are in **To Do**, created since
+(**[BOT DISPLAY NAME]**) will add **one** `ai-triage-*` label and one
+explanatory comment for it to O3 tickets that are in **To Do**, created since
 **[COHORT START DATE]**, and have no linked pull request. That's roughly 30
 tickets to begin with, then new ones as they arrive.
+
+If a ticket is edited enough to change the answer it is re-classified: the old
+label comes off, the new one goes on, and one comment explains the new label. So
+a ticket can end up with two comments over the pilot, never with two labels.
 
 The goal is narrow: make it easier to see which tickets are ready to pick up,
 which are waiting on a decision, and which can't be started yet because we don't
@@ -25,7 +29,9 @@ makes no technical or clinical calls.
 It also only reads what's already on the ticket: summary, description, acceptance
 criteria, the parent ticket, linked ticket titles, and comments from people. It
 never changes status, assignee, description, links, or anything else. Labels and
-comments are the only things it writes.
+comments are the only things it writes that you can see; it also stores a small
+record of what it decided against the issue, invisible in the UI, which is how
+it knows not to label the same ticket twice.
 
 It will sometimes be wrong. Which brings us to the first ask.
 
@@ -38,7 +44,8 @@ rest of the pilot. No need to explain, though we'd love to hear why.
 Two things follow from that:
 
 - **Please don't remove the label just to tidy up.** It's our main quality
-  signal: if more than 1 in 10 labels get removed, we stop the pilot. Removals
+  signal: more than 1 in 10 removed and that measure fails, costing the pilot its
+  strongest result; past 1 in 5 we stop outright. Removals
   meant as housekeeping would read as "the triage is bad."
 - **Leave it in place after promoting a ticket to `intro`.** A ticket can hold
   both, and it needs to hold both to count for us — see ask 3.
