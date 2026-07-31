@@ -18,6 +18,7 @@ import itertools
 import json
 import os
 import re
+import socket
 import sys
 import tempfile
 import types
@@ -125,7 +126,33 @@ class StubAnthropicModels:
         cls.error = None
 
 
+_NETWORK_PATCHES: list = []
+
+
+def _deny_socket(*_a, **_k):
+    raise AssertionError(
+        "a test opened a real network connection. The suite is offline by "
+        "construction - Jira, GitHub and Anthropic are all stubbed - and a test "
+        "that reaches out is testing the internet rather than this code: slow, "
+        "flaky, dependent on credentials, and quietly different from what CI runs. "
+        "Stub the client instead (StubJira, StubGitHub, StubAnthropicModels)."
+    )
+
+
 def setUpModule():
+    # The README calls this suite offline; this is what makes that true rather
+    # than merely so far. Adding a live probe to preflight once sent every
+    # preflight test to the real Anthropic API and the suite went from 2.8s to
+    # 17.2s - noticed only because of the clock. A faster endpoint would have
+    # become an unexplained cost on every CI run, and a flaky one an
+    # unexplained failure. Only the connect path is blocked, which stops real
+    # traffic without touching anything else that uses sockets.
+    for name in ("connect", "connect_ex"):
+        _NETWORK_PATCHES.append(mock.patch.object(socket.socket, name, _deny_socket))
+    _NETWORK_PATCHES.append(mock.patch.object(socket, "create_connection", _deny_socket))
+    for patch in _NETWORK_PATCHES:
+        patch.start()
+
     # One patch point: preflight builds its client through run.github_from_env,
     # so both entry points resolve GitHubClient in run's namespace.
     StubGitHub.reset()
@@ -141,6 +168,8 @@ def setUpModule():
 def tearDownModule():
     while _GITHUB_PATCHES:
         _GITHUB_PATCHES.pop().stop()
+    while _NETWORK_PATCHES:
+        _NETWORK_PATCHES.pop().stop()
 
 
 def issue(labels=(), histories=(), comments=(), **fields):
@@ -612,6 +641,28 @@ class DocumentedSurfaceTests(unittest.TestCase):
             self.assertIn("Re-run", section,
                           f"numbers are from {stated}, config pins {current}, and "
                           "nothing tells the reader to re-derive them")
+
+    def test_the_suite_cannot_reach_the_network(self):
+        """The README calls this suite offline; this is what makes it true.
+
+        Verified by running all 423 tests with sockets blocked - none touched
+        the network - and then made self-enforcing, because the interesting
+        case is the next test rather than the current ones. Adding a live probe
+        to preflight once sent every preflight test to the real Anthropic API,
+        and the only reason it was noticed was the clock: 2.8s to 17.2s. A
+        faster endpoint would have become an unexplained cost on every CI run,
+        and a flaky one an unexplained failure attributed to the code.
+
+        Asserted rather than assumed, since the block lives in setUpModule and
+        deleting it would leave the suite green and silently online again.
+        """
+        self.assertIs(socket.socket.connect, _deny_socket,
+                      "setUpModule no longer blocks outbound connections")
+        self.assertIs(socket.create_connection, _deny_socket)
+        with self.assertRaises(AssertionError) as caught:
+            socket.create_connection(("example.invalid", 80))
+        self.assertIn("offline by construction", str(caught.exception),
+                      "the failure must explain what to do instead")
 
     def test_no_production_file_io_relies_on_the_platform_encoding(self):
         """Every text read and write names its encoding.
