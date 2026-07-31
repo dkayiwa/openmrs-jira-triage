@@ -102,9 +102,32 @@ Code session using your own account:
 # 1. gather - no Anthropic credential, writes contexts + a manifest
 .venv/bin/python -m triage.run --no-classify --limit 5
 
-# 2. classify - read out/manifest.json (it lists every ticket eligible for
-#    classification with its content hash, and embeds entry_schema, the schema
-#    of one classifications-file entry) and write out/classifications.json
+# 2. classify - read out/manifest.json and write out/classifications.json.
+#    This is the only step you write yourself, so here is its exact shape.
+#    manifest["tickets"] is an OBJECT keyed by issue key, not a list; each
+#    entry carries content_hash and the path to the context to classify.
+#    manifest["entry_schema"] is the schema of one classifications entry.
+#
+#      import json, pathlib
+#      m = json.loads(pathlib.Path("out/manifest.json").read_text())
+#      out = {}
+#      for key, t in m["tickets"].items():
+#          context = pathlib.Path("out") / t["context"]      # the text to judge
+#          out[key] = {
+#              "label": ...,            # one of the three ai-triage label keys
+#              "rationale": ...,        # <= 2 sentences, quoting the ticket
+#              "missing_info": [],      # needs_more_info only
+#              "verification_steps": [],# automation_candidate only
+#              "confidence": 0.7,
+#              "content_hash": t["content_hash"],   # copy it; do not recompute
+#          }
+#      pathlib.Path("out/classifications.json").write_text(json.dumps(
+#          {"prompt_version": m["prompt_version"],
+#           "classifier": "session-agent", "classifications": out}, indent=2))
+#
+#    Copy content_hash rather than recomputing it: it is what binds your
+#    judgement to the exact text you read, and step 3 refuses any entry whose
+#    hash no longer matches the context on disk.
 
 # 3. apply - replays those classifications; makes no Claude call
 .venv/bin/python -m triage.run --classifications out/classifications.json --live

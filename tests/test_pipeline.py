@@ -643,6 +643,45 @@ class DocumentedSurfaceTests(unittest.TestCase):
                          "these rely on the platform's default encoding:\n  "
                          + "\n  ".join(offenders))
 
+    def test_the_documented_manifest_shape_matches_what_the_gather_writes(self):
+        """Step 2 of the replay is the only step the reader has to write.
+
+        The README used to describe the manifest in prose, and the shape is not
+        guessable: `tickets` is an object keyed by issue key, not a list. I
+        guessed it wrong while walking the procedure, having worked on this
+        pipeline all session, which is a fair prediction of how a maintainer
+        or an agent following the instructions would fare.
+
+        Now that the README shows the code, the code has to stay true - a
+        rename in write_manifest would leave a documented snippet that raises
+        TypeError on the one path the pilot falls back to when Anthropic
+        credit runs out.
+        """
+        snippet = self.readme[self.readme.index("# 2. classify"):]
+        snippet = snippet[:snippet.index("# 3. apply")]
+        for field in ('m["tickets"].items()', 't["context"]', 't["content_hash"]',
+                      'm["prompt_version"]', '"classifications"', '"classifier"'):
+            self.assertIn(field, snippet, f"the documented snippet lost {field}")
+
+        cfg = load_config()
+        jira = RecordingJira({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda c: jira), \
+                 mock.patch.object(run, "Classifier", lambda *a: StubClassifier(None)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                run.main(["--no-classify", "--keys", "O3-1"], out=out)
+            manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
+            # Exactly the accesses the README tells the reader to make.
+            self.assertIsInstance(manifest["tickets"], dict)
+            for key, t in manifest["tickets"].items():
+                self.assertTrue((out / t["context"]).exists(),
+                                "the documented context path does not resolve")
+                self.assertTrue(t["content_hash"])
+            self.assertEqual(manifest["prompt_version"], cfg["prompt"]["version"])
+
     def test_every_config_key_the_code_reads_is_present(self):
         # Direction that matters: a key the code reads but the file lacks is a
         # KeyError mid-sweep. The reverse (an unused key) is only clutter, and
