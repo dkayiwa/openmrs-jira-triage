@@ -3233,7 +3233,15 @@ class EvalImportTests(unittest.TestCase):
             module.GRADED = d / "graded.csv"
             module.CONTEXTS = d / "frozen"
             with contextlib.redirect_stdout(io.StringIO()) as log:
-                module.import_proposals(str(proposals), str(d / "contexts"))
+                try:
+                    module.import_proposals(str(proposals), str(d / "contexts"))
+                except SystemExit as e:
+                    # A sheet whose every graded row is skipped now exits
+                    # non-zero rather than reporting an ordinary "imported 0".
+                    # These cases each have a single row and skip it on
+                    # purpose, so they all take that path; the exit text joins
+                    # the log so they can still assert the reason.
+                    print(e)
             with open(module.GRADED) as fh:
                 rows = list(csv.DictReader(fh))
         return rows, log.getvalue()
@@ -3275,6 +3283,49 @@ class EvalImportTests(unittest.TestCase):
         rows, log = self._import("x", "", key="../../../../etc/passwd")
         self.assertEqual(rows, [])
         self.assertIn("not a Jira issue key", log)
+
+    def test_a_wholly_skipped_import_fails_instead_of_reporting_zero(self):
+        """Grading an afternoon away and being told nothing went wrong.
+
+        Found by walking the path rather than reading it: pointing --contexts
+        one directory too high skipped all 31 rows of a real proposals CSV,
+        printed a reason for each, summarised "imported 0 graded case(s)", and
+        exited 0. Every individual message was correct and the whole was a
+        false success - the operator's next command is the gate, which then
+        says "no graded cases yet" for a reason unconnected to what they did.
+
+        Partial skips stay non-fatal: one bad row out of thirty is a warning,
+        not a failed import. Only nothing-landed is an error.
+        """
+        module = load_evals_module()
+        with tempfile.TemporaryDirectory() as tmp:
+            d = Path(tmp)
+            (d / "contexts").mkdir()
+            proposals = d / "proposals.csv"
+            with open(proposals, "w", newline="", encoding="utf-8") as fh:
+                w = csv.DictWriter(fh, fieldnames=self.HEADER, extrasaction="ignore")
+                w.writeheader()
+                for key in ("O3-1", "O3-2"):
+                    w.writerow({"key": key, "proposed_label": "needs_more_info",
+                                "confidence": "0.90", "content_hash": "abc",
+                                "source": "api", "grade(ok/wrong)": "ok"})
+            module.GRADED = d / "graded.csv"
+            module.CONTEXTS = d / "frozen"
+            with contextlib.redirect_stdout(io.StringIO()), \
+                 self.assertRaises(SystemExit) as caught:
+                module.import_proposals(str(proposals), str(d / "wrong-place"))
+        self.assertIn("2 row(s) were graded and none could be imported",
+                      str(caught.exception))
+
+    def test_an_ungraded_sheet_is_not_an_error(self):
+        # A freshly exported sheet has no grades yet. Importing it should say
+        # so quietly, not fail - the guard above must fire on "graded but not
+        # landed", never on "not graded".
+        rows, log = self._import("TICKET: O3-1\n", ctx.content_hash("TICKET: O3-1\n"),
+                                 grade="")
+        self.assertEqual(rows, [])
+        self.assertIn("imported 0", log)
+        self.assertNotIn("none could be imported", log)
 
     def test_wrong_graded_replay_is_admitted_because_the_label_is_human(self):
         rows, _ = self._import("TICKET: O3-1\n", ctx.content_hash("TICKET: O3-1\n"),

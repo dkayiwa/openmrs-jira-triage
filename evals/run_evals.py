@@ -46,11 +46,13 @@ def import_proposals(path: str, contexts_dir: str) -> None:
         with open(GRADED, encoding="utf-8") as fh:
             rows = {r["key"]: r for r in csv.DictReader(fh)}
     added = 0
+    graded_rows = 0
     with open(path, encoding="utf-8") as fh:
         for r in csv.DictReader(fh):
             grade = (r.get("grade(ok/wrong)") or "").strip().lower()
             if grade not in ("ok", "wrong"):
                 continue
+            graded_rows += 1
             # The key becomes a filesystem path below and is stored for later
             # reads, so it is bounded to a Jira key shape rather than trusted.
             if not KEY_RE.fullmatch((r.get("key") or "").strip()):
@@ -120,6 +122,16 @@ def import_proposals(path: str, contexts_dir: str) -> None:
         for row in sorted(rows.values(), key=lambda x: x["key"]):
             w.writerow(row)
     print(f"imported {added} graded case(s); eval set now has {len(rows)}")
+    # Someone graded rows and none of them landed. Every skip above prints its
+    # own reason, but they scroll past, the summary reads as an ordinary "0",
+    # and the exit code says success - so a person who has just spent an hour
+    # grading is told nothing went wrong while nothing was recorded. The
+    # commonest cause is --contexts pointing somewhere the contexts are not,
+    # which is how this was found: every one of 31 rows skipped, and the
+    # command still succeeded.
+    if graded_rows and not added:
+        sys.exit(f"{graded_rows} row(s) were graded and none could be imported - see the "
+                 "reasons above. Nothing was written to the eval set.")
 
 
 def load_cases() -> list[dict]:
