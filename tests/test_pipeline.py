@@ -643,6 +643,50 @@ class DocumentedSurfaceTests(unittest.TestCase):
                          "these rely on the platform's default encoding:\n  "
                          + "\n  ".join(offenders))
 
+    def test_the_permission_list_covers_every_jira_write_the_code_makes(self):
+        """The checklist's permission scheme against the client's actual verbs.
+
+        Step 3 said to grant "only Browse Projects, Edit Issues, and Add
+        Comments ... no Transition, Delete, Assign, or Link", and step 4 then
+        runs a probe that posts a comment and deletes it. Following the two in
+        order left a comment on a real public ticket - one that said "this will
+        be deleted" - from a bot whose announcement is step 5.
+
+        Nothing connected the list to the code, so this is checked by verb: if
+        JiraClient grows a DELETE the checklist does not account for, the list
+        is out of date again.
+        """
+        client = (self.ROOT / "triage" / "jira.py").read_text(encoding="utf-8")
+        # Scoped to the granting sentence, not the whole README. Checking the
+        # file at large passed while the permission had been deleted from the
+        # list and survived only in the paragraph explaining it - a test that
+        # reads as coverage and asserts nothing, which is the failure this
+        # suite keeps finding in itself.
+        start = self.readme.index("It needs a permission scheme")
+        granted = self.readme[start:self.readme.index(".", self.readme.index("no Transition"))]
+        # Whitespace collapsed: the list wraps mid-name ("Add\n   Comments"),
+        # so a literal search fails for a formatting reason and reads as a
+        # missing permission.
+        granted = " ".join(granted.split())
+        verbs = {
+            "session.put": "Edit Issues",
+            "session.post": "Add Comments",
+            "session.delete": "Delete Own Comments",
+        }
+        for verb, permission in verbs.items():
+            if verb in client:
+                self.assertIn(permission, granted,
+                              f"jira.py issues a {verb} but the granting sentence in the "
+                              f"go-live checklist does not list {permission}")
+
+    def test_the_probe_comment_does_not_promise_its_own_removal(self):
+        # It lands on a real public ticket and may outlive the run, because
+        # Delete Own Comments is a permission an operator may decline.
+        source = (self.ROOT / "triage" / "preflight.py").read_text(encoding="utf-8")
+        probe = source[source.index("verifying Add Comments"):][:400]
+        self.assertIn("if the bot has Delete Own Comments", probe)
+        self.assertIn("removed by hand", probe)
+
     def test_the_documented_manifest_shape_matches_what_the_gather_writes(self):
         """Step 2 of the replay is the only step the reader has to write.
 

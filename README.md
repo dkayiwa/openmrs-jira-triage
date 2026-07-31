@@ -261,8 +261,17 @@ phase, every human label-removal gets added here as a new case.
    new account makes every label change the old one made read as a human removal:
    the whole cohort registers as opted out and the weekly decision flips to STOP.
    Rotate the API *token* freely; keep the account. It needs a permission scheme
-   granting only Browse Projects, Edit Issues (labels need it), and Add
-   Comments on O3 - no Transition, Delete, Assign, or Link. Note Edit Issues
+   granting only Browse Projects, Edit Issues (labels need it), Add
+   Comments, and **Delete Own Comments** on O3 - no Transition, Delete Issues,
+   Assign, or Link.
+
+   Delete Own Comments is there for step 4 and nothing else: the `--scratch`
+   probe posts a comment to verify Add Comments and then removes it. Without
+   the permission the probe still passes, prints a WARN, and leaves the comment
+   behind - on a real public ticket, saying "this will be deleted if the bot is
+   permitted to", from a bot whose announcement (step 5) has not gone out yet.
+   The pilot itself never deletes anything; if you would rather not grant it,
+   that is fine, but expect to remove the probe comment by hand. Note Edit Issues
    is not field-granular in Jira, so "never edits ticket text" is enforced by
    this code writing only the labels field; audit via changelogs weekly.
    `notifyUsers=false` on label edits additionally needs project admin, else

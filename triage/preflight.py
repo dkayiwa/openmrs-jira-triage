@@ -247,8 +247,14 @@ def main(argv=None) -> int:
         # suppresses the comment).
         posted = None
         try:
+            # Not "this will be deleted": removing it needs Delete Own
+            # Comments, which the checklist now lists but an operator may
+            # reasonably decline, and a comment on a public ticket should not
+            # promise something the bot may not be permitted to do.
             posted = jira.add_comment(args.scratch, "triage pilot preflight - "
-                                      "verifying Add Comments; this will be deleted")
+                                      "verifying Add Comments; this will be deleted "
+                                      "if the bot has Delete Own Comments, and should "
+                                      "otherwise be removed by hand")
             ok &= check("bot can add comments", True, f"comment {posted.get('id')}")
         except Exception as e:
             ok &= check("bot can add comments", False, str(e)[:200])
