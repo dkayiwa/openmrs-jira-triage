@@ -689,7 +689,17 @@ def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime
                   "sweep will add one, because the label already being there is what "
                   "suppresses the comment. Post the comment by hand, or remove the "
                   "label - and note that removing it opts the ticket out of the pilot "
-                  "for good.</p>", "<ul>"]
+                  "for good.</p>",
+                  # Measured across three sweeps: the next run finds the label
+                  # already present, so it posts no comment, hits no error, and
+                  # writes the entity property - marking the ticket triaged, after
+                  # which it renders like any healthy quiet re-classification.
+                  "<p><strong>This page is the only notice.</strong> The next sweep "
+                  "will finish this ticket's bookkeeping and stop listing it here: it "
+                  "will look identical to a ticket that was commented on properly "
+                  "weeks ago, because both show as \"label already present, so no "
+                  "comment\". Deal with these before the next run, or note the keys "
+                  "somewhere that outlives this file.</p>", "<ul>"]
         for row in orphaned:
             parts.append(f'<li><a href="{url}{esc(row["key"])}">{esc(row["key"])}</a> '
                          f'&mdash; <code>{esc(row["label"])}</code> applied; '

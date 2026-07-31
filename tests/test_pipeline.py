@@ -4082,6 +4082,35 @@ class LiveRunTests(unittest.TestCase):
         self.assertIn("Add Comments permission missing", report,
                       "the reason has to travel with it, or it is not actionable")
 
+    def test_the_orphan_section_says_it_is_the_only_notice(self):
+        """Because the next sweep erases the distinction.
+
+        Measured across three sweeps against a Jira that refuses comments:
+        sweep 1 errors and lists the ticket here; sweep 2 finds the label
+        already present, so it posts no comment, hits no error, and writes the
+        entity property - marking the ticket triaged; sweep 3 skips it as
+        already-triaged. From sweep 2 on it renders exactly like a ticket that
+        was commented on properly weeks ago, because both show as "label
+        already present, so no comment". The label stays unexplained on a
+        public board and no artifact says so.
+
+        A reader who defers this until next week has nothing left to act on, so
+        the page has to say that rather than let them assume otherwise.
+        """
+        class CommentRefused(RecordingJira):
+            def add_comment(self, key, body):
+                raise JiraError("503 upstream unavailable")
+
+        c = Classification("needs_judgment", "A clinical call.", [], [], 0.8, "m")
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            self._sweep(CommentRefused({"O3-1": issue()}), c,
+                        ["--live", "--keys", "O3-1"], out)
+            report = next(out.glob("proposals-*.html")).read_text(encoding="utf-8")
+        self.assertIn("This page is the only notice", report)
+        self.assertIn("label already present, so no comment", report,
+                      "it must name the line the ticket will hide behind")
+
     def test_a_healthy_run_has_no_orphaned_label_section(self):
         # The section must not appear when nothing is wrong, or it becomes
         # furniture the reader learns to skip.
