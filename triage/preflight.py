@@ -43,7 +43,11 @@ def attempt(label: str, fn):
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="triage pilot preflight")
-    ap.add_argument("--scratch", help="issue key for the label-charset write test (needs bot auth)")
+    ap.add_argument("--scratch",
+                    help="a THROWAWAY issue key for the write tests (needs bot auth). "
+                         "This posts a real comment, and Jira Cloud notifies that "
+                         "ticket's watchers with no way to suppress it - do not point "
+                         "it at a ticket someone is following")
     # The same flag the sweep takes, because preflight tells the operator to
     # reach for it. Before this, the failure below advised "pass --no-pr-check"
     # and preflight itself answered "unrecognized arguments" - and since

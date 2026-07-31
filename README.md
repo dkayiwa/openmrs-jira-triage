@@ -277,6 +277,16 @@ phase, every human label-removal gets added here as a new case.
    `notifyUsers=false` on label edits additionally needs project admin, else
    edits notify watchers (comments always notify - Cloud has no off switch).
 4. **Preflight with the write test:** `python -m triage.preflight --scratch O3-XXXX`.
+
+   **Make O3-XXXX a ticket you created for this.** The probe is not a dry run:
+   it adds and removes a label, and posts and deletes a comment, on whatever
+   key you hand it. Per the note above, comments always notify watchers and
+   Jira Cloud has no way to suppress that - so pointing this at an existing O3
+   ticket sends its watchers a notification from a bot account whose
+   announcement is still one step away, saying "triage pilot preflight". Close
+   the throwaway afterwards; it never enters the cohort, because scope is
+   `status = "To Do"` and tickets created before `cohort_created_since` are out
+   of the window anyway.
 5. **Dry-run the whole cohort, grade, iterate** until the eval gate passes.
 
    **Know what passing it proves.** The gate is a point estimate: each graded

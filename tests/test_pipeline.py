@@ -682,6 +682,31 @@ class DocumentedSurfaceTests(unittest.TestCase):
                         .read_text(encoding="utf-8").split())
         self.assertIn("two comments over the pilot", flat)
 
+    def test_the_write_probe_warns_that_it_notifies_watchers(self):
+        """Step 4 told you to point real writes at a production ticket.
+
+        `--scratch O3-XXXX` is not a dry run: it adds and removes a label and
+        posts and deletes a comment on whatever key it is given. Two lines
+        above it, the README states the fact that makes this a problem -
+        "comments always notify - Cloud has no off switch" - and step 5, the
+        announcement, has not happened yet. Following the steps in order sends
+        an arbitrary O3 ticket's watchers a notification from a bot nobody has
+        been told about.
+
+        Warned in both places a reader might look: the checklist, and the
+        flag's own --help, since anyone reaching for it from the command line
+        never sees the checklist.
+        """
+        step4 = self.readme[self.readme.index("**Preflight with the write test:**"):]
+        step4 = " ".join(step4[:step4.index("5. **Dry-run")].split())
+        self.assertIn("ticket you created for this", step4)
+        self.assertIn("notify watchers", step4)
+
+        help_text = (self.ROOT / "triage" / "preflight.py").read_text(encoding="utf-8")
+        scratch = help_text[help_text.index('ap.add_argument("--scratch"'):][:600]
+        self.assertIn("THROWAWAY", scratch)
+        self.assertIn("notifies", scratch)
+
     def test_the_permission_list_covers_every_jira_write_the_code_makes(self):
         """The checklist's permission scheme against the client's actual verbs.
 
