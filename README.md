@@ -51,21 +51,125 @@ Deliberate limits, both erring towards leaving a ticket in scope:
 - **A key only in a PR *comment* does not count.** Search matches comments too,
   so "unrelated to O3-5816" in a review would otherwise exclude a ticket nobody
   is working on. Only the PR title and body are treated as a claim.
-- **A PR that never names the ticket is invisible here.** O3-5843's description
-  links `openmrs-esm-audit-log-app#1`, but that PR cites no key, so neither Jira
-  nor GitHub can tie the two. The fix is the convention the other PRs already
-  follow — put the key in the PR title. Prose-scanning the ticket instead would
-  misfire: the same URL appears in O3-5842 as the place a styleguide bug was
-  *observed*, and in O3-5828 as a dependency.
 - **A closed PR does not count.** O3-5716's `bedmanagement#114` was closed
   unmerged on 2026-07-08, so that ticket genuinely is the pilot's to sort.
+- **Prose-scanning the ticket for PR links is not the answer.** Tempting, but
+  the same URL appears in O3-5842 as the place a styleguide bug was *observed*,
+  and in O3-5828 as a dependency. A linked PR is not a PR doing the work.
 
-`GITHUB_TOKEN` is optional and read-only; it raises the search limit from 10 to
+### When no PR cites the key
+
+The key search shares one assumption with the dev panel: that somebody wrote the
+key down. When they did not, both fail together, and "two independent checks"
+is really one question asked twice. This is not hypothetical — it is how the
+pilot's own first batch went wrong. Of the nine tickets it proposed as
+automation candidates, **six already had an open PR and the key search found
+none of them.** Not all of that is forgetfulness:
+`openmrs-esm-audit-log-app#1` does cite a key, `O3-5843` — the *epic* — while
+the five tickets describing that work are O3-5685…5689. A PR citing the parent
+is invisible to a search for the child.
+
+So when the key search comes back empty, the sweep asks a different question:
+*does an open PR describe this work?* It derives up to three phrases from the
+summary — code identifiers first (`esm-admin-auditlog-app`, `useAuditLogs`),
+then the whole summary, for the common case of a PR title that mirrors the
+ticket. Multi-word text is quoted so GitHub does not OR the words; a single
+identifier is deliberately **not**, because GitHub's index tokenises on hyphens
+and `"esm-admin-auditlog-app"` quoted returns nothing while the bare term
+returns the two PRs doing the work. A phrase matching more than ten open PRs is
+describing the project rather than the ticket and is discarded; `"unit tests"`
+matches over 140.
+
+A hyphenated word only counts as an identifier if one of its segments is
+`openmrs`, `esm`, `module`, `omod` or `app`. Every real package name here has
+one (`openmrs-esm-patient-chart`, `openmrs-module-fhir2`) and no English
+compound does — without that rule `weight-for-age`, from O3-5834's summary,
+matched an unrelated PR containing the phrase in a test fixture and held back a
+ticket nobody was working on.
+
+This is journalled as **`skip-related-pr`, kept deliberately distinct from
+`skip-open-pr`**, and reported under its own heading. The difference is what
+they know. A PR naming the key is proof. A PR sharing the ticket's words is a
+suggestion for a human to confirm — `OpenmrsDatePicker` matched five open PRs
+when this was written, all genuinely about that component and none about any one
+ticket. The matched phrase travels with each URL so the reader can judge it.
+
+Measured against live GitHub over the 29-ticket cohort on 2026-08-02: **3 held
+back, all three correct, no false positives.** Two consequences worth stating
+plainly:
+
+- **It recovers half of what the key search misses, not all of it.** Of the six
+  above it finds O3-5685, O3-5686 and O3-5801. O3-5687, O3-5688 and O3-5689
+  have summaries that are ordinary prose with no identifier in them — "Add
+  filter bar with entity type, username and date range" matches nothing, and no
+  phrasing of it would. **Putting the key in the PR title remains the only
+  mechanism that works every time**; this is a backstop, not a substitute.
+- **A held-back ticket is not held back forever.** It stays out of the manifest
+  for that sweep only, and returns to scope as soon as the PR closes. If the
+  match was a coincidence and the ticket is wanted sooner, ask the PR author to
+  cite the key — which also fixes it at the source.
+
+A failure of *this* search does not fail the ticket, unlike the key search
+above: an advisory signal must not be able to trip the consecutive-error
+breaker and halt a healthy sweep.
+
+It is still reported, in three places, because "not an error" is not the same
+as "not worth mentioning": the journal row carries `related_pr_check`, the run
+warns on stderr, and the report opens with **"Scope was checked once, not
+twice"** naming how many tickets it applies to. Without those last two the
+journal was the only record, and a sweep in which every content search died
+read exactly like a clean one — the report listed the proposals with no caveat,
+which is the page people approve a live run from. The warning does not change
+the exit code, though: a transient GitHub blip must not turn the scheduled
+sweep red, or failing open would have bought nothing.
+
+**`related_pr_check` distinguishes three outcomes, and its absence is the
+fourth.** The audit record has to answer "was this ticket in scope?", and it
+could not while a ticket the backstop never looked at was journalled exactly
+like one it looked at and cleared:
+
+| `related_pr_check` | what happened |
+|---|---|
+| *(absent)* | searched, no similar open PR found |
+| `failed: …` | the search did not complete — re-running may help |
+| `skipped: no distinctive phrase…` | nothing searchable in the summary; only rewording changes this |
+| `skipped: every derived phrase exceeded…` | the query was over GitHub's limit; a shorter summary clears it |
+
+Only `failed:` counts towards the banner, because only it is worth re-running
+for. The two `skipped:` cases are routine — 2 of the 29-ticket cohort yield no
+searchable phrase — so they are recorded per ticket and never escalated; a
+banner that fires on most sweeps is one operators learn to ignore.
+
+It costs at most three extra searches per unmatched ticket and a measured mean
+of exactly one — across the 29-ticket cohort, 25 summaries yield one phrase, 2
+yield two and 2 yield none. That doubles the sweep's GitHub time (2 searches
+per ticket, 5.0s rather than 2.5s) and brings the scheduled job's ceiling down
+from ~143 tickets to ~120; `.github/workflows/triage.yml` carries the
+arithmetic.
+
+**Without a token that ceiling is ~72, not ~120.** Anonymous search allows
+10/min rather than 30, so each search waits 7.5s rather than 2.5s, and doubling
+the count per ticket costs 15s of throttle instead of 5s — the sweep drops from
+~103 tickets to ~72. That is under three times the current cohort, so on a
+local full-cohort run `GITHUB_TOKEN` has stopped being a nicety:
+`GITHUB_TOKEN=$(gh auth token)` restores the ~120. CI is unaffected — the
+workflow passes the automatic `github.token`, and the run's first line always
+states which mode it is in.
+
+A phrase whose query would exceed GitHub's 256-character limit is
+skipped rather than sent — Jira allows a 255-character summary, and a 422
+raised mid-loop would discard the identifier match already found for that
+ticket.
+
+`GITHUB_TOKEN` is read-only and still optional, but see the ceiling above before
+sweeping the whole cohort without one: it raises the search limit from 10 to
 30/min (`GITHUB_TOKEN=$(gh auth token)` locally). The scheduled workflow uses
-the automatic `github.token`, so no new repo secret is needed. A failed search
-**fails that ticket** rather than classifying it — fail-open would silently
-re-open this gap on exactly the tickets most likely to be in review. Use
-`--no-pr-check` (or `[github].check_open_prs = false`) to sweep on Jira's word
+the automatic `github.token`, so no new repo secret is needed. A failed *key*
+search **fails that ticket** rather than classifying it — fail-open would
+silently re-open this gap on exactly the tickets most likely to be in review.
+(The content search above is the deliberate exception, for the reason given
+there.) Use `--no-pr-check` (or `[github].check_open_prs = false`) to sweep on
+Jira's word
 alone; either way the run says which mode it is in. **Pass the flag to
 `triage.preflight` as well as `triage.run`** — the gate probes the same search
 and runs as a required workflow step, so skipping it in one place and not the
@@ -89,7 +193,7 @@ Useful flags: `--keys O3-4522,O3-5823` (specific tickets), `--no-classify`
 `--live` this re-spends on classification and comments again on any label
 flip, but opt-outs are still respected), `--live` (real writes; needs
 `JIRA_EMAIL`, `JIRA_API_TOKEN`, `TRIAGE_BOT_ACCOUNT_ID`), `--no-pr-check`
-(sweep without the open-PR backstop below).
+(sweep without either of the GitHub backstops below).
 
 ## Running without an Anthropic API key
 
@@ -449,7 +553,7 @@ phase, every human label-removal gets added here as a new case.
 ## Verifying a change
 
 ```bash
-.venv/bin/python -m unittest discover -s tests -q     # 424 tests, ~3s, no network
+.venv/bin/python -m unittest discover -s tests -q     # 494 tests, ~3s, no network
 .venv/bin/python -m triage.preflight                  # the go-live gate, read-only
 ```
 
@@ -508,7 +612,7 @@ prompt/system.md      the rubric prompt (versioned)
 docs/                 maintainer announcement (label names pinned by the tests)
 triage/run.py         sweep -> skip checks -> assemble -> classify -> write/propose
 triage/context.py     visible-information assembly + content hash
-triage/github.py      open-PR backstop for the Jira dev panel (scope)
+triage/github.py      open-PR + content backstops for the Jira dev panel (scope)
 triage/state.py       changelog-derived opt-out / already-triaged / violations
 triage/classifier.py  one Claude call, JSON-schema output, refusal fallbacks
 triage/preflight.py   pre-launch checks incl. label charset test

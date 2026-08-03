@@ -59,21 +59,35 @@ Two things follow from that:
 ## 2. Put the O3 key in your PR title
 
 The pilot skips tickets that already have a pull request, so nobody gets triage
-noise on work that's already underway. It finds those PRs two ways: Jira's
-development panel, and by searching GitHub for the ticket key.
+noise on work that's already underway. It finds those PRs three ways: Jira's
+development panel, a GitHub search for the ticket key, and — only when both of
+those come up empty — a GitHub search for distinctive wording from the ticket
+summary.
 
-Both depend on the key appearing in the PR. So please use the form the majority
-already do:
+The first two depend on the key appearing in the PR, and the third is a guess
+that only works sometimes. So please use the form the majority already do:
 
 ```
 (fix) O3-1234: short description
 ```
 
-This isn't hypothetical. One ticket in the starting cohort has an open PR that
-the pilot can't connect to it, because the PR title doesn't mention the key —
-so that ticket will get triaged as though nobody were working on it. Keys in PR
-titles also fix the dev panel, the release notes, and anyone searching Jira for
-"what happened to this."
+This isn't hypothetical, and it is worse than we first thought. Of the nine
+tickets the pilot's first batch put forward as automation candidates, **six
+already had an open PR and neither key-based check found any of them** — no PR
+cited its key, so both checks failed together. Some of that isn't even
+forgetfulness: one PR does cite a key, but the *epic* rather than the five
+tickets describing the actual work, and a search for the child never finds it.
+
+Searching by wording recovers about half of those. It can't do better: a
+summary like "Add filter bar with entity type, username and date range" has
+nothing distinctive in it to search for. **The key in the PR title is the only
+thing that works every time.** It also fixes the dev panel, the release notes,
+and anyone searching Jira for "what happened to this."
+
+If the pilot does hold a ticket back on wording alone, the run report says so
+under its own heading, names the pull request, and shows the phrase that
+matched — so a coincidence is visible rather than silent, and the ticket comes
+back into scope by itself once that PR closes.
 
 ## 3. Apply `intro` or `not-intro` when you act on a triaged ticket
 

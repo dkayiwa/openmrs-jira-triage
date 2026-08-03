@@ -166,6 +166,17 @@ def main(argv=None) -> int:
               "dev panel alone")
     else:
         gh_label = "github open-PR backstop"
+        # Only the KEY search is probed, deliberately, though the sweep also
+        # runs a content search when the key search comes back empty. The two
+        # share an endpoint, a token and a throttle, so this probe already
+        # proves everything the content search needs from the environment; all
+        # that differs is the `q` string. And the asymmetry that makes this gate
+        # load-bearing does not apply to the second search: a failed key search
+        # fails its ticket, and five in a row abort the sweep, which is why it
+        # has to be proven before go-live. A failed content search is recorded
+        # on the journal row and the ticket proceeds. Probing it would cost a
+        # search per gate run to protect against an outcome that costs nothing.
+        #
         # A key the sweep will actually ask about, so a probe that passes proves
         # the query the pipeline runs - not a simpler one.
         real_key = bool(scope_ok and keys)

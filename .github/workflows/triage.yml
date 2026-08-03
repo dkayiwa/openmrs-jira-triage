@@ -42,12 +42,31 @@ jobs:
     # against GitHub search, 0.6 reading Jira. Steady-state sweeps are far
     # shorter, since an unchanged ticket is skipped before either call.
     #
+    # The GitHub term doubled when the content backstop landed: a ticket whose
+    # key search comes back empty is searched again by phrase, and in a full
+    # sweep almost every key search is empty. Measured over the 29-ticket
+    # cohort on 2026-08-02, phrase derivation yields a mean of exactly 1.00
+    # extra search per ticket (25 tickets give one phrase, 2 give two, 2 give
+    # none), so 2 searches per ticket and 5.0s rather than 2.5s.
+    #
     # The number that matters if scope ever widens: this kills the job at
-    # roughly 143 tickets. A cohort past that cannot finish a prompt-bump
-    # sweep, and would be killed and restarted every four hours forever -
-    # making progress each time, because completed tickets are skipped, but
-    # never producing a grading sheet or a comment report, since both are
-    # written only after the loop.
+    # roughly 120 tickets, down from 143 before that change, and at ~90 in the
+    # worst case where every summary yields the full three phrases. A cohort
+    # past that cannot finish a prompt-bump sweep, and would be killed and
+    # restarted every four hours forever - making progress each time, because
+    # completed tickets are skipped, but never producing a grading sheet or a
+    # comment report, since both are written only after the loop. If the cohort
+    # approaches it, lowering MAX_PHRASES in triage/github.py buys headroom
+    # back at a measured cost in what the backstop catches; 0 restores the old
+    # 143 exactly, by turning the content search off while leaving the key
+    # search - the one whose answer is proof - untouched.
+    #
+    # Every number above assumes an authenticated search: 30/min, so 2.5s per
+    # search. This job is authenticated (github.token is passed to both the
+    # gate and the sweep), so it holds here. A LOCAL run without GITHUB_TOKEN
+    # gets 10/min, 7.5s per search, 15s of throttle per ticket, and a ceiling
+    # of ~72 rather than ~120 - which the README states, because it is the one
+    # supported configuration where the documented figure does not apply.
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4

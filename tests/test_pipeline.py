@@ -27,6 +27,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+import requests
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from triage import context as ctx  # noqa: E402
@@ -71,15 +73,21 @@ class StubGitHub:
     """
 
     answers: dict = {}
+    related: dict = {}
     searched: list = []
+    phrase_searched: list = []
     error: Exception | None = None
+    related_error: Exception | None = None
     built: int = 0
 
     @classmethod
-    def reset(cls, answers=None, error=None):
+    def reset(cls, answers=None, error=None, related=None, related_error=None):
         cls.answers = dict(answers or {})
+        cls.related = dict(related or {})
         cls.searched = []
+        cls.phrase_searched = []
         cls.error = error
+        cls.related_error = related_error
         cls.built = 0
 
     def __init__(self, org, token=None, **kwargs):
@@ -93,6 +101,18 @@ class StubGitHub:
         if type(self).error:
             raise type(self).error
         return list(type(self).answers.get(key, []))
+
+    # Kept in step with GitHubClient deliberately. When this method was added
+    # to the client and not here, every sweep in the suite raised
+    # AttributeError inside the ticket loop, was caught as a generic error, and
+    # 34 tests went red at once - the stub's whole reason for existing is that
+    # the client is built out of the test's reach, so a client method missing
+    # here is a suite-wide outage rather than one skipped assertion.
+    def related_pr_urls(self, key, summary):
+        type(self).phrase_searched.append((key, summary))
+        if type(self).related_error:
+            raise type(self).related_error
+        return [tuple(p) for p in type(self).related.get(key, [])]
 
 
 _GITHUB_PATCHES = []
@@ -720,6 +740,31 @@ class DocumentedSurfaceTests(unittest.TestCase):
         self.assertIn("past 1 in 5 we stop outright", flat,
                       "the announcement must state where STOP actually begins")
 
+    def test_the_announcement_does_not_claim_every_check_needs_the_key(self):
+        """It used to say "Both depend on the key appearing in the PR."
+
+        True when the only checks were the dev panel and a key search; false
+        the moment a phrase search could catch a PR that cites nothing. Pinned
+        to the code rather than the wording: while search_phrases returns
+        anything at all, that sentence is a promise the pipeline breaks.
+        """
+        self.assertTrue(gh.search_phrases("Bootstrap esm-admin-auditlog-app package"),
+                        "no content search exists; restore the simpler wording")
+        flat = " ".join((self.ROOT / "docs" / "maintainer-announcement.md")
+                        .read_text(encoding="utf-8").split())
+        self.assertNotIn("Both depend on the key appearing in the PR", flat)
+
+    def test_the_announcement_still_asks_for_the_key_in_the_title(self):
+        # The counterweight to the test above. Admitting a second mechanism
+        # exists is only safe while the document also says it is partial - a
+        # maintainer who reads "it searches the wording too" and stops writing
+        # keys would make scope detection worse, not better, because the
+        # wording search is measured at half the recall of the key search.
+        flat = " ".join((self.ROOT / "docs" / "maintainer-announcement.md")
+                        .read_text(encoding="utf-8").split())
+        self.assertIn("only thing that works every time", flat)
+        self.assertIn("recovers about half", flat)
+
     def test_the_announcement_does_not_promise_only_one_comment_ever(self):
         # plan_label_writes posts a comment whenever the label is new to the
         # ticket, so a re-classification that flips the label adds a second.
@@ -964,13 +1009,36 @@ class ReportMarkupTests(unittest.TestCase):
                            [f"missing {self.PAYLOAD}"], [f"verify {self.PAYLOAD}"],
                            0.8, f"model {self.PAYLOAD}")
         iss = issue(summary=f"Summary {self.PAYLOAD}")
+        # Both exclusion shapes, because they render through different
+        # interpolations and this sweep is the check that does not rely on
+        # anyone's eyes. The content-match row was added later than this test
+        # and was invisible to it: the section only renders when a row carries
+        # `related_prs`, so four new interpolations - the URL, the matched
+        # phrase, and the two banner counts - were reviewed by eye alone in a
+        # class whose whole premise is that eyes miss one in 41.
         excluded = [{"key": "O3-2", "open_prs": [f"https://x/{self.PAYLOAD}"],
-                     "summary": f"Excluded {self.PAYLOAD}"}]
+                     "summary": f"Excluded {self.PAYLOAD}"},
+                    {"key": "O3-3", "summary": f"Held back {self.PAYLOAD}",
+                     "related_prs": [
+                         {"url": f"https://x/{self.PAYLOAD}",
+                          "matched": f"phrase {self.PAYLOAD}"},
+                         # A URL that is NOT a link, so the report's other
+                         # branch is swept too. Both are needed: with only the
+                         # https one, every payload took the <a href> path and
+                         # dropping esc() from the <code> stand-in went
+                         # unnoticed. And the stand-in is not inert by
+                         # construction - item_url builds it from `number`,
+                         # which is remote JSON, so a hostile number really does
+                         # arrive here as "openmrs PR #<script>… (no URL
+                         # returned)".
+                         {"url": f"openmrs PR #{self.PAYLOAD} (no URL returned)",
+                          "matched": f"other {self.PAYLOAD}"}]}]
         stamp = datetime.datetime(2026, 8, 1, tzinfo=datetime.timezone.utc)
         with tempfile.TemporaryDirectory() as d:
             base = run.proposal_base(Path(d), stamp)
             path = run.write_comment_report(cfg, base, stamp, [(iss, c, "abc")],
-                                            False, source, excluded, swept=2, errors=0)
+                                            False, source, excluded, swept=3, errors=0,
+                                            unchecked=1)
             return path.read_text()
 
     def _assert_inert(self, text, marker):
@@ -2535,6 +2603,522 @@ def pr(number=1, title="", body="", url=None):
             "html_url": url or f"https://github.com/openmrs/repo/pull/{number}"}
 
 
+class SearchPhraseTests(unittest.TestCase):
+    """What the content backstop searches for, given a ticket summary.
+
+    Every summary below is verbatim from the launch cohort, because the point of
+    this derivation is not that it is clever - it is that it recovers the PRs the
+    key search actually missed. Fixtures invented to suit the regexes would
+    prove the regexes and nothing else.
+    """
+
+    def test_a_package_name_is_pulled_out_of_the_summary(self):
+        # O3-5685. Measured against live GitHub, this identifier returns two open
+        # PRs and both are the real work - even though the repository is called
+        # openmrs-esm-audit-log-app, so the repo name would not have matched.
+        self.assertIn("esm-admin-auditlog-app",
+                      gh.search_phrases("Bootstrap esm-admin-auditlog-app package"))
+
+    def test_a_hook_name_is_pulled_out_and_searched_first(self):
+        # O3-5686. `useAuditLogs` finds the PRs; the full summary as a phrase
+        # finds nothing, so the identifier has to be tried before the prose.
+        phrases = gh.search_phrases("Implement useAuditLogs hook and paginated data table")
+        self.assertEqual(phrases[0], "useAuditLogs")
+
+    def test_the_whole_summary_is_tried_when_a_title_might_mirror_it(self):
+        # O3-5801 has no identifier at all, and its exact summary returns
+        # exactly one open PR: the one that fixes it. Dropping the prose phrase
+        # for want of an identifier would lose that ticket.
+        self.assertEqual(
+            gh.search_phrases("Add location name for Transfer Request encounter type"),
+            ["Add location name for Transfer Request encounter type"])
+
+    def test_an_english_compound_is_not_mistaken_for_a_package_name(self):
+        # Measured over the live cohort, and the only false hold-back it
+        # produced: `weight-for-age` from O3-5834 matched an unrelated PR that
+        # happens to contain the phrase in a test fixture, and would have kept a
+        # ticket nobody was working on out of the sweep.
+        self.assertEqual(
+            gh.search_phrases("Add CDC weight-for-age growth reference standard "
+                              "to the O3 Growth Chart"),
+            ["Add CDC weight-for-age growth reference standard to the O3 Growth Chart"])
+
+    def test_a_real_package_name_still_survives_that_filter(self):
+        # The filter above is worthless if it also drops the identifiers that
+        # make this backstop work, so both directions are asserted.
+        for name in ("openmrs-esm-patient-chart", "openmrs-module-fhir2",
+                     "esm-admin-auditlog-app", "openmrs-esm-audit-log-app"):
+            with self.subTest(name):
+                self.assertIn(name, gh.search_phrases(f"Bootstrap the {name} package now"))
+
+    def test_a_short_capitalised_word_never_becomes_a_phrase(self):
+        # "Migrate CashierOptionsService to OpenMRS Service" is a real cohort
+        # summary: the class name is wanted, the org's own name is not. The
+        # length floor is what separates them, so it is asserted on the real
+        # pair rather than on the rule in the abstract.
+        phrases = gh.search_phrases("Migrate CashierOptionsService to OpenMRS Service")
+        self.assertIn("CashierOptionsService", phrases)
+        self.assertNotIn("OpenMRS", phrases)
+
+    def test_a_generic_camel_case_word_is_left_to_the_hit_cap(self):
+        # There is no way to tell `TypeScript` from `CashierOptionsService` by
+        # shape, so extraction does not try - it emits both, and the answer
+        # sorts them out: measured live, TypeScript matches 84 open PRs and is
+        # discarded, CashierOptionsService matches 0. This test pins the half
+        # that is a decision: the word IS emitted, so the cap is load-bearing
+        # and must not be removed as redundant.
+        self.assertIn("TypeScript", gh.search_phrases("Migrate the app to TypeScript now"))
+        self.assertGreater(84, gh.MAX_PHRASE_HITS,
+                           "the measured hit count must exceed the cap, or the "
+                           "cap is not what protects this case")
+
+    def test_a_summary_too_short_to_be_distinctive_yields_nothing(self):
+        # Better no query than one that matches the whole org: "Fix bug" as a
+        # phrase would hold back every ticket it was run on.
+        self.assertEqual(gh.search_phrases("Fix bug"), [])
+
+    def test_a_four_word_summary_is_still_searched(self):
+        # The exact MIN_SUMMARY_WORDS boundary, and it is not hypothetical: 3 of
+        # 100 sampled O3 summaries are exactly four words - "Update Patient
+        # Chart README", "Implement TOTP enrollment screen", "Create Backend
+        # Notification Module". Nudging the threshold to 5 silences all of them
+        # and every test still passed, which is how mutation testing found this.
+        for summary in ("Update Patient Chart README",
+                        "Implement TOTP enrollment screen",
+                        "Create Backend Notification Module"):
+            with self.subTest(summary):
+                self.assertEqual(gh.search_phrases(summary), [summary])
+
+    def test_jira_monospace_markers_do_not_reach_the_query(self):
+        # Summaries carry {{...}} around code. Searching for the braces finds
+        # nothing, so the identifier inside them would be wasted.
+        self.assertIn("OpenmrsDatePicker",
+                      gh.search_phrases("The {{OpenmrsDatePicker}} is one pixel too tall"))
+
+    def test_punctuation_cannot_break_out_of_the_quoted_phrase(self):
+        # The phrase is interpolated into q="..." - a quote or a qualifier
+        # surviving into it would silently change what was searched for, and the
+        # result would still look like a clean answer.
+        for phrase in gh.search_phrases('Fix the "broken" is:merged repo:evil/x thing'):
+            self.assertNotIn('"', phrase)
+
+    def test_no_more_phrases_than_the_cap_are_ever_returned(self):
+        # Each phrase is one throttled search charged to every unmatched ticket.
+        # Asserted against a literal 3, not against gh.MAX_PHRASES: reading the
+        # constant made this tautological - raising it to 99 raised the bound
+        # too and the test still passed, which mutation testing caught.
+        #
+        # The exact list is pinned rather than just the length, for the same
+        # reason: with only a length assertion, reordering the two identifier
+        # shapes changed which three searches a ticket pays for and no test
+        # noticed. Which shape comes first is arbitrary and unmeasured - see
+        # search_phrases - so this is a characterisation test. What is NOT
+        # arbitrary, and is asserted separately above, is that identifiers come
+        # before the prose summary.
+        summary = ("Refactor useAuditLogs and useVisitQueue in esm-admin-auditlog-app "
+                   "and openmrs-esm-patient-chart with OpenmrsDatePicker")
+        self.assertEqual(gh.search_phrases(summary),
+                         ["esm-admin-auditlog-app", "openmrs-esm-patient-chart",
+                          "useAuditLogs"])
+
+    def test_both_documented_ceilings_rest_on_these_two_intervals(self):
+        """2.5s authenticated, 7.5s anonymous - the other half of the arithmetic.
+
+        The test below pins 2 searches per ticket; these are the seconds each
+        one costs, and together they give the two ceilings the README and the
+        workflow state: ~120 tickets with a token, ~72 without. The anonymous
+        figure is the one worth guarding, because it is the configuration the
+        README calls optional and the one my doubling of the search count hurt
+        most - 103 tickets down to 72, which is under three times the current
+        cohort. A change to RATE_HEADROOM or RATE_LIMIT_PER_MIN moves both
+        numbers with nothing else noticing.
+        """
+        for token, expected in (("tok", 2.5), (None, 7.5)):
+            with self.subTest("authenticated" if token else "anonymous"):
+                self.assertAlmostEqual(
+                    gh.GitHubClient("openmrs", token).min_interval, expected, places=2,
+                    msg="the ceilings in README.md and .github/workflows/triage.yml "
+                        "were derived from this interval")
+
+    def test_two_searches_per_ticket_is_what_the_timeout_assumes(self):
+        """The number .github/workflows/triage.yml does arithmetic with.
+
+        Its 30-minute timeout and the "~120 tickets" ceiling it documents are
+        derived from 2 GitHub searches per ticket - one key search, one content
+        search - at the 2.5s throttle. That is a property of phrase derivation,
+        not just of MAX_PHRASES, so raising it is not the only way to break it:
+        a derivation change that started yielding two phrases for a typical
+        summary would halve the ceiling with nothing failing and no one told,
+        and the sweep would then be killed and restarted every four hours
+        forever, making progress each time but never writing a report.
+
+        The mix below is the measured cohort: 25 summaries yielding one phrase,
+        2 yielding two, 2 yielding none.
+        """
+        mix = (["Bootstrap esm-admin-auditlog-app package"] * 25
+               + ["Implement useAuditLogs hook and paginated data table"] * 2
+               + ["Fix bug"] * 2)
+        content = sum(len(gh.searchable_phrases(s, "openmrs")) for s in mix)
+        per_ticket = (len(mix) + content) / len(mix)   # one key search each, plus these
+        self.assertAlmostEqual(per_ticket, 2.0, places=2,
+                               msg="the capacity arithmetic in "
+                                   ".github/workflows/triage.yml no longer holds")
+
+    def test_the_phrase_budget_is_pinned_at_three(self):
+        # Not a restatement of the constant. .github/workflows/triage.yml does
+        # arithmetic with this number - it is why the scheduled job's ceiling is
+        # documented as ~120 tickets rather than ~143 - so raising it silently
+        # invalidates a published capacity figure and the 30-minute timeout
+        # derived from it.
+        self.assertEqual(gh.MAX_PHRASES, 3,
+                         "update the capacity arithmetic in .github/workflows/triage.yml")
+
+
+class RelatedPrSearchTests(unittest.TestCase):
+    """The content backstop's client: what it claims, and what it refuses to."""
+
+    def _client(self, pages):
+        client = gh.GitHubClient("openmrs", None, sleep=lambda s: None, now=lambda: 1000.0)
+        client.session = GitHubSession(pages)
+        return client
+
+    def test_a_pr_sharing_a_distinctive_phrase_is_returned_with_its_evidence(self):
+        client = self._client([gh_response([
+            pr(1, title="Add audit log app", body="Bootstraps esm-admin-auditlog-app")])])
+        self.assertEqual(
+            client.related_pr_urls("O3-5685", "Bootstrap esm-admin-auditlog-app package"),
+            [("https://github.com/openmrs/repo/pull/1", "esm-admin-auditlog-app")])
+
+    def test_a_multi_word_phrase_is_quoted_in_the_query(self):
+        # Unquoted, GitHub ORs the words: "Add location name for Transfer Request
+        # encounter type" would match any PR mentioning "name". The precision of
+        # the prose phrase rests on the quotes being there.
+        client = self._client([gh_response([])])
+        client.related_pr_urls("O3-5801", "Add location name for Transfer Request type")
+        self.assertEqual(client.session.queries,
+                         ['org:openmrs is:pr is:open '
+                          '"Add location name for Transfer Request type"'])
+
+    def test_a_single_identifier_is_not_quoted(self):
+        # Measured against live GitHub, and the opposite of what looks tidy:
+        # `"esm-admin-auditlog-app"` quoted returns 0, the bare term returns the
+        # 2 PRs doing the work. The index tokenises on hyphens, so the quoted
+        # form is matched literally and never hits. Quoting every phrase for
+        # consistency silently cost a third of this backstop's recovery.
+        client = self._client([gh_response([])])
+        client.related_pr_urls("O3-5685", "Bootstrap esm-admin-auditlog-app package")
+        self.assertEqual(client.session.queries,
+                         ["org:openmrs is:pr is:open esm-admin-auditlog-app"])
+
+    def test_a_pr_that_names_the_key_is_kept_not_filtered_away(self):
+        # This is only ever reached when open_pr_urls returned nothing, so a
+        # key-naming PR arriving here is one the key search MISSED. Filtering it
+        # out as "the key search owns it" cannot prevent a duplicate - there is
+        # nothing to duplicate - it can only throw away proof and let the sweep
+        # label a ticket that is provably in review.
+        client = self._client([gh_response([
+            pr(2, title="(feat) O3-5685: bootstrap esm-admin-auditlog-app")])])
+        found = client.related_pr_urls("O3-5685", "Bootstrap esm-admin-auditlog-app package")
+        self.assertEqual(len(found), 1)
+        self.assertIn("names O3-5685", found[0][1],
+                      "the evidence must say this one is a citation, not a resemblance")
+
+    def test_a_phrase_matching_far_too_much_is_not_evidence(self):
+        # "unit tests" really does return over 140 open PRs in this org. Note the
+        # shape: GitHub caps the page, so total_count exceeds the items - which
+        # is also how the key search detects fatal truncation. Here it is the
+        # answer, not a failure.
+        payload = {"items": [pr(n) for n in range(30)], "total_count": 143,
+                   "incomplete_results": False}
+        resp = StubResponse(payload, 200)
+        resp.headers, resp.text = {}, json.dumps(payload)
+        client = self._client([resp])
+        self.assertEqual(
+            client.related_pr_urls("O3-5689", "Unit tests for the Admin Dashboard"), [])
+
+    def test_an_overbroad_phrase_does_not_abort_the_phrases_after_it(self):
+        # The identifier is tried first and the prose second, so a run that
+        # stopped at the first overbroad answer would still work here. This
+        # guards the reverse order too: one useless phrase must cost one search,
+        # not the whole ticket's check.
+        broad = {"items": [pr(n) for n in range(30)], "total_count": 143,
+                 "incomplete_results": False}
+        first = StubResponse(broad, 200)
+        first.headers, first.text = {}, json.dumps(broad)
+        client = self._client([first, gh_response([pr(77, title="paginated data table")])])
+        found = client.related_pr_urls(
+            "O3-5686", "Implement useAuditLogs hook and paginated data table")
+        self.assertEqual([u for u, _ in found],
+                         ["https://github.com/openmrs/repo/pull/77"])
+
+    def test_results_come_back_in_a_stable_order(self):
+        # GitHub returns equal-ranked hits in whatever order it likes, and these
+        # URLs land in the journal and the report. Unsorted, two sweeps of an
+        # unchanged ticket would produce rows that differ only by ordering, and
+        # anyone diffing journals to see what changed would be reading noise.
+        # The stub returns them reversed so insertion order cannot pass for
+        # sorted order - that is what let this mutation survive.
+        client = self._client([gh_response([
+            pr(9, url="https://github.com/openmrs/zeta/pull/9",
+               title="esm-admin-auditlog-app work"),
+            pr(1, url="https://github.com/openmrs/alpha/pull/1",
+               title="esm-admin-auditlog-app work")])])
+        found = client.related_pr_urls("O3-5685", "Bootstrap esm-admin-auditlog-app package")
+        self.assertEqual([u for u, _ in found],
+                         ["https://github.com/openmrs/alpha/pull/1",
+                          "https://github.com/openmrs/zeta/pull/9"])
+
+    def test_one_pr_matching_two_phrases_is_reported_once(self):
+        client = self._client([
+            gh_response([pr(5, title="useAuditLogs and paginated data table")]),
+            gh_response([pr(5, title="useAuditLogs and paginated data table")])])
+        found = client.related_pr_urls(
+            "O3-5686", "Implement useAuditLogs hook and paginated data table")
+        self.assertEqual(len(found), 1)
+
+    def test_a_summary_too_long_for_github_is_never_sent(self):
+        # Measured live: GitHub 422s "The search is longer than 256 characters."
+        # Jira allows a 255-character summary, so this is reachable with
+        # ordinary data. The queued response would be consumed if it were sent.
+        client = self._client([gh_response([pr(1, title="should not be reached")])])
+        long_summary = "alpha beta gamma delta " * 13
+        self.assertEqual(client.related_pr_urls("O3-1", long_summary), [])
+        self.assertEqual(client.session.queries, [])
+
+    def test_an_over_long_phrase_does_not_discard_an_earlier_match(self):
+        # The sharp edge of the same bug. A 422 raises out of the phrase loop,
+        # so a ticket whose identifier had already matched would lose that match
+        # because its prose phrase was too long to send. Identifiers are tried
+        # first precisely so this ordering matters.
+        summary = "Bootstrap esm-admin-auditlog-app " + "and more words here " * 12
+        client = self._client([gh_response([pr(1, title="audit log work")])])
+        found = client.related_pr_urls("O3-5685", summary)
+        self.assertEqual([p for _, p in found], ["esm-admin-auditlog-app"])
+        self.assertEqual(len(client.session.queries), 1,
+                         "the over-long phrase should cost no search")
+
+    def test_a_summary_with_nothing_distinctive_costs_no_search_at_all(self):
+        client = self._client([])          # any request would IndexError
+        self.assertEqual(client.related_pr_urls("O3-1", "Fix bug"), [])
+        self.assertEqual(client.session.queries, [])
+
+    def test_a_search_failure_is_raised_rather_than_read_as_no_match(self):
+        # The caller decides what to do with it. Returning [] here would tell a
+        # sweep the second look happened and found nothing.
+        resp = StubResponse({}, 503)
+        resp.headers, resp.text = {}, "upstream boom"
+        client = self._client([resp])
+        with self.assertRaises(gh.GitHubError):
+            client.related_pr_urls("O3-5801", "Add location name for Transfer Request type")
+
+    MALFORMED = {
+        "an item that is not an object": {"items": ["a string"], "total_count": 1},
+        "a null item": {"items": [None], "total_count": 1},
+        "items that is an object": {"items": {"a": 1}, "total_count": 1},
+        "items that is a string": {"items": "nope", "total_count": 1},
+        "a total_count that is a string": {"items": [], "total_count": "0"},
+        # isinstance(True, int) is True in Python, so a boolean would pass a
+        # naive numeric check and then compare as 1. classifier.py rejects
+        # booleans for the same reason; this matches it.
+        "a total_count that is a boolean": {"items": [], "total_count": True},
+    }
+
+    def test_a_malformed_response_arrives_as_a_github_error(self):
+        """Having the keys is not having the shape.
+
+        The shape guard accepts any body carrying `items` and `total_count`, so
+        a proxy envelope or an error page shaped as JSON reaches the parsing
+        below - where item.get() raises AttributeError and the truncation
+        comparison raises TypeError. Neither is a GitHubError.
+
+        That matters more for this method than for the key search. run.py
+        catches GitHubError so an advisory search cannot fail a ticket, and
+        deliberately lets everything else through so a real bug in this module
+        errors loudly. A bad gateway is not a bug in this module, so leaking
+        AttributeError would turn a graceful degradation into an errored
+        ticket - and five of those trip the consecutive-error breaker and abort
+        a sweep that was otherwise fine.
+        """
+        for name, payload in self.MALFORMED.items():
+            for method, args in (("related_pr_urls",
+                                  ("O3-1", "Bootstrap esm-admin-auditlog-app package")),
+                                 ("open_pr_urls", ("O3-1",))):
+                with self.subTest(f"{name} / {method}"):
+                    body = dict(payload, incomplete_results=False)
+                    resp = StubResponse(body, 200)
+                    resp.headers, resp.text = {}, json.dumps(body)
+                    client = self._client([resp])
+                    with self.assertRaises(gh.GitHubError):
+                        getattr(client, method)(*args)
+
+    def test_a_well_formed_response_is_not_caught_by_those_guards(self):
+        # The shape guards are worthless if they also reject real answers, and
+        # a guard that rejects everything passes every test above.
+        client = self._client([gh_response([pr(1, title="esm-admin-auditlog-app work")])])
+        self.assertEqual(len(client.related_pr_urls(
+            "O3-1", "Bootstrap esm-admin-auditlog-app package")), 1)
+
+    def test_a_read_timeout_arrives_as_a_github_error(self):
+        # Not cosmetic. run.py catches GitHubError to stop an advisory search
+        # from failing a ticket; a bare requests.ReadTimeout sails past that
+        # handler, so the transient blip the wrapper exists to absorb would be
+        # the one thing it did not absorb. Observed live in a 34-ticket sweep.
+        class Timeout:
+            headers: dict = {}
+            def get(self, url, params=None, timeout=None):
+                raise requests.exceptions.ReadTimeout("read timed out")
+        client = self._client([])
+        client.session = Timeout()
+        with self.assertRaises(gh.GitHubError) as caught:
+            client.related_pr_urls("O3-5801", "Add location name for Transfer Request type")
+        self.assertIn("ReadTimeout", str(caught.exception))
+
+    def test_a_key_search_timeout_is_the_same_one_error_type(self):
+        class Timeout:
+            headers: dict = {}
+            def get(self, url, params=None, timeout=None):
+                raise requests.exceptions.ConnectionError("connection reset")
+        client = self._client([])
+        client.session = Timeout()
+        with self.assertRaises(gh.GitHubError):
+            client.open_pr_urls("O3-5816")
+
+    def test_an_empty_body_is_still_not_an_answer_here_either(self):
+        resp = StubResponse({}, 200)
+        resp.headers, resp.text = {}, ""
+        client = self._client([resp])
+        with self.assertRaises(gh.GitHubError):
+            client.related_pr_urls("O3-5801", "Add location name for Transfer Request type")
+
+
+class ItemUrlTests(unittest.TestCase):
+    """The PR URL, taken from untrusted remote JSON."""
+
+    def test_a_real_url_is_returned(self):
+        self.assertEqual(
+            gh.item_url({"number": 1, "html_url": "https://github.com/o/r/pull/1"}, "openmrs"),
+            "https://github.com/o/r/pull/1")
+
+    def test_the_api_url_is_the_fallback(self):
+        self.assertEqual(gh.item_url({"number": 1, "url": "https://api/1"}, "openmrs"),
+                         "https://api/1")
+
+    def test_an_empty_html_url_falls_through_rather_than_winning(self):
+        self.assertEqual(
+            gh.item_url({"number": 1, "html_url": "", "url": "https://api/1"}, "openmrs"),
+            "https://api/1")
+
+    def test_a_non_string_url_is_refused_rather_than_passed_on(self):
+        """Reachable from a proxy envelope or an API change, and it escapes far.
+
+        A numeric html_url used to flow through the client and the journal and
+        fail only in write_comment_report - which runs after every
+        classification has been paid for, so an otherwise good sweep lost its
+        whole report at the very end. A dict or list was worse: unhashable, so
+        TypeError inside the client, and TypeError is not GitHubError, so it
+        slipped past the handler that keeps an advisory search from failing a
+        ticket.
+        """
+        for bad in (123, {"a": 1}, ["u"], None, True):
+            with self.subTest(repr(bad)):
+                url = gh.item_url({"number": 7, "html_url": bad}, "openmrs")
+                self.assertEqual(url, "openmrs PR #7 (no URL returned)")
+                self.assertIsInstance(url, str)
+
+    def test_the_stand_in_is_deliberately_not_a_link(self):
+        # Paired with the report's scheme check: this value must not be
+        # something a reviewer can click and land on a 404.
+        self.assertFalse(
+            gh.item_url({"number": 7}, "openmrs").startswith(("http://", "https://")))
+
+
+class MalformedResponseInvariantTests(unittest.TestCase):
+    """One property over a generated space of broken responses.
+
+    Every individual guard in _search was added after someone thought of the
+    shape it rejects, and each time the shape nobody thought of leaked a
+    different exception type: AttributeError from a non-dict body, TypeError
+    from an unhashable html_url, JSONDecodeError from an HTML error page,
+    ReadTimeout from the transport. Enumerating shapes finds them one release
+    at a time.
+
+    The property is what actually matters, and it is not "nothing goes wrong" -
+    it is "whatever goes wrong arrives as GitHubError". run.py leans on exactly
+    that: it catches GitHubError so a malformed answer degrades an advisory
+    search gracefully, and lets every other type through so a genuine bug in
+    this module errors loudly instead of hiding. A leaked TypeError is
+    therefore not an untidy traceback; it is a bad gateway masquerading as a
+    bug in our own code, erroring tickets and tripping the breaker.
+    """
+
+    BODIES = [None, 5, 0, -1, 1.5, True, False, "", "hi", [], [1], {},
+              {"items": []}, {"total_count": 0},
+              {"items": None, "total_count": 0},
+              {"items": [], "total_count": None},
+              {"items": [None], "total_count": 1},
+              {"items": ["x"], "total_count": 1},
+              {"items": [[]], "total_count": 1},
+              {"items": [{}], "total_count": 1},
+              {"items": {}, "total_count": 0},
+              {"items": [], "total_count": []},
+              {"items": [], "total_count": "0"},
+              {"items": [], "total_count": 0, "incomplete_results": True},
+              {"items": [{"number": None}], "total_count": 1},
+              {"items": [{"html_url": 1}], "total_count": 1},
+              {"items": [{"html_url": {}}], "total_count": 1},
+              {"items": [{"html_url": []}], "total_count": 1},
+              {"items": [{"title": 1, "body": 2, "html_url": "https://x/1"}],
+               "total_count": 1}]
+
+    class _Resp:
+        def __init__(self, body, text, exc=None):
+            self.status_code, self.headers, self.text = 200, {}, text
+            self._body, self._exc = body, exc
+
+        def json(self):
+            if self._exc:
+                raise self._exc
+            return self._body
+
+    def _client(self, resp):
+        client = gh.GitHubClient("openmrs", None, sleep=lambda s: None, now=lambda: 0.0)
+        client.session = GitHubSession([resp])
+        return client
+
+    def test_only_github_error_ever_escapes(self):
+        cases = [(repr(b)[:40], self._Resp(b, json.dumps(b))) for b in self.BODIES]
+        # Bodies that are not JSON at all: text is non-empty so the empty-body
+        # guard passes them straight to json().
+        for text in ("<html>502 Bad Gateway</html>", "not json", "{", "\x00\xff"):
+            cases.append((f"non-JSON {text[:20]!r}",
+                          self._Resp(None, text,
+                                     exc=json.JSONDecodeError("bad", text or "x", 0))))
+        for label, resp in cases:
+            for method, args in (("related_pr_urls",
+                                  ("O3-1", "Bootstrap esm-admin-auditlog-app package")),
+                                 ("open_pr_urls", ("O3-1",))):
+                with self.subTest(f"{label} / {method}"):
+                    try:
+                        result = getattr(self._client(resp), method)(*args)
+                    except gh.GitHubError:
+                        continue                       # the contract
+                    except Exception as e:             # noqa: BLE001 - the point
+                        self.fail(f"{type(e).__name__} escaped instead of GitHubError: {e}")
+                    self.assertIsInstance(result, list)
+                    for entry in result:
+                        url = entry[0] if isinstance(entry, tuple) else entry
+                        self.assertIsInstance(
+                            url, str, "a non-string URL reaches the journal and only "
+                                      "fails in the report, after the sweep is paid for")
+
+    def test_the_generated_space_actually_reaches_the_parsing(self):
+        # Without this the suite above passes just as well against a client that
+        # rejects everything at the first line, which would prove nothing.
+        client = self._client(gh_response([pr(1, title="esm-admin-auditlog-app")]))
+        self.assertEqual(len(client.related_pr_urls(
+            "O3-1", "Bootstrap esm-admin-auditlog-app package")), 1)
+
+
 class KeyCitationTests(unittest.TestCase):
     """Which mentions count as a PR claiming a ticket."""
 
@@ -2841,6 +3425,319 @@ class OpenPrBackstopWiringTests(unittest.TestCase):
         _, row = self._run(jira, live=True)
         self.assertEqual(row["action"], "labeled")
         self.assertEqual(StubGitHub.searched, ["O3-1"])
+
+    # --- the content backstop, for the PRs that never cite a key -------------
+    # Six of the nine tickets this pilot proposed for automation already had an
+    # open PR, and the key search found none of them: not one cited its key, so
+    # Jira's dev panel and the backstop were the same question asked twice.
+
+    PR9 = ["https://github.com/openmrs/repo/pull/9"]
+
+    def test_a_ticket_whose_work_is_already_open_is_held_back(self):
+        StubGitHub.reset(related={"O3-1": [(self.PR9[0], "esm-admin-auditlog-app")]})
+        jira = RecordingJira({"O3-1": issue()})
+        rc, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "skip-related-pr")
+        self.assertEqual(jira.writes, [], "labelled a ticket whose work is already open")
+        self.assertEqual(rc, 0, "a held-back ticket is a routine skip, not a fault")
+
+    def test_the_matched_phrase_is_journalled_beside_the_url(self):
+        # A bare URL cannot be judged. "Found by `esm-admin-auditlog-app`" can be
+        # checked in one click, and dismissed when it is a coincidence.
+        StubGitHub.reset(related={"O3-1": [(self.PR9[0], "esm-admin-auditlog-app")]})
+        _, row = self._run(RecordingJira({"O3-1": issue()}))
+        self.assertEqual(row["related_prs"],
+                         [{"url": self.PR9[0], "matched": "esm-admin-auditlog-app"}])
+
+    def test_a_held_back_ticket_is_not_offered_for_classification(self):
+        StubGitHub.reset(related={"O3-1": [(self.PR9[0], "phrase")]})
+        with tempfile.TemporaryDirectory() as d:
+            self._run(RecordingJira({"O3-1": issue()}),
+                      extra_args=["--no-classify"], out=Path(d))
+            manifest = Path(d) / "manifest.json"
+            tickets = json.loads(manifest.read_text())["tickets"] if manifest.exists() else {}
+        self.assertNotIn("O3-1", tickets)
+
+    def test_the_ticket_summary_is_what_gets_searched(self):
+        # Wiring the key in twice would search for "O3-1" as a phrase and find
+        # nothing, forever, while every test keyed on the stub still passed.
+        StubGitHub.reset()
+        self._run(RecordingJira({"O3-1": issue(summary="Bootstrap the audit log app")}))
+        self.assertEqual(StubGitHub.phrase_searched,
+                         [("O3-1", "Bootstrap the audit log app")])
+
+    def test_a_key_match_costs_no_content_search(self):
+        # Proof in hand, so the suggestion cannot change the outcome - and it
+        # would cost up to three more throttled searches to learn nothing.
+        StubGitHub.reset({"O3-1": self.PR9})
+        _, row = self._run(RecordingJira({"O3-1": issue()}), live=True)
+        self.assertEqual(row["action"], "skip-open-pr")
+        self.assertEqual(StubGitHub.phrase_searched, [])
+
+    def test_a_key_match_leaves_no_suggestion_on_the_row(self):
+        # The sweep never even asks for a suggestion once it has proof, so the
+        # row carries only the proof. Note this does NOT exercise plan_ticket's
+        # precedence between the two - related_prs is empty here because the
+        # search was skipped, not because proof outranked it. That precedence is
+        # a property of plan_ticket and is tested directly against it below;
+        # asserting it here looked like coverage and was not, which mutation
+        # testing showed by reordering the two branches with no test failing.
+        StubGitHub.reset({"O3-1": self.PR9}, related={"O3-1": [("https://x/1", "p")]})
+        _, row = self._run(RecordingJira({"O3-1": issue()}), live=True)
+        self.assertEqual(row["action"], "skip-open-pr")
+        self.assertNotIn("related_prs", row)
+
+    def test_plan_ticket_reports_proof_rather_than_suggestion(self):
+        # Both flags true is unreachable from today's call site, which is
+        # exactly why it needs pinning here: plan_ticket is the single authority
+        # on precedence, and a future caller that ran both searches
+        # unconditionally would otherwise file a PR that names the key under the
+        # heading that says none of these name the ticket - understating
+        # evidence the pilot has.
+        st = inspect(issue(), AI, "bot", set())
+        self.assertEqual(
+            run.plan_ticket(st, False, False, True, out_of_scope=False,
+                            has_open_pr=True, has_related_pr=True),
+            "skip-open-pr")
+
+    def test_a_content_search_failure_does_not_fail_the_ticket(self):
+        # Deliberately unlike the key search, which fails closed. This one is a
+        # second opinion costing three more chances at the secondary rate limit;
+        # letting it error tickets would let an advisory signal trip the
+        # consecutive-error breaker and halt an otherwise healthy sweep.
+        StubGitHub.reset(related_error=gh.GitHubError("secondary rate limit"))
+        jira = RecordingJira({"O3-1": issue()})
+        rc, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "labeled")
+        self.assertEqual(rc, 0)
+
+    def test_a_bug_in_the_content_search_is_not_swallowed_as_a_failed_check(self):
+        """The catch is GitHubError, deliberately, and not Exception.
+
+        This already happened once: related_pr_urls was added to the client and
+        not to StubGitHub, every sweep raised AttributeError, and 34 tests went
+        red at once - which is how it was found in seconds. Widen the catch and
+        the same mistake is swallowed as "the second look did not happen": every
+        ticket gets classified, the suite stays green, and the backstop is dead
+        in production with nothing anywhere saying so.
+
+        So a non-GitHubError must still error the ticket. Mutation testing found
+        this gap - the existing tests raise GitHubError, which both the narrow
+        and the wide catch handle identically.
+        """
+        StubGitHub.reset(related_error=AttributeError("no such method"))
+        jira = RecordingJira({"O3-1": issue()})
+        rc, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "error")
+        self.assertIn("AttributeError", row["error"])
+        self.assertEqual(jira.writes, [], "labelled despite a broken scope check")
+        self.assertEqual(rc, 1, "a sweep that classified nothing must exit non-zero")
+
+    def test_a_ticket_the_backstop_never_looked_at_says_so(self):
+        """"Searched and clear" and "never searched" were the same row.
+
+        related_pr_urls returns [] for both, so a ticket whose summary yields no
+        distinctive phrase - 2 of the 29-ticket cohort - was journalled exactly
+        like one that was searched and came back empty. The audit record could
+        not then answer "was this ticket in scope?", which is the one question it
+        exists to answer.
+
+        A journal field and not a warning: this fires on a routine ~7% of
+        tickets, and a banner that routine is one operators stop reading.
+        """
+        StubGitHub.reset()
+        _, row = self._run(RecordingJira({"O3-1": issue(summary="Fix bug")}), live=True)
+        self.assertEqual(row["action"], "labeled")
+        self.assertIn("no distinctive phrase", row["related_pr_check"])
+
+    def test_a_summary_too_long_to_search_is_not_called_undistinctive(self):
+        # The two skips need different answers - one is a fact about the ticket
+        # that only rewording changes, the other a limit of the search API that a
+        # shorter summary clears - so reporting both as "no phrase" would be
+        # false for this one, in a field whose whole purpose is accuracy.
+        StubGitHub.reset()
+        long_summary = "Refactor " + "and more words here " * 14
+        self.assertTrue(gh.search_phrases(long_summary), "fixture derives no phrase")
+        _, row = self._run(RecordingJira({"O3-1": issue(summary=long_summary)}), live=True)
+        self.assertIn("character query limit", row["related_pr_check"])
+        self.assertNotIn("no distinctive phrase", row["related_pr_check"])
+
+    def test_a_ticket_that_was_searched_carries_no_skip_note(self):
+        # The counterweight: a note on every row would make the note worthless.
+        StubGitHub.reset()
+        _, row = self._run(RecordingJira(
+            {"O3-1": issue(summary="Bootstrap esm-admin-auditlog-app package")}), live=True)
+        self.assertNotIn("related_pr_check", row)
+        self.assertEqual(StubGitHub.phrase_searched,
+                         [("O3-1", "Bootstrap esm-admin-auditlog-app package")])
+
+    def test_a_skipped_search_is_not_counted_as_a_failed_one(self):
+        # unchecked drives the "Scope was checked once, not twice" banner, which
+        # tells an operator to re-run. Re-running cannot help a summary with no
+        # distinctive phrase in it, so counting these there would fire the banner
+        # on most sweeps and advise something useless.
+        StubGitHub.reset()
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            classification = Classification("automation_candidate", "Because.", [],
+                                            ["check it"], 0.9, "m")
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env",
+                                   lambda cfg: RecordingJira({"O3-1": issue(summary="Fix bug")})), \
+                 mock.patch.object(run, "Classifier",
+                                   lambda *a: StubClassifier(classification)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                run.main(["--keys", "O3-1"], out=out)
+            page = next(out.glob("proposals-*.html")).read_text()
+        self.assertNotIn("Scope was checked once", page)
+        self.assertNotIn("content backstop did not complete", err.getvalue())
+
+    def test_a_silently_degraded_scope_check_is_reported_to_the_operator(self):
+        """Not an error, but it was also not mentioned - which is worse.
+
+        A failed content search must not fail a ticket, so it is journalled and
+        the sweep continues. That turned "not an error" into "not visible": the
+        report showed the proposals with no caveat and stdout said nothing, so a
+        run where every second scope check died read exactly like a clean one.
+        The only record was out/journal.jsonl, which a comment in run.py itself
+        describes as "a journal nobody reads" - and the report is the page
+        people read before approving a live run.
+        """
+        StubGitHub.reset(related_error=gh.GitHubError("secondary rate limit"))
+        jira = RecordingJira({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            classification = Classification("automation_candidate", "Because.", [],
+                                            ["check it"], 0.9, "m")
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier",
+                                   lambda *a: StubClassifier(classification)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                rc = run.main(["--keys", "O3-1"], out=out)
+            page = next(out.glob("proposals-*.html")).read_text()
+        self.assertIn("content backstop did not complete", err.getvalue())
+        self.assertIn("Scope was checked once, not twice", page)
+        self.assertIn("related_pr_check", page, "the report must name where to look")
+        self.assertEqual(rc, 0, "a transient blip must not turn the scheduled sweep red")
+
+    def test_a_clean_run_carries_no_such_warning(self):
+        # A banner that shows on every sweep is a banner operators stop reading,
+        # and this one has to still mean something on the day it matters.
+        StubGitHub.reset()
+        jira = RecordingJira({"O3-1": issue()})
+        with tempfile.TemporaryDirectory() as d:
+            out = Path(d)
+            classification = Classification("automation_candidate", "Because.", [],
+                                            ["check it"], 0.9, "m")
+            with mock.patch.dict(os.environ, {"TRIAGE_BOT_ACCOUNT_ID": "bot"}), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 mock.patch.object(run, "Classifier",
+                                   lambda *a: StubClassifier(classification)), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()) as err:
+                run.main(["--keys", "O3-1"], out=out)
+            page = next(out.glob("proposals-*.html")).read_text()
+        self.assertNotIn("content backstop did not complete", err.getvalue())
+        self.assertNotIn("Scope was checked once", page)
+
+    def test_but_the_failure_is_recorded_rather_than_passed_over(self):
+        # Otherwise the journal reads exactly like a ticket that was checked and
+        # cleared, which is the failure mode this whole repo keeps relearning.
+        StubGitHub.reset(related_error=gh.GitHubError("secondary rate limit"))
+        _, row = self._run(RecordingJira({"O3-1": issue()}), live=True)
+        self.assertIn("secondary rate limit", row["related_pr_check"])
+
+    def test_a_held_back_ticket_stays_held_back_across_sweeps(self):
+        # It writes no property, so nothing records the decision - the second
+        # sweep has to reach it again from scratch. A drift here would show up
+        # as a ticket labelled on the sweep after the one that held it back,
+        # four hours later, with nothing in between to explain it.
+        StubGitHub.reset(related={"O3-1": [(self.PR9[0], "phrase")]})
+        jira = RecordingJira({"O3-1": issue()})
+        for sweep in (1, 2):
+            _, row = self._run(jira, live=True)
+            self.assertEqual(row["action"], "skip-related-pr", f"sweep {sweep}")
+            self.assertEqual(jira.writes, [], f"wrote on sweep {sweep}")
+
+    def test_it_returns_to_scope_when_the_pull_request_closes(self):
+        # The promise the README makes to anyone whose ticket was held back on a
+        # coincidence: wait, and it sorts itself out. Nothing was persisted to
+        # un-persist, which is exactly why it works - and why it needs a test,
+        # because a future "remember the hold-back" optimisation would break it
+        # silently and look like an improvement.
+        StubGitHub.reset(related={"O3-1": [(self.PR9[0], "phrase")]})
+        jira = RecordingJira({"O3-1": issue()})
+        _, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "skip-related-pr")
+        StubGitHub.reset()                      # the PR closed
+        _, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "labeled")
+        self.assertTrue([w for w in jira.writes if w[0] == "labels"])
+
+    def test_a_replayed_classification_cannot_label_a_held_back_ticket(self):
+        """Scope outranks a hand-authored classifications file.
+
+        The documented two-step workflow is gather then apply, and the apply run
+        reads labels from a file rather than the model. That file is written by a
+        human or an agent that never consulted GitHub, so if scope were not
+        re-checked on the apply run, a replay would label a ticket an open PR is
+        already working on - bypassing the backstop entirely on the one path
+        where nothing else is looking.
+
+        The second half is the control: the same file, the same ticket, no
+        hold-back, and it writes. So the silence above is caused by the hold-back
+        rather than by a fixture the replay never matched - which is how this
+        would pass while proving nothing.
+        """
+        for related, expected, should_write in (
+                ({"O3-1": [(self.PR9[0], "phrase")]}, "skip-related-pr", False),
+                ({}, "labeled", True)):
+            with self.subTest(expected):
+                StubGitHub.reset(related=related)
+                jira = RecordingJira({"O3-1": issue(summary="Bootstrap the widget")})
+                with tempfile.TemporaryDirectory() as d:
+                    out = Path(d)
+                    self._gather_then_replay(jira, out)
+                    row = json.loads(
+                        (out / "journal.jsonl").read_text().splitlines()[-1])
+                self.assertEqual(row["action"], expected)
+                self.assertEqual(bool(jira.writes), should_write)
+
+    def _gather_then_replay(self, jira, out):
+        """Run --no-classify, then --live --classifications over its context."""
+        env = {"TRIAGE_BOT_ACCOUNT_ID": "bot"}
+        for argv in (["--keys", "O3-1", "--no-classify"], None):
+            if argv is None:
+                text = (out / "contexts" / "O3-1.txt").read_text()
+                path = out / "classifications.json"
+                path.write_text(json.dumps({
+                    "prompt_version": load_config()["prompt"]["version"],
+                    "classifier": "hand", "classifications": {"O3-1": {
+                        "label": "automation_candidate", "rationale": "Replayed.",
+                        "missing_info": [], "verification_steps": ["x"],
+                        "confidence": 0.9, "content_hash": ctx.content_hash(text)}}}))
+                argv = ["--keys", "O3-1", "--live", "--classifications", str(path)]
+            with mock.patch.dict(os.environ, env), \
+                 mock.patch.object(run, "jira_from_env", lambda cfg: jira), \
+                 contextlib.redirect_stdout(io.StringIO()), \
+                 contextlib.redirect_stderr(io.StringIO()):
+                run.main(argv, out=out)
+
+    def test_an_opted_out_ticket_costs_no_content_search_either(self):
+        StubGitHub.reset(related={"O3-1": [(self.PR9[0], "phrase")]})
+        jira = RecordingJira({"O3-1": issue(histories=[label_change("u1", AI[2], "")])})
+        _, row = self._run(jira, live=True)
+        self.assertEqual(row["action"], "skip-opted-out")
+        self.assertEqual(StubGitHub.phrase_searched, [])
+
+    def test_no_pr_check_skips_the_content_search_too(self):
+        StubGitHub.reset(related={"O3-1": [(self.PR9[0], "phrase")]})
+        _, row = self._run(RecordingJira({"O3-1": issue()}), extra_args=["--no-pr-check"])
+        self.assertEqual(StubGitHub.phrase_searched, [])
+        self.assertEqual(row["action"], "proposed")
 
     def test_no_pr_check_skips_the_lookup_entirely(self):
         StubGitHub.reset({"O3-1": ["https://github.com/openmrs/repo/pull/9"]})
@@ -5205,6 +6102,89 @@ class CommentReportTests(unittest.TestCase):
         self.assertIn("O3-5816", page)
         self.assertIn("openmrs-esm-core/pull/1818", page)
 
+    RELATED = [{"key": "O3-5685", "summary": "Bootstrap the audit log app",
+                "related_prs": [{"url": "https://github.com/openmrs/x/pull/1",
+                                 "matched": "esm-admin-auditlog-app"}]}]
+
+    def test_a_content_match_is_not_reported_as_proof(self):
+        # The whole point of the split. Filed under "already in review", a
+        # coincidence would read as a settled fact and nobody would check it.
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], excluded=self.RELATED)
+        self.assertNotIn("already in review", page)
+        self.assertIn("no proof", page.lower())
+
+    def test_a_content_match_shows_the_phrase_that_found_it(self):
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], excluded=self.RELATED)
+        self.assertIn("O3-5685", page)
+        self.assertIn("esm-admin-auditlog-app", page)
+        self.assertIn("openmrs/x/pull/1", page)
+
+    def test_the_lede_does_not_call_a_held_back_ticket_reviewed(self):
+        # The lede is the line most readers stop at.
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], excluded=self.RELATED)
+        self.assertIn("1 held back on a similar open PR", page)
+        self.assertNotIn("excluded as already in review", page)
+
+    def test_both_kinds_of_exclusion_are_counted_and_listed_apart(self):
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], excluded=[
+            {"key": "O3-5816", "summary": "Login crashes",
+             "open_prs": ["https://github.com/openmrs/openmrs-esm-core/pull/1818"]},
+            *self.RELATED])
+        self.assertIn("1 excluded as already in review", page)
+        self.assertIn("1 held back on a similar open PR", page)
+        self.assertLess(page.index("already in review"), page.index("no proof"),
+                        "the proven list must come first; it is the stronger claim")
+
+    def test_a_hostile_matched_phrase_cannot_inject_markup(self):
+        # The phrase is derived from a Jira summary, which anyone can edit.
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], excluded=[
+            {"key": "O3-1", "summary": "s",
+             "related_prs": [{"url": "https://x/1", "matched": "<script>alert(1)</script>"}]}])
+        self.assertNotIn("<script>", page)
+        self.assertIn("&lt;script&gt;", page)
+
+    def test_a_banner_without_a_denominator_does_not_say_none(self):
+        # swept is optional in the signature and only main() always supplies it,
+        # so both banners could interpolate it blindly - and "3 of None
+        # ticket(s)" reads as a bug in the tool, on the two notices whose entire
+        # job is to be believed by the maintainers approving a live run.
+        page = self._report([], errors=2, swept=None, excluded=[
+            {"key": "O3-1", "summary": "s",
+             "related_prs": [{"url": "https://x/1", "matched": "p"}]}])
+        self.assertNotIn("of None", page)
+        self.assertIn("2 ticket(s) errored", page)
+
+    def test_a_dangerous_url_scheme_is_never_rendered_as_a_link(self):
+        # The URL comes from GitHub's API, so this is not the likeliest attack -
+        # but the report is a file maintainers open in a browser, and the
+        # property currently holds only because _pr_link happens to allow-list
+        # http/https. Pinned so a later "just linkify everything" cannot quietly
+        # turn a PR title into an executable link.
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        for scheme in ("javascript:alert(1)", "data:text/html,<script>alert(1)</script>",
+                       "vbscript:msgbox(1)"):
+            with self.subTest(scheme):
+                page = self._report([(issue(), c, "h")], excluded=[
+                    {"key": "O3-1", "summary": "s",
+                     "related_prs": [{"url": scheme, "matched": "p"}]}])
+                self.assertNotIn(f'href="{scheme}', page)
+                self.assertNotIn("<script>", page)
+
+    def test_a_content_match_with_no_url_is_not_rendered_as_a_link(self):
+        # Same care the proven list takes: a synthesised reference that renders
+        # as an anchor is a link a reviewer follows to a 404.
+        c = Classification("needs_judgment", "Clinical call.", [], [], 0.8, "m")
+        page = self._report([(issue(), c, "h")], excluded=[
+            {"key": "O3-1", "summary": "s",
+             "related_prs": [{"url": "openmrs PR #7 (no URL returned)", "matched": "p"}]}])
+        self.assertNotIn('href="openmrs PR', page)
+        self.assertIn("no URL returned", page)
+
     def test_a_ticket_that_gets_no_comment_says_so(self):
         # Its label is already present, so plan_label_writes suppresses the
         # comment; a reviewer counting comments would otherwise over-count.
@@ -5454,15 +6434,17 @@ class DecisionChainInvariantTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             out = Path(tmp)
             for (labels, prop_kind, status, opted_out, force, decided_label,
-                 open_pr) in itertools.product(
+                 open_pr, related_pr) in itertools.product(
                     self.LABELS, self.PROPERTIES, self.STATUSES, (False, True),
                     (False, True), ("needs_more_info", "automation_candidate"),
-                    (False, True)):
+                    (False, True), (False, True)):
                 decided = Classification(decided_label, self.HOSTILE_RATIONALE,
                                          [self.HOSTILE_ITEM], [], 0.9, "m")
                 label_name = cfg["labels"][decided_label]
-                StubGitHub.reset({"O3-1": ["https://github.com/openmrs/r/pull/1"]}
-                                 if open_pr else {})
+                StubGitHub.reset(
+                    {"O3-1": ["https://github.com/openmrs/r/pull/1"]} if open_pr else {},
+                    related=({"O3-1": [("https://github.com/openmrs/r/pull/2", "phrase")]}
+                             if related_pr else {}))
                 jira = RecordingJira({"O3-1": self._issue(labels, status, opted_out)})
                 text = ctx.assemble(StubJira(), jira.issues["O3-1"], None, ["bot"])
                 stored = self._property_for(prop_kind, ctx.content_hash(text), label_name)
@@ -5472,7 +6454,7 @@ class DecisionChainInvariantTests(unittest.TestCase):
                 writes = jira.writes
                 state = (f"labels={labels} prop={prop_kind} status={status} "
                          f"opted_out={opted_out} force={force} decided={decided_label} "
-                         f"open_pr={open_pr}")
+                         f"open_pr={open_pr} related_pr={related_pr}")
                 checked += 1
 
                 # 1. An opt-out is permanent and unconditional.
@@ -5487,6 +6469,16 @@ class DecisionChainInvariantTests(unittest.TestCase):
                 #     the removal the pilot counts as a permanent opt-out.
                 if open_pr:
                     self.assertEqual(writes, [], f"wrote to a ticket with an open PR: {state}")
+                    continue
+                # 2c. Nor is one whose work an open PR appears to describe. A
+                #     weaker claim than 2b, but the same consequence: labelling
+                #     it invites the removal counted as a permanent opt-out.
+                #     Only reachable when the ticket is not already triaged -
+                #     an already-triaged one is never content-searched outside
+                #     gather - which is itself part of what this enumerates.
+                if related_pr and not (labels and prop_kind == "matching" and not force):
+                    self.assertEqual(writes, [],
+                                     f"wrote to a ticket with a related PR: {state}")
                     continue
                 # 3. At most one comment per run, and a comment only ever
                 #    accompanies a label that is new to the ticket.

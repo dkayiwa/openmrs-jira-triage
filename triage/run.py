@@ -9,8 +9,11 @@ and is gated on three things: the credentials, the configured bot account id
 actually matching them, and no scheduled sweep being able to race this one
 (see schedule_conflict).
 
-Scope is Jira's dev panel plus a GitHub backstop: a ticket whose PR the panel
-has not indexed is still excluded if an open PR names its key.
+Scope is Jira's dev panel plus two GitHub backstops. A ticket whose PR the panel
+has not indexed is excluded outright if an open PR names its key
+(`skip-open-pr`, proof); failing that, it is held back for the sweep if an open
+PR merely shares distinctive wording from its summary (`skip-related-pr`, a
+suggestion a human is asked to confirm).
 """
 from __future__ import annotations
 
@@ -36,7 +39,13 @@ from .classifier import (
     Classifier,
     validate_classification,
 )
-from .github import GitHubClient
+from .github import (
+    MAX_QUERY_CHARS,
+    GitHubClient,
+    GitHubError,
+    search_phrases,
+    searchable_phrases,
+)
 from .jira import JiraClient
 from .state import PROPERTY_KEY, TicketState, inspect
 
@@ -357,7 +366,8 @@ def schedule_conflict(root: pathlib.Path, in_ci: bool) -> str | None:
 
 
 def plan_ticket(st: TicketState, unchanged: bool, force: bool, can_classify: bool,
-                out_of_scope: bool = False, has_open_pr: bool = False) -> str | None:
+                out_of_scope: bool = False, has_open_pr: bool = False,
+                has_related_pr: bool = False) -> str | None:
     """The skip action for this ticket, or None to classify it.
 
     Opt-out, out-of-scope and open-PR are tested first and unconditionally:
@@ -369,6 +379,14 @@ def plan_ticket(st: TicketState, unchanged: bool, force: bool, can_classify: boo
     unchanged ticket alone, but only this one keeps it out of the manifest, so a
     ticket that gained a PR after being labelled stops being offered for
     re-classification on the next prompt bump.
+
+    "skip-related-pr" is kept distinct from "skip-open-pr" rather than folded
+    into it, because the two differ in what they know. A PR citing the key is
+    proof. A PR merely containing the ticket's words is a suggestion, and one
+    that has to be read by a human before it means anything - the phrase
+    `OpenmrsDatePicker` matches five open PRs that are all genuinely about that
+    component and none of which are about any one ticket. Same deferral, weaker
+    claim, and the journal and the report have to say which one it was.
     """
     if st.opted_out:
         return "skip-opted-out"
@@ -376,6 +394,8 @@ def plan_ticket(st: TicketState, unchanged: bool, force: bool, can_classify: boo
         return "skip-out-of-scope"
     if has_open_pr:
         return "skip-open-pr"
+    if has_related_pr:
+        return "skip-related-pr"
     if st.ai_labels_present and unchanged and not force:
         return "skip-already-triaged"
     if not can_classify:
@@ -576,6 +596,7 @@ h3 { font-size:1rem; margin:2rem 0 .4rem; }
 a { color:var(--accent); }
 p, li { margin:.5rem 0; }
 .lede, .meta { color:var(--muted); font-size:.9rem; }
+.muted { color:var(--muted); }
 .note { border-left:3px solid var(--accent); padding:.6rem .9rem; margin:1.25rem 0;
         background:var(--pre-bg); border-radius:0 4px 4px 0; font-size:.92rem; }
 table { border-collapse:collapse; width:100%; margin:1rem 0; font-size:.92rem; }
@@ -598,7 +619,8 @@ pre { background:var(--pre-bg); border:1px solid var(--line); border-radius:6px;
 def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime,
                          proposals: list, live: bool, source: str,
                          excluded: list[dict], swept: int | None = None,
-                         errors: int = 0, orphaned: list[dict] | None = None) -> pathlib.Path:
+                         errors: int = 0, orphaned: list[dict] | None = None,
+                         unchecked: int = 0) -> pathlib.Path:
     """Every label and comment this run writes (or would write), as one page.
 
     The reviewable artifact: Dennis and Veronica sign off on the wording before
@@ -636,7 +658,12 @@ def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime
         f'<code>{esc(cfg["prompt"]["version"])}</code> &middot; '
         f'{"LIVE - labels and comments applied" if live else "dry run - nothing written"}'
         f' &middot; {len(rows)} ticket(s) labelled'
-        + (f", {len(excluded)} excluded as already in review" if excluded else "")
+        # Counted apart because the lede is the line most readers stop at, and
+        # "already in review" is a claim the content matches cannot support.
+        + (f", {sum(1 for r in excluded if r.get('open_prs'))} excluded as already in review"
+           if any(r.get("open_prs") for r in excluded) else "")
+        + (f", {sum(1 for r in excluded if r.get('related_prs'))} held back on a "
+           f"similar open PR" if any(r.get("related_prs") for r in excluded) else "")
         + (f" &middot; {swept} in scope" if swept is not None else "")
         + "</p>",
     ]
@@ -647,13 +674,41 @@ def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime
     # fire on every routine sweep and train operators to ignore the banner.
     # Errors are the signal - they are also the only way the sweep truncates,
     # since the breaker trips on consecutive failures.
+    # "N of None ticket(s)" reads as a bug in the tool, on the two banners whose
+    # whole job is to be believed. swept is optional in the signature and only
+    # main() is guaranteed to pass it, so the denominator is stated when known
+    # and dropped when not, rather than interpolated blindly.
+    def _of(n: int) -> str:
+        return f"{n} of {swept}" if swept is not None else str(n)
+
     if errors:
         parts.append('<div class="note"><strong>This run did not complete '
-                     f'cleanly.</strong> {errors} of {swept} ticket(s) errored, and '
+                     f'cleanly.</strong> {_of(errors)} ticket(s) errored, and '
                      "the sweep stops early if enough fail in a row - so tickets "
                      "may be missing from this report entirely. Check "
                      "<code>out/journal.jsonl</code> for the per-ticket outcome "
                      "before treating this as a complete record.</div>")
+    # A failed content search is deliberately not an error - it must not be able
+    # to fail a ticket - but "not an error" was quietly turned into "not
+    # mentioned". Every ticket below then reads as one whose scope was checked
+    # twice, when the second check never ran, and the only record was
+    # out/journal.jsonl. This file already describes that as "a journal nobody
+    # reads", and this is a page people do read before approving a live run.
+    #
+    # It gets its own banner rather than sharing the errors one above: nothing
+    # errored, the run IS complete, and the tickets listed are real proposals.
+    # What is missing is a scope check, which is a different thing to tell
+    # someone about to approve them.
+    if unchecked:
+        parts.append('<div class="note"><strong>Scope was checked once, not '
+                     f'twice.</strong> On {_of(unchecked)} ticket(s) the search '
+                     "for an open pull request matching the ticket's wording did not "
+                     "complete, so only the ticket-key search stands behind them. That "
+                     "search is the one that misses PRs which never cite a key, which "
+                     "is how six of the first nine automation candidates turned out to "
+                     "be work already underway. Re-run before treating the labels below "
+                     "as in-scope; <code>out/journal.jsonl</code> names the tickets "
+                     "under <code>related_pr_check</code>.</div>")
     if not live:
         parts.append(
             '<p class="meta">Every comment below is rendered by the same '
@@ -718,29 +773,63 @@ def write_comment_report(cfg: dict, base: pathlib.Path, stamp: datetime.datetime
                          f'comment refused: {esc(row["error"])}</li>')
         parts.append("</ul>")
 
-    if excluded:
+    # Linked only when it is a link. github.py emits a plain-text stand-in
+    # ("openmrs PR #123 (no URL returned)") when the API returns neither
+    # html_url nor url, and says why in as many words: a synthesised reference
+    # "reaches the report as an href and renders as a link that goes nowhere,
+    # which is worse than plain text a reviewer can search for". Wrapping every
+    # entry in an anchor defeated that - the stand-in became
+    # <a href="openmrs PR #123 (no URL returned)">, a relative href that 404s -
+    # so the producer's care was undone by the consumer. This is the evidence
+    # list for tickets held out of scope, which is exactly where a reviewer
+    # follows the link to check the claim.
+    def _pr_link(u: str) -> str:
+        return (f'<a href="{esc(u)}">{esc(u)}</a>'
+                if u.startswith(("http://", "https://")) else f"<code>{esc(u)}</code>")
+
+    # Both exclusion lists are meant to read identically - same ticket link,
+    # same summary, same dash - so that the only visible difference between
+    # them is the heading and the evidence. Shared rather than written twice,
+    # because "identical" maintained by copy-paste is how the two drift apart.
+    def _excluded_li(row: dict, links: str) -> str:
+        return (f'<li><a href="{url}{esc(row["key"])}">{esc(row["key"])}</a> '
+                f'{esc(row["summary"])} &mdash; {links}</li>')
+
+    # Two sections, not one, and the split is the point. The first list is
+    # settled: a PR names the key, so the ticket is in review and that is that.
+    # The second is a question put to a human - these PRs share the ticket's
+    # words and nothing more. Merging them would give a suggestion the
+    # authority of proof, and the suggestion is the one that can be wrong.
+    by_proof = [r for r in excluded if r.get("open_prs")]
+    by_content = [r for r in excluded if r.get("related_prs")]
+
+    if by_proof:
         parts += ["<h2>Excluded: already in review</h2>",
                   "<p>No label, no comment. The Jira dev panel reported no pull request "
                   "for these, so <code>scope_jql</code> returned them; the open-PR "
                   "backstop caught them.</p>", "<ul>"]
-        for row in excluded:
-            # Linked only when it is a link. github.py emits a plain-text
-            # stand-in ("openmrs PR #123 (no URL returned)") when the API
-            # returns neither html_url nor url, and says why in as many words:
-            # a synthesised reference "reaches the report as an href and
-            # renders as a link that goes nowhere, which is worse than plain
-            # text a reviewer can search for". Wrapping every entry in an
-            # anchor defeated that - the stand-in became
-            # <a href="openmrs PR #123 (no URL returned)">, a relative href
-            # that 404s - so the producer's care was undone by the consumer.
-            # This is the evidence list for tickets held out of scope, which is
-            # exactly where a reviewer follows the link to check the claim.
-            links = " ".join(
-                f'<a href="{esc(u)}">{esc(u)}</a>' if u.startswith(("http://", "https://"))
-                else f"<code>{esc(u)}</code>"
-                for u in row["open_prs"])
-            parts.append(f'<li><a href="{url}{esc(row["key"])}">{esc(row["key"])}</a> '
-                         f'{esc(row["summary"])} &mdash; {links}</li>')
+        for row in by_proof:
+            parts.append(_excluded_li(
+                row, " ".join(_pr_link(u) for u in row["open_prs"])))
+        parts.append("</ul>")
+
+    if by_content:
+        # Deliberately does not say "unlike the list above": that section only
+        # renders when something proven is in it, and on the first real sweep
+        # nothing was, leaving the sentence pointing at nothing.
+        parts += ["<h2>Held back: an open PR looks like this work</h2>",
+                  "<p>No label, no comment, and <strong>no proof</strong> &mdash; the "
+                  "search for the ticket key did not connect these pull requests to it. "
+                  "They were "
+                  "found because they contain a distinctive phrase from its summary, and "
+                  "the phrase is shown so you can judge the match. If it is a coincidence, "
+                  "the ticket returns to scope as soon as that pull request closes; to get "
+                  "it triaged sooner, ask the PR author to cite the key.</p>", "<ul>"]
+        for row in by_content:
+            parts.append(_excluded_li(row, ", ".join(
+                f'{_pr_link(m["url"])} <span class="muted">(matched '
+                f'<code>{esc(m["matched"])}</code>)</span>'
+                for m in row["related_prs"])))
         parts.append("</ul>")
 
     if rows:
@@ -834,7 +923,8 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     if github:
         auth = ("GITHUB_TOKEN" if github.authenticated else
                 f"unauthenticated, {github.min_interval:.0f}s between searches")
-        print(f"open-PR backstop: on (org {github.org}, {auth})")
+        print(f"open-PR backstop: on, by key and by content "
+              f"(org {github.org}, {auth})")
     else:
         print("open-PR backstop: OFF; tickets with an open PR that the Jira dev "
               "panel missed will be classified")
@@ -883,6 +973,8 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     # not just notice that they are missing.
     excluded: list[dict] = []
     orphaned: list[dict] = []
+    # Counted, not just journalled. See the banner in write_comment_report.
+    unchecked = 0
     manifest: dict = {}
     errors = consecutive = 0
     journal = out / "journal.jsonl"
@@ -974,18 +1066,77 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
             deaf_to_answer = provisional in ("skip-opted-out", "skip-out-of-scope") or (
                 provisional == "skip-already-triaged" and not args.no_classify)
             open_prs: list[str] = []
+            related_prs: list[tuple[str, str]] = []
             if github and not deaf_to_answer:
                 open_prs = github.open_pr_urls(key)
+                # Only when the key search came back empty, which is exactly
+                # when it is least trustworthy. Measured on the launch cohort:
+                # six of nine proposed automation candidates already had an
+                # open PR and the key search found none of them, because none
+                # cited its key. A second look that asks a different question
+                # is worth 2.5s of throttle on a ticket the sweep was otherwise
+                # about to classify and comment on.
+                if not open_prs:
+                    summary = issue["fields"].get("summary") or ""
+                    # Asked before searching, so the row can say which of the
+                    # two empty answers this was. Without it a ticket the
+                    # backstop never looked at - because its summary yields no
+                    # distinctive phrase, or only phrases too long for GitHub to
+                    # accept - was journalled identically to one it looked at and
+                    # cleared, and the audit record could not answer "was this
+                    # ticket in scope?". Not a warning and not a banner: this
+                    # fires on a routine ~7% of tickets, and a banner that
+                    # routine is one operators learn to ignore.
+                    if not searchable_phrases(summary, github.org):
+                        # The two reasons are separated because they call for
+                        # different responses: nothing derivable is a fact about
+                        # the ticket and the wording would have to change, while
+                        # an over-long query is a limit of the search API that a
+                        # shorter summary would clear. "No phrase" for both would
+                        # be false for the second, and this field exists to be
+                        # accurate.
+                        row["related_pr_check"] = (
+                            "skipped: every derived phrase exceeded GitHub's "
+                            f"{MAX_QUERY_CHARS}-character query limit"
+                            if search_phrases(summary) else
+                            "skipped: no distinctive phrase could be derived from "
+                            "the summary")
+                    try:
+                        related_prs = github.related_pr_urls(key, summary)
+                    except GitHubError as e:
+                        # Deliberately not fail-closed, unlike the key search
+                        # above. That one is the proof the exclusion rests on,
+                        # so losing it has to stop the ticket. This one is a
+                        # second opinion costing up to three extra searches per
+                        # ticket, i.e. three more chances at the secondary rate
+                        # limit; letting it error the ticket would let an
+                        # advisory signal trip the consecutive-error breaker and
+                        # halt a sweep that was otherwise fine. The row records
+                        # that the second look did not happen, so a reader is
+                        # never told a ticket was checked when it was not.
+                        row["related_pr_check"] = f"failed: {type(e).__name__}: {e}"[:200]
+                        unchecked += 1
             action = plan_ticket(st, unchanged, args.force, classifier is not None,
-                                 out_of_scope, bool(open_prs))
-            # Excluded only for the three reasons that are permanent: an opt-out
-            # the pilot promised to honour, a ticket that has left scope, and one
-            # that is already in review.
+                                 out_of_scope, bool(open_prs), bool(related_prs))
+            # Held out of the manifest for four reasons. Three are permanent
+            # facts: an opt-out the pilot promised to honour, a ticket that has
+            # left scope, and one already in review.
+            #
+            # "skip-related-pr" is the odd one and is listed anyway. It is NOT a
+            # permanent fact - it is this sweep's guess that an open PR is doing
+            # this work - but the manifest is rebuilt from scratch on every
+            # gather, so listing it withholds the ticket for one sweep rather
+            # than forever, and it returns of its own accord when that PR closes.
+            # The alternative, offering it for classification while the sweep
+            # declines to label it, would put a ticket on the grading sheet that
+            # no run will ever act on.
+            #
             # "already-triaged" is NOT permanent - a live run re-classifies it
             # after a prompt bump or an edit - and the gather step is a dry run
             # where `unchanged` is unconditionally True, so gating on it dropped
             # every labelled ticket and left the re-triage backlog unclassified.
-            if action not in ("skip-opted-out", "skip-out-of-scope", "skip-open-pr"):
+            if action not in ("skip-opted-out", "skip-out-of-scope", "skip-open-pr",
+                              "skip-related-pr"):
                 manifest[key] = {
                     "content_hash": chash,
                     "summary": issue["fields"].get("summary", ""),
@@ -1002,6 +1153,15 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
                     # skip whose evidence lives outside Jira entirely.
                     row["open_prs"] = open_prs
                     excluded.append({"key": key, "open_prs": open_prs,
+                                     "summary": issue["fields"].get("summary") or ""})
+                elif action == "skip-related-pr":
+                    # The matched phrase travels with the URL, because without
+                    # it the reader cannot judge the match - "found by
+                    # `useAuditLogs`" is checkable, a bare URL is not.
+                    row["related_prs"] = [{"url": u, "matched": p}
+                                          for u, p in related_prs]
+                    excluded.append({"key": key,
+                                     "related_prs": row["related_prs"],
                                      "summary": issue["fields"].get("summary") or ""})
                 elif action == "skip-already-triaged":
                     row["labels"] = st.ai_labels_present
@@ -1115,9 +1275,19 @@ def main(argv=None, out: pathlib.Path | None = None) -> int:
     if proposals or excluded or errors or orphaned:
         report = write_comment_report(cfg, base, stamp, proposals, args.live, source,
                                       excluded, swept=len(keys), errors=errors,
+                                      unchecked=unchecked,
                                       orphaned=orphaned)
         wrote = "what was written" if args.live else "what would be written"
         print(f"\nComment report ({wrote}): {report}")
+    if unchecked:
+        # Warned, but deliberately NOT a non-zero exit. The run is complete and
+        # the proposals are real; only the weaker of the two scope checks is
+        # missing. Turning the scheduled sweep red on a transient GitHub blip
+        # would undo the whole reason this search fails open. Loud enough to
+        # notice, quiet enough not to cry wolf every four hours.
+        print(f"\nWARN: the content backstop did not complete on {unchecked} of "
+              f"{len(keys)} ticket(s); only the ticket-key search stands behind them. "
+              "See related_pr_check in out/journal.jsonl.", file=sys.stderr)
     if errors:
         # Non-zero so a scheduled run turns red. Previously a sweep in which
         # every ticket failed still exited 0, so the only evidence was a line
